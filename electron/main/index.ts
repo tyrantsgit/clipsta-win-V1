@@ -35,6 +35,7 @@ import os from "os";
 		captureAudio: true,
 		captureMic: false,
 		audioSource: "desktop",
+		audioInputDeviceId: "",
 		gameDetect: true,
 		autoUpload: false,
 		minimizeToTray: true,
@@ -61,6 +62,7 @@ interface AppSettings {
 	captureAudio: boolean;
 	captureMic: boolean;
 	audioSource: string;
+	audioInputDeviceId: string;
 	gameDetect: boolean;
 	autoUpload: boolean;
 	minimizeToTray: boolean;

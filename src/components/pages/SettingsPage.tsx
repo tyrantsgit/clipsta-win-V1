@@ -14,6 +14,17 @@ interface Props {
 
 export default function SettingsPage({ settings, updateSetting, saveAll, cloud }: Props) {
 	const [local, setLocal] = useState<AppSettings>({ ...settings });
+	const [audioInputs, setAudioInputs] = useState<{ deviceId: string; label: string }[]>([]);
+
+	useEffect(() => {
+		navigator.mediaDevices.enumerateDevices().then((devices) => {
+			setAudioInputs(
+				devices
+					.filter((d) => d.kind === "audioinput")
+					.map((d) => ({ deviceId: d.deviceId, label: d.label || `Mic ${d.deviceId.slice(0, 8)}` }))
+			);
+		}).catch(() => {});
+	}, []);
 	const [saved, setSaved] = useState(false);
 
 	const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
@@ -105,6 +116,15 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 								v === "both" ? "Desktop + Microphone" : "None"} />
 						<NumberField label="Audio Bitrate (kbps)" value={local.audioBitrate}
 							onChange={(v) => update("audioBitrate", v)} min={64} max={320} step={32} />
+						{(local.audioSource === "mic" || local.audioSource === "both") && (
+							<SelectField label="Microphone" value={local.audioInputDeviceId}
+								onChange={(v) => update("audioInputDeviceId", v)}
+								options={["", ...audioInputs.map((d) => d.deviceId)]}
+								display={(v) =>
+									v === "" ? "System Default" :
+									audioInputs.find((d) => d.deviceId === v)?.label ?? v.slice(0, 16)}
+							/>
+						)}
 					</div>
 				</Section>
 

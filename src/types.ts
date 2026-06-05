@@ -13,6 +13,7 @@ export interface AppSettings {
 	captureAudio: boolean;
 	captureMic: boolean;
 	audioSource: string;
+	audioInputDeviceId: string;
 	gameDetect: boolean;
 	autoUpload: boolean;
 	minimizeToTray: boolean;

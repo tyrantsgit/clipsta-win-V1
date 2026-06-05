@@ -16,6 +16,7 @@ export const DEFAULTS: AppSettings = {
 	captureAudio: true,
 	captureMic: false,
 	audioSource: "desktop",
+	audioInputDeviceId: "",
 	gameDetect: true,
 	autoUpload: false,
 	minimizeToTray: true,

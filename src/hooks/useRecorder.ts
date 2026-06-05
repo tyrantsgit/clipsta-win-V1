@@ -81,9 +81,14 @@ export function useRecorder(settings: AppSettings | null) {
 
 		if (audioSource === "mic" || audioSource === "both") {
 			try {
-				const mic = await navigator.mediaDevices.getUserMedia({
-					audio: { echoCancellation: true, noiseSuppression: true },
-				});
+				const micConstraints: MediaTrackConstraints = {
+					echoCancellation: true,
+					noiseSuppression: true,
+				};
+				if (settings?.audioInputDeviceId) {
+					micConstraints.deviceId = { exact: settings.audioInputDeviceId };
+				}
+				const mic = await navigator.mediaDevices.getUserMedia({ audio: micConstraints });
 				auxStreams.push(mic);
 				mic.getAudioTracks().forEach((t: MediaStreamTrack) => stream.addTrack(t));
 			} catch {
