@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
+import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload, Loader2 } from "lucide-react";
 import type { AppSettings } from "../../types";
 import { DEFAULTS } from "../../hooks/useSettings";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
@@ -148,18 +149,30 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 								)}
 							</div>
 							{cloud.pairingCode && (
-								<div className="text-center py-2">
-									<p className="text-[10px] text-text-dim mb-1">Enter this code on your mobile app:</p>
+								<div className="text-center py-2 space-y-3">
+									<div className="flex justify-center">
+										<QRCodeSVG
+											value={`clipsta://pair/${cloud.pairingCode}`}
+											size={140}
+											bgColor="transparent"
+											fgColor="#D4F000"
+										/>
+									</div>
+									<p className="text-[10px] text-text-dim">Or enter this code on your mobile app:</p>
 									<p className="text-2xl font-black text-y tracking-widest">{cloud.pairingCode}</p>
 								</div>
 							)}
-							{!cloud.paired && (
+							{(!cloud.paired || cloud.pairingCode) && (
 								<button
 									onClick={cloud.generatePairingCode}
 									className="btn-y w-full justify-center text-xs py-2"
-									disabled={cloud.pairingError !== null}
+									disabled={cloud.pairingLoading}
 								>
-									<Upload size={12} /> Generate Pairing Code
+									{cloud.pairingLoading ? (
+										<><Loader2 size={12} className="animate-spin" /> Generating…</>
+									) : (
+										<><Upload size={12} /> Generate Pairing Code</>
+									)}
 								</button>
 							)}
 							{cloud.pairingError && (

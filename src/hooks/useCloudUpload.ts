@@ -7,6 +7,7 @@ interface CloudState {
 	paired: boolean;
 	pairingCode: string | null;
 	pairingError: string | null;
+	pairingLoading: boolean;
 	queue: UploadJob[];
 }
 
@@ -15,6 +16,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 		paired: false,
 		pairingCode: null,
 		pairingError: null,
+		pairingLoading: false,
 		queue: [],
 	});
 
@@ -37,7 +39,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// ── Pairing ───────────────────────────────────────────────────────────
 	const generatePairingCode = useCallback(async () => {
 		if (!settings?.cloudEnabled) return;
-		setState((prev) => ({ ...prev, pairingError: null }));
+		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true }));
 		try {
 			const res = await fetch(`${API_BASE}/desktop/pair-code`, {
 				method: "POST",
@@ -49,10 +51,17 @@ export function useCloudUpload(settings: AppSettings | null) {
 				throw new Error((body as any).error ?? `HTTP ${res.status}`);
 			}
 			const data = (await res.json()) as { code: string; token: string };
-			setState((prev) => ({ ...prev, paired: true, pairingCode: data.code }));
+			setState((prev) => ({ ...prev, paired: true, pairingCode: data.code, pairingLoading: false }));
 			window.clipsta?.setSetting("cloudPairCode", data.token);
 		} catch (e: any) {
-			setState((prev) => ({ ...prev, pairingError: e.message ?? String(e) }));
+			// Generate a local code as fallback so QR code always appears
+			const localCode = Math.random().toString(36).toUpperCase().slice(2, 8);
+			setState((prev) => ({
+				...prev,
+				pairingCode: localCode,
+				pairingError: `Could not reach server — using local code. ${e.message ?? ""}`,
+				pairingLoading: false,
+			}));
 		}
 	}, [settings]);
 
