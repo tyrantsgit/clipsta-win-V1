@@ -26,8 +26,12 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 	const addClip = async () => {
 		const path = await window.clipsta?.browseFile();
 		if (!path) return;
-		if (!confirm(`Add "${path.replace(/^.*[\\/]/, "")}" to the library?`)) return;
-		await window.clipsta?.importClip(path);
+		const name = path.replace(/^.*[\\/]/, "");
+		if (!confirm(`Add "${name}" to the library?`)) return;
+		const destPath = await window.clipsta?.importClip(path);
+		if (destPath && cloud.paired) {
+			cloud.addToQueue(destPath, name, 0);
+		}
 		load();
 	};
 
