@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload, Loader2 } from "lucide-react";
+import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload, Loader2, X, Smartphone } from "lucide-react";
 import type { AppSettings } from "../../types";
 import { DEFAULTS } from "../../hooks/useSettings";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
@@ -26,6 +26,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 		}).catch(() => {});
 	}, []);
 	const [saved, setSaved] = useState(false);
+	const [showPairingModal, setShowPairingModal] = useState(false);
 
 	const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
 		setLocal((prev) => ({ ...prev, [key]: value }));
@@ -129,7 +130,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				</Section>
 
 				{/* ── Capture ── */}
-				<Section icon={<Cpu size={16} />} title="Capture Behaviour">
+				<Section icon={<Cpu size={16} />} title="Capture Behavior">
 					<div className="grid grid-cols-2 gap-4">
 						<Toggle label="Auto Game Detection" checked={local.gameDetect}
 							onChange={(v) => update("gameDetect", v)}
@@ -168,36 +169,20 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 									<span className="text-[10px] text-text-dim">Not paired</span>
 								)}
 							</div>
-							{cloud.pairingCode && (
-								<div className="text-center py-2 space-y-3">
-									<div className="flex justify-center">
-										<QRCodeSVG
-											value={`clipsta://pair/${cloud.pairingCode}`}
-											size={140}
-											bgColor="transparent"
-											fgColor="#D4F000"
-										/>
-									</div>
-									<p className="text-[10px] text-text-dim">Or enter this code on your mobile app:</p>
-									<p className="text-2xl font-black text-y tracking-widest">{cloud.pairingCode}</p>
+							{cloud.pairingUrl && cloud.paired && (
+								<div className="text-center py-2">
+									<p className="text-[10px] text-green-400">Paired successfully</p>
 								</div>
 							)}
-							{(!cloud.paired || cloud.pairingCode) && (
-								<button
-									onClick={cloud.generatePairingCode}
-									className="btn-y w-full justify-center text-xs py-2"
-									disabled={cloud.pairingLoading}
-								>
-									{cloud.pairingLoading ? (
-										<><Loader2 size={12} className="animate-spin" /> Generating…</>
-									) : (
-										<><Upload size={12} /> Generate Pairing Code</>
-									)}
-								</button>
-							)}
-							{cloud.pairingError && (
-								<p className="text-red-400 text-[10px]">{cloud.pairingError}</p>
-							)}
+							<button
+								onClick={() => {
+									setShowPairingModal(true);
+									cloud.generatePairingCode();
+								}}
+								className="btn-y w-full justify-center text-xs py-2"
+							>
+								<Smartphone size={12} /> Pair with iPhone
+							</button>
 							{local.uploadBandwidth === 0 && (
 								<p className="text-[10px] text-text-dim">Bandwidth: 0 = unlimited</p>
 							)}
@@ -238,6 +223,65 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					{saved ? "Settings Saved ✓" : "Save All Settings"}
 				</button>
 			</div>
+
+			{/* Pairing QR modal */}
+			{showPairingModal && (
+				<div
+					className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
+					onClick={() => setShowPairingModal(false)}
+				>
+					<div
+						className="bg-card rounded-xl p-8 max-w-sm w-full mx-4 shadow-2xl border border-border"
+						onClick={(e) => e.stopPropagation()}
+					>
+						<div className="flex items-center justify-between mb-4">
+							<h3 className="text-white font-bold text-lg">Pair with iPhone</h3>
+							<button onClick={() => setShowPairingModal(false)} className="text-text-dim hover:text-white transition-colors">
+								<X size={18} />
+							</button>
+						</div>
+
+						{cloud.pairingLoading && (
+							<div className="text-center py-10">
+								<Loader2 size={32} className="animate-spin text-y mx-auto mb-3" />
+								<p className="text-text-dim text-sm">Generating pairing code…</p>
+							</div>
+						)}
+
+						{cloud.pairingUrl && !cloud.pairingLoading && (
+							<div className="text-center space-y-4">
+								<div className="flex justify-center">
+									<QRCodeSVG
+										value={cloud.pairingUrl}
+										size={200}
+										bgColor="transparent"
+										fgColor="#D4F000"
+									/>
+								</div>
+								<p className="text-text-dim text-xs">Open the Clipsta app on your iPhone and scan this QR code</p>
+							</div>
+						)}
+
+						{cloud.pairingError && !cloud.pairingLoading && (
+							<div className="text-center py-6 space-y-3">
+								<p className="text-red-400 text-sm">{cloud.pairingError}</p>
+								<button
+									onClick={() => {
+										cloud.generatePairingCode();
+									}}
+									className="btn-y w-full justify-center text-xs py-2"
+								>
+									Retry
+								</button>
+							</div>
+						)}
+
+						{cloud.paired && cloud.pairingUrl && !cloud.pairingLoading && (
+							<p className="text-green-400 text-xs text-center mt-3">✓ Device is paired</p>
+						)}
+					</div>
+				</div>
+			)}
 		</div>
 	);
 }

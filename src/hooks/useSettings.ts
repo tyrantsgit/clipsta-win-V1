@@ -25,6 +25,7 @@ export const DEFAULTS: AppSettings = {
 	cloudPairCode: "",
 	uploadBandwidth: 0,
 	deleteAfterUpload: false,
+	desktopDeviceId: "",
 };
 
 export function useSettings() {

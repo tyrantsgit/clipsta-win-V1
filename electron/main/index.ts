@@ -44,6 +44,7 @@ import os from "os";
 		cloudPairCode: "",
 		uploadBandwidth: 0,
 		deleteAfterUpload: false,
+		desktopDeviceId: "",
 	},
 });
 
@@ -71,6 +72,7 @@ interface AppSettings {
 	cloudPairCode: string;
 	uploadBandwidth: number;
 	deleteAfterUpload: boolean;
+	desktopDeviceId: string;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -118,6 +120,7 @@ app.whenReady().then(async () => {
 	});
 
 	ensureOutputFolder();
+	ensureDesktopDeviceId();
 	await createWindow();
 	createTray();
 	registerAllHotkeys();
@@ -237,6 +240,15 @@ function ensureOutputFolder() {
 		store.set("outputFolder", f);
 	}
 	if (!fs.existsSync(f)) fs.mkdirSync(f, { recursive: true });
+}
+
+// ── Desktop device ID ─────────────────────────────────────────────────────────
+function ensureDesktopDeviceId() {
+	let id = store.get("desktopDeviceId");
+	if (!id) {
+		id = `desktop_${crypto.randomUUID().replaceAll("-", "")}`;
+		store.set("desktopDeviceId", id);
+	}
 }
 
 // ── IPC: window controls ──────────────────────────────────────────────────────
@@ -466,6 +478,88 @@ ipcMain.handle("system:info", () => ({
 // ── IPC: read file for upload ─────────────────────────────────────────────────
 ipcMain.handle("file:read", (_e, filePath: string) => {
 	return fs.readFileSync(filePath).buffer;
+});
+
+// ── IPC: upload clip to cloud ──────────────────────────────────────────────────
+const API_BASE = "https://clipsta-api.godson594.workers.dev";
+const DESKTOP_TEST_KEY = "dev-clipsta";
+
+ipcMain.handle("upload:clip", async (_e, opts: {
+	desktopDeviceId: string;
+	filePath: string;
+	fileName: string;
+	durationSeconds: number;
+	bytes: number;
+	capturedAt: string;
+}) => {
+	// Step 1: Request upload URL
+	const clipRes = await fetch(`${API_BASE}/clip-uploads`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Clipsta-Test-Key": DESKTOP_TEST_KEY,
+		},
+		body: JSON.stringify({
+			desktopDeviceId: opts.desktopDeviceId,
+			fileName: opts.fileName,
+			durationSeconds: opts.durationSeconds,
+			bytes: opts.bytes,
+			capturedAt: opts.capturedAt,
+		}),
+	});
+	if (!clipRes.ok) {
+		const errBody = await clipRes.text().catch(() => "");
+		throw new Error(`clip-uploads failed: HTTP ${clipRes.status} ${errBody}`);
+	}
+	const clipData = await clipRes.json();
+
+	// Step 2: Upload file to the returned uploadUrl via multipart form-data
+	const fileBuf = fs.readFileSync(opts.filePath);
+	const boundary = `----ClipstaBoundary${Math.random().toString(36).slice(2)}`;
+	const head = Buffer.from(
+		`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${opts.fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+		"utf-8"
+	);
+	const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf-8");
+	const multipartBody = Buffer.concat([head, fileBuf, tail]);
+
+	const uploadRes = await fetch((clipData as any).uploadUrl, {
+		method: "POST",
+		headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+		body: multipartBody,
+	});
+	if (!uploadRes.ok) {
+		const errBody = await uploadRes.text().catch(() => "");
+		throw new Error(`file upload failed: HTTP ${uploadRes.status} ${errBody}`);
+	}
+
+	return clipData;
+});
+
+// ── IPC: notify desktop upload status ──────────────────────────────────────────
+ipcMain.handle("upload:status", async (_e, body: {
+	desktopDeviceId: string;
+	desktopName: string;
+	queuedCount: number;
+	waitingForGameplayCount: number;
+	uploadingCount: number;
+	uploadedCount: number;
+	failedCount: number;
+	currentProgressPercent: number;
+	currentStatus: string;
+}) => {
+	const res = await fetch(`${API_BASE}/desktop-upload-status`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Clipsta-Test-Key": DESKTOP_TEST_KEY,
+		},
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) {
+		const errBody = await res.text().catch(() => "");
+		console.warn("upload-status failed:", res.status, errBody);
+	}
 });
 
 interface ExportOpts {

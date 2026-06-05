@@ -5,6 +5,7 @@ const API_BASE = "https://clipsta-api.godson594.workers.dev";
 
 interface CloudState {
 	paired: boolean;
+	pairingUrl: string | null;
 	pairingCode: string | null;
 	pairingError: string | null;
 	pairingLoading: boolean;
@@ -14,6 +15,7 @@ interface CloudState {
 export function useCloudUpload(settings: AppSettings | null) {
 	const [state, setState] = useState<CloudState>({
 		paired: false,
+		pairingUrl: null,
 		pairingCode: null,
 		pairingError: null,
 		pairingLoading: false,
@@ -22,44 +24,60 @@ export function useCloudUpload(settings: AppSettings | null) {
 
 	const queueRef = useRef<UploadJob[]>([]);
 	const processingRef = useRef(false);
+	const pairingDeviceIdRef = useRef<string | null>(null);
 
-	// Sync ref with state
-	const setQueue = useCallback((fn: (prev: UploadJob[]) => UploadJob[]) => {
-		setState((prev) => {
-			const next = fn(prev.queue);
-			queueRef.current = next;
-			return { ...prev, queue: next };
-		});
+	const getDeviceId = useCallback(() => {
+		let id = settings?.desktopDeviceId;
+		if (!id) {
+			if (!pairingDeviceIdRef.current) {
+				pairingDeviceIdRef.current = `desktop_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+			}
+			id = pairingDeviceIdRef.current;
+		}
+		return id;
+	}, [settings]);
+
+	const syncQueue = useCallback((next: UploadJob[]) => {
+		queueRef.current = next;
+		setState((prev) => ({ ...prev, queue: next }));
 	}, []);
 
 	const updateJob = useCallback((id: string, patch: Partial<UploadJob>) => {
-		setQueue((prev) => prev.map((j) => (j.id === id ? { ...j, ...patch } : j)));
-	}, [setQueue]);
+		syncQueue(queueRef.current.map((j) => (j.id === id ? { ...j, ...patch } : j)));
+	}, [syncQueue]);
 
 	// ── Pairing ───────────────────────────────────────────────────────────
 	const generatePairingCode = useCallback(async () => {
-		if (!settings?.cloudEnabled) return;
 		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true }));
 		try {
-			const res = await fetch(`${API_BASE}/desktop/pair-code`, {
+			const res = await fetch(`${API_BASE}/pairing-tokens`, {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ deviceName: "Clipsta Desktop" }),
+				headers: {
+					"Content-Type": "application/json",
+					"X-Clipsta-Test-Key": "dev-clipsta",
+				},
+				body: JSON.stringify({
+					desktopDeviceId: getDeviceId(),
+					desktopName: "Clipsta Desktop",
+				}),
 			});
 			if (!res.ok) {
 				const body = await res.json().catch(() => ({}));
 				throw new Error((body as any).error ?? `HTTP ${res.status}`);
 			}
-			const data = (await res.json()) as { code: string; token: string };
-			setState((prev) => ({ ...prev, paired: true, pairingCode: data.code, pairingLoading: false }));
-			window.clipsta?.setSetting("cloudPairCode", data.token);
-		} catch (e: any) {
-			// Generate a local code as fallback so QR code always appears
-			const localCode = Math.random().toString(36).toUpperCase().slice(2, 8);
+			const data = (await res.json()) as { token: string; pairingUrl: string; expiresAt: string };
 			setState((prev) => ({
 				...prev,
-				pairingCode: localCode,
-				pairingError: `Could not reach server — using local code. ${e.message ?? ""}`,
+				paired: true,
+				pairingUrl: data.pairingUrl,
+				pairingCode: data.token,
+				pairingLoading: false,
+			}));
+			window.clipsta?.setSetting("cloudPairCode", data.token);
+		} catch (e: any) {
+			setState((prev) => ({
+				...prev,
+				pairingError: `Pairing failed: ${e.message ?? ""}`,
 				pairingLoading: false,
 			}));
 		}
@@ -68,16 +86,14 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// Resume pairing on mount if we have a stored token
 	useEffect(() => {
 		if (settings?.cloudEnabled && settings?.cloudPairCode) {
-			setState((prev) => ({ ...prev, paired: true }));
+			setState((prev) => ({ ...prev, paired: true, pairingCode: settings.cloudPairCode! }));
 		}
 	}, [settings?.cloudEnabled, settings?.cloudPairCode]);
 
-	// ── Upload with bandwidth throttle ────────────────────────────────────
+	// ── Upload ────────────────────────────────────────────────────────────
 	const processQueue = useCallback(async () => {
 		if (processingRef.current) return;
 		processingRef.current = true;
-
-		const maxBps = (settings?.uploadBandwidth ?? 0) * 1024; // KB/s → bytes/s
 
 		while (queueRef.current.some((j) => j.status === "queued")) {
 			const job = queueRef.current.find((j) => j.status === "queued");
@@ -86,46 +102,21 @@ export function useCloudUpload(settings: AppSettings | null) {
 			updateJob(job.id, { status: "uploading", progress: 0 });
 
 			try {
-				const fileBuf = await window.clipsta?.readFile(job.path);
-				if (!fileBuf) throw new Error("Could not read file");
-
-				// Upload with bandwidth throttle
-				const xhr = new XMLHttpRequest();
-				xhr.open("POST", `${API_BASE}/desktop/upload`);
-				xhr.setRequestHeader("Authorization", `Bearer ${settings?.cloudPairCode ?? ""}`);
-				xhr.setRequestHeader("X-Filename", encodeURIComponent(job.name));
-
-				await new Promise<void>((resolve, reject) => {
-					xhr.upload.onprogress = (e) => {
-						if (e.lengthComputable) {
-							const pct = Math.round((e.loaded / e.total) * 100);
-							updateJob(job.id, { progress: pct });
-
-							// Bandwidth throttle
-							if (maxBps > 0) {
-								const elapsed = (Date.now() - (xhr as any)._startTime) / 1000;
-								const expected = e.loaded / maxBps;
-								if (elapsed < expected) {
-									const delay = (expected - elapsed) * 1000;
-									// Sleep using setTimeout — this blocks the chunk callback from being called too fast
-									const t0 = Date.now();
-									while (Date.now() - t0 < delay) {
-										// busy-wait for small delays
-									}
-								}
-							}
-						}
-					};
-					(xhr as any)._startTime = Date.now();
-					xhr.onload = () => {
-						if (xhr.status >= 200 && xhr.status < 300) resolve();
-						else reject(new Error(`Upload failed: HTTP ${xhr.status}`));
-					};
-					xhr.onerror = () => reject(new Error("Upload network error"));
-					xhr.send(fileBuf);
+				const result = await window.clipsta?.uploadClip({
+					desktopDeviceId: getDeviceId(),
+					filePath: job.path,
+					fileName: job.name,
+					durationSeconds: 0,
+					bytes: job.size,
+					capturedAt: new Date().toISOString(),
 				});
 
-				updateJob(job.id, { status: "done", progress: 100 });
+				updateJob(job.id, {
+					status: "done",
+					progress: 100,
+					streamUid: result?.streamUid,
+					shareUrl: result?.shareUrl,
+				});
 			} catch (e: any) {
 				updateJob(job.id, { status: "failed", error: e.message ?? String(e) });
 			}
@@ -136,10 +127,9 @@ export function useCloudUpload(settings: AppSettings | null) {
 
 	const addToQueue = useCallback((path: string, name: string, size: number) => {
 		const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		setQueue((prev) => [...prev, { id, path, name, size, progress: 0, status: "queued" }]);
-		// Trigger processing
+		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued" }]);
 		setTimeout(processQueue, 100);
-	}, [setQueue, processQueue]);
+	}, [syncQueue, processQueue]);
 
 	const retryJob = useCallback((id: string) => {
 		updateJob(id, { status: "queued", progress: 0, error: undefined });
@@ -147,8 +137,41 @@ export function useCloudUpload(settings: AppSettings | null) {
 	}, [updateJob, processQueue]);
 
 	const removeJob = useCallback((id: string) => {
-		setQueue((prev) => prev.filter((j) => j.id !== id));
-	}, [setQueue]);
+		syncQueue(queueRef.current.filter((j) => j.id !== id));
+	}, [syncQueue]);
+
+	// ── Upload status notifications ───────────────────────────────────────
+	const notifyStatus = useCallback(() => {
+		const queue = queueRef.current;
+		const queuedCount = queue.filter((j) => j.status === "queued").length;
+		const uploadingCount = queue.filter((j) => j.status === "uploading").length;
+		const uploadedCount = queue.filter((j) => j.status === "done").length;
+		const failedCount = queue.filter((j) => j.status === "failed").length;
+		const uploading = queue.find((j) => j.status === "uploading");
+		const currentProgressPercent = uploading?.progress ?? 0;
+		const parts: string[] = [];
+		if (queuedCount) parts.push(`${queuedCount} queued`);
+		if (uploadingCount) parts.push(`${uploadingCount} uploading (${currentProgressPercent}%)`);
+		if (uploadedCount) parts.push(`${uploadedCount} done`);
+		if (failedCount) parts.push(`${failedCount} failed`);
+		const currentStatus = parts.length ? parts.join(", ") : "Idle";
+
+		window.clipsta?.notifyUploadStatus({
+			desktopDeviceId: getDeviceId(),
+			desktopName: "Clipsta Desktop",
+			queuedCount,
+			waitingForGameplayCount: 0,
+			uploadingCount,
+			uploadedCount,
+			failedCount,
+			currentProgressPercent,
+			currentStatus,
+		}).catch(() => {});
+	}, [settings]);
+
+	useEffect(() => {
+		if (settings?.cloudEnabled) notifyStatus();
+	}, [state.queue, settings?.cloudEnabled, notifyStatus]);
 
 	return {
 		...state,

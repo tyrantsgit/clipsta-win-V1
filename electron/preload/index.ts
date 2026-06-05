@@ -47,4 +47,8 @@ contextBridge.exposeInMainWorld("clipsta", {
 
 	// File
 	readFile: (p: string) => ipcRenderer.invoke("file:read", p),
+
+	// Cloud upload
+	uploadClip: (opts: object) => ipcRenderer.invoke("upload:clip", opts),
+	notifyUploadStatus: (body: object) => ipcRenderer.invoke("upload:status", body),
 });

@@ -22,6 +22,7 @@ export interface AppSettings {
 	cloudPairCode: string;
 	uploadBandwidth: number;
 	deleteAfterUpload: boolean;
+	desktopDeviceId: string;
 }
 
 export interface UploadJob {
@@ -32,6 +33,18 @@ export interface UploadJob {
 	progress: number;
 	status: "queued" | "uploading" | "done" | "failed";
 	error?: string;
+	streamUid?: string;
+	shareUrl?: string;
+}
+
+export interface UploadClipResponse {
+	id: string;
+	streamUid: string;
+	uploadUrl: string;
+	shareUrl: string;
+	playerUrl: string;
+	streamUrl: string;
+	thumbnailUrl: string;
 }
 
 export interface ScreenSource {
@@ -49,6 +62,27 @@ export interface ClipFile {
 }
 
 export type Page = "capture" | "library" | "editor" | "settings";
+
+export interface UploadClipOpts {
+	desktopDeviceId: string;
+	filePath: string;
+	fileName: string;
+	durationSeconds: number;
+	bytes: number;
+	capturedAt: string;
+}
+
+export interface UploadStatusBody {
+	desktopDeviceId: string;
+	desktopName: string;
+	queuedCount: number;
+	waitingForGameplayCount: number;
+	uploadingCount: number;
+	uploadedCount: number;
+	failedCount: number;
+	currentProgressPercent: number;
+	currentStatus: string;
+}
 
 declare global {
 	interface Window {
@@ -79,6 +113,8 @@ declare global {
 			importClip(sourcePath: string): Promise<string>;
 			getSystemInfo(): Promise<SystemInfo>;
 			readFile(path: string): Promise<ArrayBuffer>;
+			uploadClip(opts: UploadClipOpts): Promise<UploadClipResponse>;
+			notifyUploadStatus(body: UploadStatusBody): Promise<void>;
 		};
 	}
 }
