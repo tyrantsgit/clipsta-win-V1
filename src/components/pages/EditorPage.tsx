@@ -3,7 +3,9 @@ import {
 	Scissors, Download, RotateCcw, Volume2, VolumeX, FileUp,
 	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen,
 } from "lucide-react";
+import { Upload } from "lucide-react";
 import type { AppSettings, ExportOpts } from "../../types";
+import type { useCloudUpload } from "../../hooks/useCloudUpload";
 
 function toFileUrl(p: string): string {
 	if (p.startsWith("file://")) return p;
@@ -15,6 +17,7 @@ function toFileUrl(p: string): string {
 interface Props {
 	initialFile: string | null;
 	settings: AppSettings;
+	cloud: ReturnType<typeof useCloudUpload>;
 }
 
 interface CutSeg { start: number; end: number }
@@ -576,8 +579,20 @@ export default function EditorPage({ initialFile, settings }: Props) {
 					</div>
 				)}
 
+				{cloud.paired && filePath && (
+					<button
+						onClick={() => {
+							const name = filePath.replace(/^.*[\\/]/, "");
+							cloud.addToQueue(filePath, name, 0);
+						}}
+						className="btn-ghost justify-center w-full py-2"
+					>
+						<Upload size={14} /> Upload to Cloud
+					</button>
+				)}
+
 				<button onClick={handleExport} disabled={exporting}
-					className="btn-y justify-center w-full py-3 mt-auto disabled:opacity-50">
+					className="btn-y justify-center w-full py-3 disabled:opacity-50">
 					{exporting
 						? <><Loader2 size={16} className="animate-spin" /> Exporting…</>
 						: <><Download size={16} /> Export Clip</>

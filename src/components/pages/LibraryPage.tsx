@@ -29,7 +29,7 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		const name = path.replace(/^.*[\\/]/, "");
 		if (!confirm(`Add "${name}" to the library?`)) return;
 		const destPath = await window.clipsta?.importClip(path);
-		if (destPath && cloud.paired && confirm(`Upload "${name}" to cloud?`)) {
+		if (destPath && cloud.paired) {
 			cloud.addToQueue(destPath, name, 0);
 		}
 		load();
@@ -114,6 +114,8 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 							onPlay={() => playClip(clip)}
 							onDelete={() => deleteClip(clip)}
 							onEdit={() => onOpenEditor(clip.path)}
+							onUpload={() => cloud.addToQueue(clip.path, clip.name, clip.size)}
+							uploadStatus={cloud.queue.find((j) => j.path === clip.path)}
 						/>
 					))}
 				</div>
@@ -252,9 +254,10 @@ function useThumbnail(path: string): string | null {
 	return thumb;
 }
 
-function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit }: {
+function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, uploadStatus }: {
 	clip: ClipFile; active: boolean;
 	onClick: () => void; onPlay: () => void; onDelete: () => void; onEdit: () => void;
+	onUpload?: () => void; uploadStatus?: UploadJob;
 }) {
 	const thumb = useThumbnail(clip.path);
 
@@ -290,6 +293,22 @@ function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit }: {
 					<button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="p-1 hover:text-red-400 text-text-dim transition-colors">
 						<Trash2 size={11} />
 					</button>
+					{onUpload && !uploadStatus && (
+						<button onClick={(e) => { e.stopPropagation(); onUpload(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Upload to cloud">
+							<Upload size={11} />
+						</button>
+					)}
+					{uploadStatus?.status === "uploading" && (
+						<Loader2 size={11} className="text-y animate-spin" />
+					)}
+					{uploadStatus?.status === "done" && (
+						<CheckCircle size={11} className="text-green-400" />
+					)}
+					{uploadStatus?.status === "failed" && (
+						<button onClick={(e) => { e.stopPropagation(); onUpload?.(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Retry upload">
+							<Upload size={11} className="text-red-400" />
+						</button>
+					)}
 				</div>
 			</div>
 		</div>

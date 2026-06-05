@@ -82,7 +82,7 @@ export default function App() {
 							<LibraryPage onOpenEditor={openInEditor} cloud={cloud} />
 						)}
 						{page === "editor" && (
-							<EditorPage initialFile={editorFile} settings={settings} />
+							<EditorPage initialFile={editorFile} settings={settings} cloud={cloud} />
 						)}
 						{page === "settings" && (
 							<SettingsPage settings={settings} updateSetting={updateSetting} saveAll={saveAll} cloud={cloud} />
