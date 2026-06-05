@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AppSettings, UploadJob } from "../types";
-
-const API_BASE = "https://clipsta-api.godson594.workers.dev";
+import type { AppSettings, CloudConfig, UploadJob } from "../types";
 
 interface CloudState {
 	paired: boolean;
@@ -25,6 +23,17 @@ export function useCloudUpload(settings: AppSettings | null) {
 	const queueRef = useRef<UploadJob[]>([]);
 	const processingRef = useRef(false);
 	const pairingDeviceIdRef = useRef<string | null>(null);
+	const cloudConfigRef = useRef<CloudConfig | null>(null);
+
+	const getCloudConfig = useCallback(async () => {
+		if (!cloudConfigRef.current) {
+			cloudConfigRef.current = await window.clipsta?.getCloudConfig() ?? {
+				apiBase: "https://clipsta-api.godson594.workers.dev",
+				apiKey: "dev-clipsta",
+			};
+		}
+		return cloudConfigRef.current;
+	}, []);
 
 	const getDeviceId = useCallback(() => {
 		let id = settings?.desktopDeviceId;
@@ -49,12 +58,13 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// ── Pairing ───────────────────────────────────────────────────────────
 	const generatePairingCode = useCallback(async () => {
 		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true }));
+		const cfg = await getCloudConfig();
 		try {
-			const res = await fetch(`${API_BASE}/pairing-tokens`, {
+			const res = await fetch(`${cfg.apiBase}/pairing-tokens`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"X-Clipsta-Test-Key": "dev-clipsta",
+					"X-Clipsta-Test-Key": cfg.apiKey,
 				},
 				body: JSON.stringify({
 					desktopDeviceId: getDeviceId(),

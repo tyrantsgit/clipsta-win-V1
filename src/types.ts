@@ -112,6 +112,7 @@ declare global {
 			renameClip(old: string, name: string): Promise<string>;
 			importClip(sourcePath: string): Promise<string>;
 			getSystemInfo(): Promise<SystemInfo>;
+			getCloudConfig(): Promise<CloudConfig>;
 			readFile(path: string): Promise<ArrayBuffer>;
 			uploadClip(opts: UploadClipOpts): Promise<UploadClipResponse>;
 			notifyUploadStatus(body: UploadStatusBody): Promise<void>;
@@ -126,6 +127,11 @@ export interface ExportOpts {
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
+}
+
+export interface CloudConfig {
+	apiBase: string;
+	apiKey: string;
 }
 
 export interface SystemInfo {

@@ -482,7 +482,13 @@ ipcMain.handle("file:read", (_e, filePath: string) => {
 
 // ── IPC: upload clip to cloud ──────────────────────────────────────────────────
 const API_BASE = "https://clipsta-api.godson594.workers.dev";
-const DESKTOP_TEST_KEY = "dev-clipsta";
+const DESKTOP_TEST_KEY = process.env.CLIPSTA_API_KEY || "dev-clipsta";
+
+// Expose cloud config to renderer
+ipcMain.handle("cloud:getConfig", () => ({
+	apiBase: API_BASE,
+	apiKey: DESKTOP_TEST_KEY,
+}));
 
 ipcMain.handle("upload:clip", async (_e, opts: {
 	desktopDeviceId: string;

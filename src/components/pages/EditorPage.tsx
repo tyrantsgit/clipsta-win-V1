@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	Scissors, Download, RotateCcw, Volume2, VolumeX, FileUp,
-	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen,
+	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen, Upload,
 } from "lucide-react";
-import { Upload } from "lucide-react";
 import type { AppSettings, ExportOpts } from "../../types";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
 
@@ -22,7 +21,7 @@ interface Props {
 
 interface CutSeg { start: number; end: number }
 
-export default function EditorPage({ initialFile, settings }: Props) {
+export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [filePath, setFilePath] = useState<string | null>(initialFile);
 	const [playing, setPlaying] = useState(false);
 	const [currentTime, setCurrentTime] = useState(0);

@@ -10,3 +10,4 @@ setup_*/
 *.blockmap
 *.asar
 *.log
+.env
