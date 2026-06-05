@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-electron/
+dist_build/
+release/
+release_build/
+build_*/
+setup_*/
+*.exe
+*.blockmap
+*.asar
+*.log
