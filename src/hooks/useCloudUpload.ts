@@ -29,7 +29,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 		if (!cloudConfigRef.current) {
 			cloudConfigRef.current = await window.clipsta?.getCloudConfig() ?? {
 				apiBase: "https://clipsta-api.godson594.workers.dev",
-				apiKey: "dev-clipsta",
+				apiKey: "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96",
 			};
 		}
 		return cloudConfigRef.current;
@@ -135,6 +135,17 @@ export function useCloudUpload(settings: AppSettings | null) {
 		processingRef.current = false;
 	}, [settings, updateJob]);
 
+	const clearPairing = useCallback(() => {
+		setState((prev) => ({
+			...prev,
+			paired: false,
+			pairingUrl: null,
+			pairingCode: null,
+			pairingError: null,
+		}));
+		window.clipsta?.setSetting("cloudPairCode", "");
+	}, []);
+
 	const addToQueue = useCallback((path: string, name: string, size: number) => {
 		const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued" }]);
@@ -186,6 +197,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	return {
 		...state,
 		generatePairingCode,
+		clearPairing,
 		addToQueue,
 		retryJob,
 		removeJob,

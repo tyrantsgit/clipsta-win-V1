@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload, Loader2, X, Smartphone } from "lucide-react";
+import { Save, FolderOpen, RotateCcw, Keyboard, Monitor, Volume2, Cpu, HardDrive, Cloud, Upload, Loader2, X, Smartphone, Link2Off } from "lucide-react";
 import type { AppSettings } from "../../types";
 import { DEFAULTS } from "../../hooks/useSettings";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
@@ -183,6 +183,17 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 							>
 								<Smartphone size={12} /> Pair with iPhone
 							</button>
+							{cloud.paired && (
+								<button
+									onClick={() => {
+										cloud.clearPairing();
+										setShowPairingModal(false);
+									}}
+									className="btn-ghost w-full justify-center text-xs py-2 text-red-400 hover:text-red-300"
+								>
+									<Link2Off size={12} /> Unpair Device
+								</button>
+							)}
 							{local.uploadBandwidth === 0 && (
 								<p className="text-[10px] text-text-dim">Bandwidth: 0 = unlimited</p>
 							)}
