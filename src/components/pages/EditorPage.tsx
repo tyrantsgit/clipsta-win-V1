@@ -57,7 +57,8 @@ export default function EditorPage({ initialFile, settings }: Props) {
 	}, [initialFile, filePath, loadFile]);
 
 	const onLoadedMetadata = () => {
-		const v = videoRef.current!;
+		const v = videoRef.current;
+		if (!v || !isFinite(v.duration)) return;
 		setDuration(v.duration);
 		setTrimOut(v.duration);
 	};
@@ -239,8 +240,9 @@ export default function EditorPage({ initialFile, settings }: Props) {
 	// ── Time ruler ticks ───────────────────────────────────────────────────
 	const tickInterval = Math.max(1, Math.floor(10 / timelineScale));
 	const ticks: number[] = [];
-	if (duration > 0) {
-		for (let t = 0; t <= duration; t += tickInterval) ticks.push(t);
+	if (duration > 0 && isFinite(duration)) {
+		const maxTicks = 10000;
+		for (let t = 0, count = 0; t <= duration && count < maxTicks; t += tickInterval, count++) ticks.push(t);
 	}
 
 	if (!filePath) {
