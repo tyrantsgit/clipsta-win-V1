@@ -37,6 +37,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const [timelineScale, setTimelineScale] = useState(1);
 	const [dragOver, setDragOver] = useState(false);
+	const [uploadTriggered, setUploadTriggered] = useState(false);
 
 	const [expFormat, setExpFormat] = useState("mp4");
 	const [expResolution, setExpResolution] = useState(settings.resolution);
@@ -581,12 +582,18 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				{cloud.paired && filePath && (
 					<button
 						onClick={() => {
+							if (uploadTriggered) return;
+							setUploadTriggered(true);
 							const name = filePath.replace(/^.*[\\/]/, "");
 							cloud.addToQueue(filePath, name, 0);
 						}}
-						className="btn-ghost justify-center w-full py-2"
+						disabled={uploadTriggered}
+						className="btn-ghost justify-center w-full py-2 disabled:opacity-50"
 					>
-						<Upload size={14} /> Upload to Cloud
+						{uploadTriggered
+							? <><Loader2 size={14} className="animate-spin" /> Queued…</>
+							: <><Upload size={14} /> Upload to Cloud</>
+						}
 					</button>
 				)}
 
