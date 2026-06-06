@@ -37,6 +37,9 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const [timelineScale, setTimelineScale] = useState(1);
 	const [dragOver, setDragOver] = useState(false);
+	const uploadJob = filePath ? cloud.queue.find((j) => j.path === filePath) : undefined;
+	const uploadBusy = !!(uploadJob && (uploadJob.status === "queued" || uploadJob.status === "uploading"));
+	const uploadDone = uploadJob?.status === "done";
 
 	const [expFormat, setExpFormat] = useState("mp4");
 	const [expResolution, setExpResolution] = useState(settings.resolution);
@@ -578,28 +581,22 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					</div>
 				)}
 
-				{cloud.paired && filePath && (() => {
-					const job = cloud.queue.find((j) => j.path === filePath);
-					const busy = job && (job.status === "queued" || job.status === "uploading");
-					const done = job?.status === "done";
-					const failed = job?.status === "failed";
-					return (
-						<button
-							onClick={() => {
-								if (busy || done) return;
-								if (failed) { cloud.retryJob(job!.id); return; }
-								const name = filePath.replace(/^.*[\\/]/, "");
-								cloud.addToQueue(filePath, name, 0);
-							}}
-							disabled={busy}
-							className={`btn-ghost justify-center w-full py-2 ${busy ? "opacity-50" : ""} ${done ? "text-green-400" : ""} ${failed ? "text-red-400" : ""}`}
-						>
-							{busy && <><Loader2 size={14} className="animate-spin" /> {job!.status === "queued" ? "Queued…" : "Uploading…"}</>}
-							{done && <><Upload size={14} /> Uploaded</>}
-							{!busy && !done && <><Upload size={14} /> Upload to Cloud</>}
-						</button>
-					);
-				})()}
+				{cloud.paired && filePath && (
+					<button
+						onClick={() => {
+							if (uploadBusy || uploadDone) return;
+							if (uploadJob?.status === "failed") { cloud.retryJob(uploadJob.id); return; }
+							const name = filePath.replace(/^.*[\\/]/, "");
+							cloud.addToQueue(filePath, name, 0);
+						}}
+						disabled={uploadBusy}
+						className={`btn-ghost justify-center w-full py-2 ${uploadBusy ? "opacity-50" : ""} ${uploadDone ? "text-green-400" : ""} ${uploadJob?.status === "failed" ? "text-red-400" : ""}`}
+					>
+						{uploadBusy && <><Loader2 size={14} className="animate-spin" /> {uploadJob!.status === "queued" ? "Queued…" : "Uploading…"}</>}
+						{uploadDone && <><Upload size={14} /> Uploaded</>}
+						{!uploadBusy && !uploadDone && <><Upload size={14} /> Upload to Cloud</>}
+					</button>
+				)}
 
 				<button onClick={handleExport} disabled={exporting}
 					className="btn-y justify-center w-full py-3 disabled:opacity-50">

@@ -83,22 +83,6 @@ export function useCloudUpload(settings: AppSettings | null) {
 				pairingLoading: false,
 			}));
 			window.clipsta?.setSetting("cloudPairCode", data.token);
-			// Poll for phone to complete pairing
-			const cfg = await getCloudConfig();
-			const poll = setInterval(async () => {
-				try {
-					const pr = await fetch(`${cfg.apiBase}/pairing-status?token=${data.token}`, {
-						headers: { "X-Clipsta-Test-Key": cfg.apiKey },
-					});
-					const ps = await pr.json();
-					if ((ps as any).paired) {
-						clearInterval(poll);
-						setState((prev) => ({ ...prev, paired: true }));
-					}
-				} catch {}
-			}, 3000);
-			// Stop polling after 5 minutes
-			setTimeout(() => clearInterval(poll), 300000);
 		} catch (e: any) {
 			setState((prev) => ({
 				...prev,
@@ -106,7 +90,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 				pairingLoading: false,
 			}));
 		}
-	}, [settings]);
+	}, [settings, getCloudConfig, getDeviceId]);
 
 	// Resume pairing on mount if we have a stored token
 	useEffect(() => {
