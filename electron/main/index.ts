@@ -498,48 +498,57 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 	bytes: number;
 	capturedAt: string;
 }) => {
-	// Step 1: Request upload URL
-	const clipRes = await fetch(`${API_BASE}/clip-uploads`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"X-Clipsta-Test-Key": DESKTOP_TEST_KEY,
-		},
-		body: JSON.stringify({
-			desktopDeviceId: opts.desktopDeviceId,
-			fileName: opts.fileName,
-			durationSeconds: opts.durationSeconds,
-			bytes: opts.bytes,
-			capturedAt: opts.capturedAt,
-		}),
-	});
-	if (!clipRes.ok) {
-		const errBody = await clipRes.text().catch(() => "");
-		throw new Error(`clip-uploads failed: HTTP ${clipRes.status} ${errBody}`);
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 30000);
+
+	try {
+		// Step 1: Request upload URL
+		const clipRes = await fetch(`${API_BASE}/clip-uploads`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"X-Clipsta-Test-Key": DESKTOP_TEST_KEY,
+			},
+			body: JSON.stringify({
+				desktopDeviceId: opts.desktopDeviceId,
+				fileName: opts.fileName,
+				durationSeconds: opts.durationSeconds,
+				bytes: opts.bytes,
+				capturedAt: opts.capturedAt,
+			}),
+			signal: controller.signal,
+		});
+		if (!clipRes.ok) {
+			const errBody = await clipRes.text().catch(() => "");
+			throw new Error(`clip-uploads failed: HTTP ${clipRes.status} ${errBody}`);
+		}
+		const clipData = await clipRes.json();
+
+		// Step 2: Upload file to the returned uploadUrl via multipart form-data
+		const fileBuf = fs.readFileSync(opts.filePath);
+		const boundary = `----ClipstaBoundary${Math.random().toString(36).slice(2)}`;
+		const head = Buffer.from(
+			`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${opts.fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+			"utf-8"
+		);
+		const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf-8");
+		const multipartBody = Buffer.concat([head, fileBuf, tail]);
+
+		const uploadRes = await fetch((clipData as any).uploadUrl, {
+			method: "POST",
+			headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+			body: multipartBody,
+			signal: controller.signal,
+		});
+		if (!uploadRes.ok) {
+			const errBody = await uploadRes.text().catch(() => "");
+			throw new Error(`file upload failed: HTTP ${uploadRes.status} ${errBody}`);
+		}
+
+		return clipData;
+	} finally {
+		clearTimeout(timer);
 	}
-	const clipData = await clipRes.json();
-
-	// Step 2: Upload file to the returned uploadUrl via multipart form-data
-	const fileBuf = fs.readFileSync(opts.filePath);
-	const boundary = `----ClipstaBoundary${Math.random().toString(36).slice(2)}`;
-	const head = Buffer.from(
-		`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${opts.fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
-		"utf-8"
-	);
-	const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf-8");
-	const multipartBody = Buffer.concat([head, fileBuf, tail]);
-
-	const uploadRes = await fetch((clipData as any).uploadUrl, {
-		method: "POST",
-		headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
-		body: multipartBody,
-	});
-	if (!uploadRes.ok) {
-		const errBody = await uploadRes.text().catch(() => "");
-		throw new Error(`file upload failed: HTTP ${uploadRes.status} ${errBody}`);
-	}
-
-	return clipData;
 });
 
 // ── IPC: notify desktop upload status ──────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	Scissors, Download, RotateCcw, Volume2, VolumeX, FileUp,
-	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen, Upload,
+	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen, Upload, Pen, Check,
 } from "lucide-react";
 import type { AppSettings, ExportOpts } from "../../types";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
@@ -39,7 +39,31 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [dragOver, setDragOver] = useState(false);
 	const uploadJob = filePath ? cloud.queue.find((j) => j.path === filePath) : undefined;
 	const uploadBusy = !!(uploadJob && (uploadJob.status === "queued" || uploadJob.status === "uploading"));
-	const uploadDone = uploadJob?.status === "done";
+	const [showUploaded, setShowUploaded] = useState(false);
+
+	useEffect(() => {
+		if (uploadJob?.status === "done") {
+			setShowUploaded(true);
+			const t = setTimeout(() => setShowUploaded(false), 2000);
+			return () => clearTimeout(t);
+		}
+	}, [uploadJob?.status]);
+
+	const [renaming, setRenaming] = useState(false);
+	const [renameValue, setRenameValue] = useState("");
+	const renameInputRef = useRef<HTMLInputElement>(null);
+
+	const handleRename = async () => {
+		if (!filePath || !renameValue.trim()) return;
+		const base = renameValue.trim();
+		const ext = filePath.replace(/^.*\./, "");
+		const newName = ext ? `${base}.${ext}` : base;
+		try {
+			const newPath = await window.clipsta?.renameClip(filePath, newName);
+			if (newPath) setFilePath(newPath);
+		} catch { /* ignore */ }
+		setRenaming(false);
+	};
 
 	const [expFormat, setExpFormat] = useState("mp4");
 	const [expResolution, setExpResolution] = useState(settings.resolution);
@@ -57,9 +81,14 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		setPlaying(false);
 	}, []);
 
+	const prevInitialRef = useRef(initialFile);
+
 	useEffect(() => {
-		if (initialFile && initialFile !== filePath) loadFile(initialFile);
-	}, [initialFile, filePath, loadFile]);
+		if (initialFile && initialFile !== prevInitialRef.current) {
+			prevInitialRef.current = initialFile;
+			loadFile(initialFile);
+		}
+	}, [initialFile, loadFile]);
 
 	const onLoadedMetadata = () => {
 		const v = videoRef.current;
@@ -239,7 +268,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	// ── Aspect ratio CSS ───────────────────────────────────────────────────
 			const aspectRatioValue = {
 				"16:9": 16 / 9, "9:16": 9 / 16,
-				"1:1": 1, "4:3": 4 / 3, "21:9": 21 / 9,
+				"4:3": 4 / 3, "21:9": 21 / 9,
 			}[expAspect] ?? 16 / 9;
 
 	// ── Time ruler ticks ───────────────────────────────────────────────────
@@ -302,6 +331,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 						style={{ aspectRatio: `${aspectRatioValue}`, maxWidth: "100%", maxHeight: "100%", width: "100%", height: "auto" }}
 					>
 						<video
+							key={filePath}
 							ref={videoRef}
 							src={toFileUrl(filePath)}
 							className="max-w-full max-h-full"
@@ -522,6 +552,51 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			<div className="w-64 flex-shrink-0 border-l border-border bg-[#0d0d0d] flex flex-col overflow-y-auto p-4 space-y-4">
 				<h3 className="font-bold text-white text-sm">Export Options</h3>
 
+				{filePath && (
+					<div className="space-y-1">
+						<p className="label">Clip Name</p>
+						{renaming ? (
+							<div className="flex items-center gap-1">
+								<input
+									ref={renameInputRef}
+									value={renameValue}
+									onChange={(e) => setRenameValue(e.target.value)}
+									onKeyDown={(e) => {
+										if (e.key === "Enter") handleRename();
+										if (e.key === "Escape") setRenaming(false);
+									}}
+									onBlur={() => setRenaming(false)}
+									className="input text-xs py-1 flex-1 min-w-0"
+									autoFocus
+								/>
+								<button
+									onMouseDown={(e) => { e.preventDefault(); handleRename(); }}
+									className="p-1.5 rounded bg-y text-black hover:bg-yd transition-colors"
+								>
+									<Check size={13} />
+								</button>
+							</div>
+						) : (
+							<div className="flex items-center gap-1 group">
+								<span className="text-xs text-white truncate flex-1">
+									{filePath.replace(/^.*[\\/]/, "")}
+								</span>
+								<button
+									onClick={() => {
+										const name = filePath.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "");
+										setRenameValue(name);
+										setRenaming(true);
+										setTimeout(() => renameInputRef.current?.select(), 50);
+									}}
+									className="p-1 text-text-dim hover:text-y border border-transparent hover:border-y rounded transition-colors"
+								>
+									<Pen size={11} />
+								</button>
+							</div>
+						)}
+					</div>
+				)}
+
 				<Section title="Trim">
 					<Row label="In" val={formatTime(trimIn)} />
 					<Row label="Out" val={formatTime(trimOut)} />
@@ -562,7 +637,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					<Select label="Resolution" value={expResolution} onChange={setExpResolution}
 						options={["480p", "720p", "1080p", "1440p", "4k"]} />
 					<Select label="Aspect Ratio" value={expAspect} onChange={setExpAspect}
-						options={["16:9", "9:16", "1:1", "4:3", "21:9"]} />
+						options={["16:9", "9:16", "4:3", "21:9"]} />
 				</Section>
 
 				<AspectPreview ratio={expAspect} />
@@ -584,17 +659,17 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				{cloud.paired && filePath && (
 					<button
 						onClick={() => {
-							if (uploadBusy || uploadDone) return;
+							if (uploadBusy) return;
 							if (uploadJob?.status === "failed") { cloud.retryJob(uploadJob.id); return; }
 							const name = filePath.replace(/^.*[\\/]/, "");
 							cloud.addToQueue(filePath, name, 0);
 						}}
 						disabled={uploadBusy}
-						className={`btn-ghost justify-center w-full py-2 ${uploadBusy ? "opacity-50" : ""} ${uploadDone ? "text-green-400" : ""} ${uploadJob?.status === "failed" ? "text-red-400" : ""}`}
+						className={`btn-ghost justify-center w-full py-2 ${uploadBusy ? "opacity-50" : ""} ${showUploaded ? "text-green-400" : ""} ${uploadJob?.status === "failed" ? "text-red-400" : ""}`}
 					>
 						{uploadBusy && <><Loader2 size={14} className="animate-spin" /> {uploadJob!.status === "queued" ? "Queued…" : "Uploading…"}</>}
-						{uploadDone && <><Upload size={14} /> Uploaded</>}
-						{!uploadBusy && !uploadDone && <><Upload size={14} /> Upload to Cloud</>}
+						{showUploaded && !uploadBusy && <><Upload size={14} /> Uploaded</>}
+						{!uploadBusy && !showUploaded && <><Upload size={14} /> Upload to Cloud</>}
 					</button>
 				)}
 
@@ -650,7 +725,7 @@ function Row({ label, val }: { label: string; val: string }) {
 function AspectPreview({ ratio }: { ratio: string }) {
 	const map: Record<string, string> = {
 		"16:9": "w-20 h-[45px]", "9:16": "w-10 h-[71px]",
-		"1:1": "w-14 h-14", "4:3": "w-16 h-12", "21:9": "w-24 h-[41px]",
+		"4:3": "w-16 h-12", "21:9": "w-24 h-[41px]",
 	};
 	const cls = map[ratio] ?? "w-16 h-9";
 	return (

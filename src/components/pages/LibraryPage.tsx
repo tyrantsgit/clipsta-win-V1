@@ -150,6 +150,9 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 									if (status?.status === "uploading") {
 										return <span className="text-y text-[10px] flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> {status.progress}%</span>;
 									}
+									if (status?.status === "queued") {
+										return <span className="text-text-dim text-[10px] flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Queued</span>;
+									}
 									if (status?.status === "failed") {
 										return (
 											<>
@@ -297,6 +300,9 @@ function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, up
 						<button onClick={(e) => { e.stopPropagation(); onUpload(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Upload to cloud">
 							<Upload size={11} />
 						</button>
+					)}
+					{uploadStatus?.status === "queued" && (
+						<Loader2 size={11} className="text-text-dim animate-spin" />
 					)}
 					{uploadStatus?.status === "uploading" && (
 						<Loader2 size={11} className="text-y animate-spin" />

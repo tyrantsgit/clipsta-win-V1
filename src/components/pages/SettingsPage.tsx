@@ -92,10 +92,10 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 							options={["30", "60", "120"]} />
 						<SelectField label="Encoder" value={local.encoder}
 							onChange={(v) => update("encoder", v)}
-							options={["auto", "x264 (Software)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
+							options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio}
 							onChange={(v) => update("aspectRatio", v)}
-							options={["16:9", "9:16", "1:1", "4:3", "21:9"]} />
+							options={["16:9", "9:16", "4:3", "21:9"]} />
 						<NumberField label="Video Bitrate (kbps)" value={local.bitrate}
 							onChange={(v) => update("bitrate", v)} min={1000} max={50000} step={500} />
 						<SelectField label="Buffer Duration" value={String(local.bufferDuration)}

@@ -78,6 +78,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 			const data = (await res.json()) as { token: string; pairingUrl: string; expiresAt: string };
 			setState((prev) => ({
 				...prev,
+				paired: true,
 				pairingUrl: data.pairingUrl,
 				pairingCode: data.token,
 				pairingLoading: false,
@@ -104,34 +105,39 @@ export function useCloudUpload(settings: AppSettings | null) {
 		if (processingRef.current) return;
 		processingRef.current = true;
 
-		while (queueRef.current.some((j) => j.status === "queued")) {
-			const job = queueRef.current.find((j) => j.status === "queued");
-			if (!job) break;
+		try {
+			while (queueRef.current.some((j) => j.status === "queued")) {
+				const job = queueRef.current.find((j) => j.status === "queued");
+				if (!job) break;
 
-			updateJob(job.id, { status: "uploading", progress: 0 });
+				updateJob(job.id, { status: "uploading", progress: 0 });
 
-			try {
-				const result = await window.clipsta?.uploadClip({
-					desktopDeviceId: getDeviceId(),
-					filePath: job.path,
-					fileName: job.name,
-					durationSeconds: 0,
-					bytes: job.size,
-					capturedAt: new Date().toISOString(),
-				});
+				try {
+					const result = await window.clipsta?.uploadClip({
+						desktopDeviceId: getDeviceId(),
+						filePath: job.path,
+						fileName: job.name,
+						durationSeconds: 0,
+						bytes: job.size,
+						capturedAt: new Date().toISOString(),
+					});
 
-				updateJob(job.id, {
-					status: "done",
-					progress: 100,
-					streamUid: result?.streamUid,
-					shareUrl: result?.shareUrl,
-				});
-			} catch (e: any) {
-				updateJob(job.id, { status: "failed", error: e.message ?? String(e) });
+					updateJob(job.id, {
+						status: "done",
+						progress: 100,
+						streamUid: result?.streamUid,
+						shareUrl: result?.shareUrl,
+					});
+				} catch (e: any) {
+					updateJob(job.id, { status: "failed", error: e.message ?? String(e) });
+				}
+			}
+		} finally {
+			processingRef.current = false;
+			if (queueRef.current.some((j) => j.status === "queued")) {
+				setTimeout(processQueue, 100);
 			}
 		}
-
-		processingRef.current = false;
 	}, [settings, updateJob]);
 
 	const clearPairing = useCallback(() => {
@@ -146,10 +152,19 @@ export function useCloudUpload(settings: AppSettings | null) {
 	}, []);
 
 	const addToQueue = useCallback((path: string, name: string, size: number) => {
+		const existing = queueRef.current.find((j) => j.path === path);
+		if (existing) {
+			if (existing.status === "queued" || existing.status === "uploading") return;
+			if (existing.status === "failed") {
+				updateJob(existing.id, { status: "queued", progress: 0, error: undefined });
+				setTimeout(processQueue, 100);
+				return;
+			}
+		}
 		const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued" }]);
 		setTimeout(processQueue, 100);
-	}, [syncQueue, processQueue]);
+	}, [syncQueue, updateJob, processQueue]);
 
 	const retryJob = useCallback((id: string) => {
 		updateJob(id, { status: "queued", progress: 0, error: undefined });
