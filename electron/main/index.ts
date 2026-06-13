@@ -133,10 +133,10 @@ app.on("activate", () => { if (!mainWindow) createWindow(); });
 // ── Window ────────────────────────────────────────────────────────────────────
 async function createWindow() {
 	mainWindow = new BrowserWindow({
-		width: 1200,
-		height: 760,
-		minWidth: 960,
-		minHeight: 640,
+		width: 1400,
+		height: 900,
+		minWidth: 1100,
+		minHeight: 720,
 		frame: false,
 		transparent: false,
 		backgroundColor: "#0a0a0a",
@@ -324,6 +324,7 @@ ipcMain.handle(
 	"recording:export",
 	async (_e, inputPath: string, outputPath: string, opts: ExportOpts): Promise<string> => {
 		const vfFilters: string[] = [];
+		let concatFile: string | null = null;
 
 		// Cuts — build select expression to skip removed segments
 		if (opts.cuts && opts.cuts.length > 0) {
@@ -337,7 +338,6 @@ ipcMain.handle(
 
 		// Aspect ratio crop
 		if (opts.aspectRatio === "9:16") vfFilters.push("crop=ih*9/16:ih");
-		else if (opts.aspectRatio === "1:1") vfFilters.push("crop=min(iw\\,ih):min(iw\\,ih)");
 		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=ih*4/3:ih");
 
 		// Resolution scale
@@ -348,10 +348,29 @@ ipcMain.handle(
 		if (opts.resolution && scaleMap[opts.resolution])
 			vfFilters.push(`scale=${scaleMap[opts.resolution]}`);
 
-		// Build trim args
-		const args: string[] = ["-hwaccel", "auto", "-i", inputPath];
-		if (opts.trimStart != null) args.push("-ss", String(opts.trimStart));
-		if (opts.trimEnd != null) args.push("-to", String(opts.trimEnd));
+		const args: string[] = [];
+
+		// Multi-clip timeline: use FFmpeg concat demuxer
+		if (opts.timeline && opts.timeline.length > 1) {
+			const concatPath = path.join(app.getPath("temp"), `clipsta_concat_${Date.now()}.txt`);
+			concatFile = concatPath;
+			const lines = ["ffconcat version 1.0"];
+			for (const clip of opts.timeline) {
+				const p = clip.path.replace(/\\/g, "/");
+				lines.push(`file '${p.replace(/'/g, "'\\''")}'`);
+				if (clip.trimIn > 0) lines.push(`inpoint ${clip.trimIn}`);
+				const dur = clip.trimOut - clip.trimIn;
+				if (dur > 0) lines.push(`duration ${dur}`);
+			}
+			fs.writeFileSync(concatPath, lines.join("\n"), "utf-8");
+			args.push("-f", "concat", "-safe", "0", "-i", concatPath);
+		} else {
+			// Single clip
+			args.push("-hwaccel", "auto", "-i", inputPath);
+			if (opts.trimStart != null) args.push("-ss", String(opts.trimStart));
+			if (opts.trimEnd != null) args.push("-to", String(opts.trimEnd));
+		}
+
 		if (vfFilters.length) args.push("-vf", vfFilters.join(","));
 		if (opts.cuts && opts.cuts.length > 0) {
 			const aTerms = opts.cuts
@@ -366,11 +385,14 @@ ipcMain.handle(
 		args.push("-c:a", "aac", "-b:a", "192k");
 		args.push("-movflags", "+faststart", "-y", outputPath);
 
-		// Try system ffmpeg, fallback message
 		return new Promise((resolve, reject) => {
-			execFile("ffmpeg", args, (err2) => {
+			execFile("ffmpeg", args, { timeout: 300000 }, (err2, _stdout, stderr) => {
+				if (concatFile) {
+					try { fs.unlinkSync(concatFile); } catch { /* ignore */ }
+				}
 				if (err2) {
-					reject("FFmpeg not found. Install ffmpeg and add to PATH: https://ffmpeg.org/download.html");
+					const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
+					reject(`FFmpeg error: ${detail}`);
 				} else {
 					resolve(outputPath);
 				}
@@ -480,6 +502,18 @@ ipcMain.handle("file:read", (_e, filePath: string) => {
 	return fs.readFileSync(filePath).buffer;
 });
 
+ipcMain.handle("file:stat", (_e, filePath: string) => {
+	const s = fs.statSync(filePath);
+	return { size: s.size, modifiedAt: s.mtime.toISOString() };
+});
+
+ipcMain.handle("file:ensureDir", (_e, dirPath: string) => {
+	if (!fs.existsSync(dirPath)) {
+		fs.mkdirSync(dirPath, { recursive: true });
+	}
+	return true;
+});
+
 // ── IPC: upload clip to cloud ──────────────────────────────────────────────────
 const API_BASE = "https://clipsta-api.godson594.workers.dev";
 const DESKTOP_TEST_KEY = process.env.CLIPSTA_API_KEY || "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96";
@@ -497,11 +531,74 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 	durationSeconds: number;
 	bytes: number;
 	capturedAt: string;
+	trimStart?: number;
+	trimEnd?: number;
+	cuts?: { start: number; end: number }[];
 }) => {
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 30000);
+	const uploadTimer = setTimeout(() => controller.abort(), 120000);
+	let cleanupPath: string | null = null;
 
 	try {
+		// Step 0: If trim/cuts provided, export the edited portion to a temp file
+		let uploadPath = opts.filePath;
+		let uploadName = opts.fileName;
+		if (opts.trimStart != null || opts.trimEnd != null || (opts.cuts && opts.cuts.length > 0)) {
+			const ext = path.extname(opts.fileName) || ".mp4";
+			const base = path.basename(opts.fileName, ext);
+			const tempDir = app.getPath("temp");
+			cleanupPath = path.join(tempDir, `clipsta_upload_${base}_${Date.now()}${ext}`);
+			const vfFilters: string[] = [];
+
+			if (opts.cuts && opts.cuts.length > 0) {
+				const terms = opts.cuts
+					.filter((c) => c.start < c.end)
+					.map((c) => `between(t,${c.start},${c.end})`);
+				if (terms.length) {
+					vfFilters.push(`select='not(${terms.join("+")})',setpts=N/FRAME_RATE/TB`);
+				}
+			}
+
+			const exportArgs: string[] = [
+				"-hwaccel", "auto", "-i", opts.filePath,
+			];
+			if (opts.trimStart != null) exportArgs.push("-ss", String(opts.trimStart));
+			if (opts.trimEnd != null) exportArgs.push("-to", String(opts.trimEnd));
+			if (vfFilters.length) exportArgs.push("-vf", vfFilters.join(","));
+			if (opts.cuts && opts.cuts.length > 0) {
+				const aTerms = opts.cuts
+					.filter((c) => c.start < c.end)
+					.map((c) => `between(t,${c.start},${c.end})`);
+				if (aTerms.length) {
+					exportArgs.push("-af", `aselect='not(${aTerms.join("+")})',asetpts=N/SR/TB`);
+				}
+			}
+			exportArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23");
+			exportArgs.push("-c:a", "aac", "-b:a", "192k");
+			exportArgs.push("-movflags", "+faststart", "-y", cleanupPath);
+
+			await new Promise<void>((resolve, reject) => {
+				execFile("ffmpeg", exportArgs, { timeout: 300000 }, (err2, _stdout, stderr) => {
+					if (err2) {
+						const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
+						reject(`FFmpeg export error: ${detail}`);
+					} else {
+						resolve();
+					}
+				});
+			});
+
+			uploadPath = cleanupPath;
+			uploadName = `${base}.mp4`;
+		}
+
+		// Read true file size from disk
+		let actualBytes = opts.bytes;
+		try {
+			const s = fs.statSync(uploadPath);
+			actualBytes = s.size;
+		} catch { /* fall back */ }
+
 		// Step 1: Request upload URL
 		const clipRes = await fetch(`${API_BASE}/clip-uploads`, {
 			method: "POST",
@@ -511,9 +608,9 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 			},
 			body: JSON.stringify({
 				desktopDeviceId: opts.desktopDeviceId,
-				fileName: opts.fileName,
+				fileName: uploadName,
 				durationSeconds: opts.durationSeconds,
-				bytes: opts.bytes,
+				bytes: actualBytes,
 				capturedAt: opts.capturedAt,
 			}),
 			signal: controller.signal,
@@ -525,10 +622,14 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 		const clipData = await clipRes.json();
 
 		// Step 2: Upload file to the returned uploadUrl via multipart form-data
-		const fileBuf = fs.readFileSync(opts.filePath);
+		const fileBuf = fs.readFileSync(uploadPath);
+		const mime = uploadName.endsWith(".webm") ? "video/webm"
+			: uploadName.endsWith(".mkv") ? "video/x-matroska"
+			: uploadName.endsWith(".mov") ? "video/quicktime"
+			: "video/mp4";
 		const boundary = `----ClipstaBoundary${Math.random().toString(36).slice(2)}`;
 		const head = Buffer.from(
-			`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${opts.fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+			`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${uploadName}"\r\nContent-Type: ${mime}\r\n\r\n`,
 			"utf-8"
 		);
 		const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf-8");
@@ -547,7 +648,10 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 
 		return clipData;
 	} finally {
-		clearTimeout(timer);
+		clearTimeout(uploadTimer);
+		if (cleanupPath) {
+			try { fs.unlinkSync(cleanupPath); } catch { /* ignore */ }
+		}
 	}
 });
 
@@ -584,4 +688,5 @@ interface ExportOpts {
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
+	timeline?: { path: string; trimIn: number; trimOut: number }[];
 }

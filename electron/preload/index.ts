@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld("clipsta", {
 
 	// File
 	readFile: (p: string) => ipcRenderer.invoke("file:read", p),
+	getFileStats: (p: string) => ipcRenderer.invoke("file:stat", p),
+	ensureDir: (p: string) => ipcRenderer.invoke("file:ensureDir", p),
 
 	// Cloud config
 	getCloudConfig: () => ipcRenderer.invoke("cloud:getConfig"),

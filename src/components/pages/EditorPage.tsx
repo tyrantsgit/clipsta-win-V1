@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	Scissors, Download, RotateCcw, Volume2, VolumeX, FileUp,
 	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen, Upload, Pen, Check,
+	Plus, ArrowUp, ArrowDown, GripHorizontal,
 } from "lucide-react";
-import type { AppSettings, ExportOpts } from "../../types";
+import type { AppSettings, ExportOpts, TimelineEntry } from "../../types";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
 
 function toFileUrl(p: string): string {
@@ -22,7 +23,14 @@ interface Props {
 interface CutSeg { start: number; end: number }
 
 export default function EditorPage({ initialFile, settings, cloud }: Props) {
-	const [filePath, setFilePath] = useState<string | null>(initialFile);
+	const [timeline, setTimeline] = useState<TimelineEntry[]>(() => {
+		if (!initialFile) return [];
+		const name = initialFile.replace(/^.*[\\/]/, "");
+		return [{ id: crypto.randomUUID(), path: initialFile, name, trimIn: 0, trimOut: 0 }];
+	});
+	const [activeIdx, setActiveIdx] = useState(0);
+	const filePath = timeline[activeIdx]?.path ?? null;
+
 	const [playing, setPlaying] = useState(false);
 	const [currentTime, setCurrentTime] = useState(0);
 	const [duration, setDuration] = useState(0);
@@ -36,7 +44,11 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [exportError, setExportError] = useState<string | null>(null);
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const [timelineScale, setTimelineScale] = useState(1);
+	const [scissorPos, setScissorPos] = useState<number | null>(null);
+	const [cutMode, setCutMode] = useState(false);
+	const cutCount = cuts.length;
 	const [dragOver, setDragOver] = useState(false);
+	const dragSrcRef = useRef<number | null>(null);
 	const uploadJob = filePath ? cloud.queue.find((j) => j.path === filePath) : undefined;
 	const uploadBusy = !!(uploadJob && (uploadJob.status === "queued" || uploadJob.status === "uploading"));
 	const [showUploaded, setShowUploaded] = useState(false);
@@ -52,16 +64,15 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [renaming, setRenaming] = useState(false);
 	const [renameValue, setRenameValue] = useState("");
 	const renameInputRef = useRef<HTMLInputElement>(null);
+	const [resetKey, setResetKey] = useState(0);
 
 	const handleRename = async () => {
-		if (!filePath || !renameValue.trim()) return;
+		const entry = timeline[activeIdx];
+		if (!entry || !renameValue.trim()) return;
 		const base = renameValue.trim();
-		const ext = filePath.replace(/^.*\./, "");
+		const ext = entry.path.replace(/^.*\./, "");
 		const newName = ext ? `${base}.${ext}` : base;
-		try {
-			const newPath = await window.clipsta?.renameClip(filePath, newName);
-			if (newPath) setFilePath(newPath);
-		} catch { /* ignore */ }
+		setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, name: newName } : e));
 		setRenaming(false);
 	};
 
@@ -69,39 +80,115 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [expResolution, setExpResolution] = useState(settings.resolution);
 	const [expAspect, setExpAspect] = useState(settings.aspectRatio);
 
-	const loadFile = useCallback((path: string) => {
-		setFilePath(path);
-		setTrimIn(0);
-		setTrimOut(0);
-		setCurrentTime(0);
-		setDuration(0);
-		setCuts([]);
-		setExportDone(null);
-		setExportError(null);
-		setPlaying(false);
-	}, []);
+	const selectClip = useCallback((idx: number) => {
+		if (idx === activeIdx || idx < 0 || idx >= timeline.length) return;
+		// Save current trim to the leaving entry
+		setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e));
+		setActiveIdx(idx);
+	}, [activeIdx, trimIn, trimOut]);
+
+	// When activeIdx or resetKey changes, load the new clip's trim values
+	useEffect(() => {
+		const entry = timeline[activeIdx];
+		if (entry) {
+			setTrimIn(entry.trimIn);
+			if (entry.trimOut > 0) setTrimOut(entry.trimOut);
+			setCurrentTime(0);
+			setCuts([]);
+			setCutMode(false);
+			setExportDone(null);
+			setExportError(null);
+			setPlaying(false);
+		}
+	}, [activeIdx, resetKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	// Keep active timeline entry in sync with local trim state
+	useEffect(() => {
+		const entry = timeline[activeIdx];
+		if (entry && (entry.trimIn !== trimIn || entry.trimOut !== trimOut)) {
+			setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e));
+		}
+	}, [trimIn, trimOut, activeIdx, timeline]);
+
+	const addToTimeline = useCallback(async (path: string) => {
+		const name = path.replace(/^.*[\\/]/, "");
+		const entry: TimelineEntry = {
+			id: crypto.randomUUID(),
+			path,
+			name,
+			trimIn: 0,
+			trimOut: 0,
+		};
+		setTimeline((prev) => [...prev, entry]);
+		setActiveIdx(timeline.length);
+	}, [timeline.length]);
+
+	const removeFromTimeline = useCallback((idx: number) => {
+		const newTimeline = timeline.filter((_, i) => i !== idx);
+		setTimeline(newTimeline);
+		if (newTimeline.length === 0) {
+			setActiveIdx(-1);
+			setCurrentTime(0);
+			setDuration(0);
+			setTrimIn(0);
+			setTrimOut(0);
+			setCuts([]);
+			setCutMode(false);
+			setPlaying(false);
+			if (activeIdx >= newTimeline.length) setActiveIdx(newTimeline.length - 1);
+			else if (activeIdx > idx) setActiveIdx(activeIdx - 1);
+			else if (activeIdx === idx) {
+				setActiveIdx(Math.min(idx, newTimeline.length - 1));
+			}
+		}
+	}, [timeline, activeIdx]);
+
+	const moveClip = useCallback((idx: number, dir: -1 | 1) => {
+		const to = idx + dir;
+		if (to < 0 || to >= timeline.length) return;
+		setTimeline((prev) => {
+			const next = [...prev];
+			[next[idx], next[to]] = [next[to], next[idx]];
+			return next;
+		});
+		setActiveIdx(to);
+	}, [timeline.length]);
 
 	const prevInitialRef = useRef(initialFile);
 
 	useEffect(() => {
 		if (initialFile && initialFile !== prevInitialRef.current) {
 			prevInitialRef.current = initialFile;
-			loadFile(initialFile);
+			const name = initialFile.replace(/^.*[\\/]/, "");
+			setTimeline([{ id: crypto.randomUUID(), path: initialFile, name, trimIn: 0, trimOut: 0 }]);
+			setActiveIdx(0);
+			setCurrentTime(0);
+			setDuration(0);
+			setCuts([]);
+			setExportDone(null);
+			setExportError(null);
+			setPlaying(false);
 		}
-	}, [initialFile, loadFile]);
+	}, [initialFile]);
 
 	const onLoadedMetadata = () => {
 		const v = videoRef.current;
 		if (!v || !isFinite(v.duration)) return;
-		setDuration(v.duration);
-		setTrimOut(v.duration);
+		setDuration((prev) => prev > 0 ? prev : v.duration);
+		const entry = timeline[activeIdx];
+		if (entry) {
+			if (entry.trimOut === 0) {
+				setTrimOut(v.duration);
+				setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimOut: v.duration } : e));
+			}
+		}
 	};
 
 	const onTimeUpdate = () => {
 		const v = videoRef.current;
 		if (!v) return;
 		setCurrentTime(v.currentTime);
-		if (v.currentTime >= trimOut) {
+		if (trimOut > 0 && v.currentTime >= trimOut) {
 			v.currentTime = trimIn;
 			if (!playing) v.pause();
 		}
@@ -112,7 +199,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		setCurrentTime(t);
 	};
 
-	const getTimeFromEvent = (clientX: number, parentEl: HTMLElement) => {
+	const getTimeFromEvent = (clientX: number, parentEl: EventTarget & Element) => {
 		const rect = parentEl.getBoundingClientRect();
 		return ((clientX - rect.left) / rect.width) * duration;
 	};
@@ -123,6 +210,16 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const handleTimelineMouseDown = (e: React.MouseEvent) => {
 		const parent = e.currentTarget;
 		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent)));
+		if (cutMode) {
+			// Place cut at this position
+			setScissorPos(t);
+			setTimeout(() => setScissorPos(null), 600);
+			const half = 0.5;
+			const start = Math.max(0, t - half);
+			const end = Math.min(duration, t + half);
+			setCuts((prev) => [...prev, { start, end }].sort((a, b) => a.start - b.start));
+			return;
+		}
 		seek(t);
 		scrubRef.current = true;
 		const move = (me: MouseEvent) => {
@@ -143,8 +240,9 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		e.preventDefault();
 		const parent = e.currentTarget as HTMLElement;
 		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent)));
-		// Add a cut segment of 2s around the clicked point
-		const half = 1;
+		setScissorPos(t);
+		setTimeout(() => setScissorPos(null), 600);
+		const half = 0.5;
 		const start = Math.max(0, t - half);
 		const end = Math.min(duration, t + half);
 		setCuts((prev) => {
@@ -174,13 +272,92 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		setCuts((prev) => [...prev, { start: trimIn, end: trimOut }].sort((a, b) => a.start - b.start));
 	};
 
+	const cutAtPlayhead = () => {
+		const t = videoRef.current?.currentTime ?? currentTime;
+		const start = Math.max(0, t - half);
+		const end = Math.min(duration, t + half);
+		setCuts((prev) => [...prev, { start, end }].sort((a, b) => a.start - b.start));
+	};
+
+	const sanitizeName = (s: string) => s.replace(/[<>:"/\\|?*]/g, "").trim() || "clip";
+
+	const handleQuickMerge = async () => {
+		if (timeline.length < 2) return;
+		// Pause playback before merge
+		setPlaying(false);
+		if (videoRef.current) videoRef.current.pause();
+		const exportTimeline = timeline.map((e, i) =>
+			i === activeIdx ? { ...e, trimIn, trimOut } : e
+		);
+		// Validate all clips have a loaded duration
+		const zeroDur = exportTimeline.find((e) => e.trimOut <= e.trimIn);
+		if (zeroDur) {
+			setExportError(`"${zeroDur.name}" has no duration loaded yet. Wait for preview to load.`);
+			return;
+		}
+		const folder = settings.outputFolder;
+		if (!folder) { setExportError("No output folder set in Settings"); return; }
+		const mergedName = exportTimeline.map((e) => sanitizeName(e.name.replace(/\.[^.]+$/, ""))).join(" + ");
+		const outPath = `${folder}\\${mergedName}.mp4`;
+		// Ensure output folder exists (create if needed)
+		try { await window.clipsta?.ensureDir(folder); } catch { /* best effort */ }
+		setExporting(true);
+		setExportDone(null);
+		setExportError(null);
+		try {
+			const primaryPath = exportTimeline[0].path;
+			const opts: ExportOpts = {
+				format: "mp4",
+				resolution: expResolution,
+				aspectRatio: expAspect,
+				timeline: exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut })),
+			};
+			const out = await window.clipsta?.exportRecording(primaryPath, outPath, opts);
+			if (out) {
+				resetEditorForFile(out);
+			} else {
+				setExportDone(null);
+				setExportError("Merge failed — no output file was created");
+			}
+		} catch (e: any) {
+			setExportError(e?.message ?? String(e));
+		} finally {
+			setExporting(false);
+		}
+	};
+
+	const resetEditorForFile = useCallback((path: string) => {
+		const name = path.replace(/^.*[\\/]/, "");
+		setTimeline([{ id: crypto.randomUUID(), path, name, trimIn: 0, trimOut: 0 }]);
+		setTrimIn(0);
+		setTrimOut(0);
+		setCurrentTime(0);
+		setCuts([]);
+		setCutMode(false);
+		setScissorPos(null);
+		setExportDone(path);
+		setExportError(null);
+		setPlaying(false);
+		setActiveIdx(0);
+		setResetKey((k) => k + 1);
+	}, []);
+
 	const removeCut = (idx: number) => {
 		setCuts((prev) => prev.filter((_, i) => i !== idx));
 	};
 
 	const handleExport = async () => {
-		if (!filePath) return;
-		const baseName = filePath.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "");
+		if (timeline.length === 0) return;
+		// Pause playback before export
+		setPlaying(false);
+		if (videoRef.current) videoRef.current.pause();
+		// Save current trim to active entry
+		const exportTimeline = timeline.map((e, i) =>
+			i === activeIdx ? { ...e, trimIn, trimOut } : e
+		);
+		const baseName = exportTimeline.length === 1
+			? (exportTimeline[0].name || exportTimeline[0].path.replace(/^.*[\\/]/, "")).replace(/\.[^.]+$/, "")
+			: "combined";
 		const ext = expFormat === "webm" ? "webm" : expFormat === "mkv" ? "mkv" : expFormat === "mov" ? "mov" : "mp4";
 		const savePath = await window.clipsta?.browseSaveExport(`${baseName}_export.${ext}`);
 		if (!savePath) return;
@@ -188,16 +365,26 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		setExportDone(null);
 		setExportError(null);
 		try {
+			// Use first clip's path for IPC (will be overridden by timeline if multi)
+			const primaryPath = exportTimeline[0].path;
 			const opts: ExportOpts = {
 				format: expFormat,
 				resolution: expResolution,
 				aspectRatio: expAspect,
-				trimStart: trimIn > 0 ? trimIn : undefined,
-				trimEnd: trimOut < duration ? trimOut : undefined,
-				cuts: cuts.length > 0 ? cuts : undefined,
+				timeline: exportTimeline.length > 1
+					? exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut }))
+					: undefined,
+			trimStart: exportTimeline.length === 1 && trimIn > 0 ? trimIn : undefined,
+			trimEnd: exportTimeline.length === 1 && trimOut < duration ? trimOut : undefined,
+				cuts: exportTimeline.length === 1 && cuts.length > 0 ? cuts : undefined,
 			};
-			const out = await window.clipsta?.exportRecording(filePath, savePath, opts);
+			const out = await window.clipsta?.exportRecording(primaryPath, savePath, opts);
 			setExportDone(out ?? null);
+			if (out) {
+				resetEditorForFile(out);
+			} else {
+				setExportError("Export failed — no output file was created");
+			}
 		} catch (e: any) {
 			setExportError(e?.message ?? String(e));
 		} finally {
@@ -216,7 +403,8 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				case "Space": e.preventDefault(); togglePlay(); break;
 				case "KeyI": setTrimIn(t); if (videoRef.current) videoRef.current.currentTime = t; break;
 				case "KeyO": setTrimOut(t); break;
-				case "KeyX": removeSegment(); break;
+				case "KeyX": e.preventDefault(); cutAtPlayhead(); break;
+				case "Escape": setCutMode(false); break;
 			}
 		};
 		window.addEventListener("keydown", onKey);
@@ -226,19 +414,21 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	// ── Drag-and-drop handlers (counter-based to avoid child-element flicker) ──
 	const dragCounterRef = useRef(0);
 
-	const getDroppedPath = (dt: DataTransfer): string | null => {
-		const f = dt.files[0];
-		if (!f) return null;
-		if ((f as any).path) return (f as any).path;
-		return null;
+	const getDroppedPaths = (dt: DataTransfer): string[] => {
+		const paths: string[] = [];
+		for (const f of Array.from(dt.files)) {
+			const p = (f as any).path || f.name;
+			if (p && /\.(webm|mp4|mkv|mov)$/i.test(p)) paths.push(p);
+		}
+		return paths;
 	};
 
 	const handleDrop = (e: React.DragEvent) => {
 		e.preventDefault();
 		dragCounterRef.current = 0;
 		setDragOver(false);
-		const path = getDroppedPath(e.dataTransfer);
-		if (path) loadFile(path);
+		const paths = getDroppedPaths(e.dataTransfer);
+		paths.forEach((p) => addToTimeline(p));
 	};
 
 	const handleDragEnter = (e: React.DragEvent) => {
@@ -262,7 +452,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 
 	const handleBrowse = async () => {
 		const path = await window.clipsta?.browseFile();
-		if (path) loadFile(path);
+		if (path) addToTimeline(path);
 	};
 
 	// ── Aspect ratio CSS ───────────────────────────────────────────────────
@@ -282,7 +472,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	if (!filePath) {
 		return (
 			<div
-				className={`h-full flex items-center justify-center flex-col gap-4 text-center p-8 transition-colors ${dragOver ? "bg-[#1c1c00]" : ""}`}
+				className={`flex-1 flex items-center justify-center flex-col gap-4 text-center p-8 transition-colors ${dragOver ? "bg-[#1c1c00]" : ""}`}
 				onDrop={handleDrop}
 				onDragEnter={handleDragEnter}
 				onDragOver={handleDragOver}
@@ -306,7 +496,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 
 	return (
 		<div
-			className={`h-full flex overflow-hidden transition-colors ${dragOver ? "bg-[#1c1c00]" : ""}`}
+			className={`flex-1 flex overflow-hidden transition-colors ${dragOver ? "bg-[#1c1c00]" : ""}`}
 			onDrop={handleDrop}
 			onDragEnter={handleDragEnter}
 			onDragOver={handleDragOver}
@@ -317,41 +507,135 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				<div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 pointer-events-none">
 					<div className="rounded-2xl border-2 border-dashed border-y p-10 text-center bg-[#1c1c00]/80 backdrop-blur-sm shadow-[0_0_60px_rgba(212,240,0,0.1)]">
 						<FileUp size={40} className="mx-auto mb-3 text-y" />
-						<p className="text-y text-lg font-bold">Drop video to load</p>
+						<p className="text-y text-lg font-bold">
+							{timeline.length > 0 ? "Drop to add to timeline" : "Drop video to start"}
+						</p>
 						<p className="text-text-dim text-sm mt-1">Supports MP4, WebM, MKV, MOV</p>
+						{timeline.length > 0 && (
+							<p className="text-text-dim text-xs mt-2">
+								{timeline.length} clip{timeline.length !== 1 ? "s" : ""} in timeline · will concatenate in order
+							</p>
+						)}
 					</div>
 				</div>
 			)}
 			{/* ── Main editor area ── */}
 			<div className="flex-1 flex flex-col overflow-hidden">
+				{/* Clip strip */}
+				{timeline.length > 0 && (
+					<div className="flex-shrink-0 bg-[#0d0d0d] border-b border-border px-3 py-2">
+						<div className="flex gap-2 items-center overflow-x-auto">
+							{timeline.map((clip, idx) => (
+								<div
+									key={clip.id}
+									onClick={() => selectClip(idx)}
+									draggable={timeline.length > 1}
+									onDragStart={(e) => {
+										e.dataTransfer.effectAllowed = "move";
+										e.dataTransfer.setData("text/plain", String(idx));
+										(e.currentTarget as HTMLElement).style.opacity = "0.4";
+									}}
+									onDragEnd={(e) => {
+										(e.currentTarget as HTMLElement).style.opacity = "1";
+									}}
+									onDragOver={(e) => {
+										e.preventDefault();
+										e.dataTransfer.dropEffect = "move";
+									}}
+									onDrop={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										const fromIdx = parseInt(e.dataTransfer.getData("text/plain"));
+										if (isNaN(fromIdx) || fromIdx === idx) return;
+										setTimeline((prev) => {
+											const next = [...prev];
+											const [moved] = next.splice(fromIdx, 1);
+											next.splice(idx, 0, moved);
+											return next;
+										});
+									}}
+									className={`flex-shrink-0 flex items-center gap-2 px-3 py-1.5 rounded text-xs transition-colors border select-none cursor-grab active:cursor-grabbing ${
+										idx === activeIdx
+											? "bg-y/10 border-y/50 text-y"
+											: "bg-muted border-border text-text-mid hover:border-y/30 hover:text-white"
+									}`}
+								>
+									<span className="font-mono truncate max-w-[120px]">{clip.name}</span>
+									<span className="text-[9px] opacity-60 tabular-nums">
+										{formatTime(clip.trimOut - clip.trimIn)}
+									</span>
+								</div>
+							))}
+						</div>
+						{/* Full-width drop zone */}
+						<div
+							onClick={handleBrowse}
+							className={`mt-2 flex items-center justify-center gap-2 py-3 px-4 rounded-lg border-2 border-dashed cursor-pointer transition-colors ${
+								dragOver
+									? "border-y bg-y/10 text-y"
+									: "border-border text-text-dim hover:border-y/50 hover:text-y/80"
+							}`}
+						>
+							<Plus size={18} />
+							<div className="text-center">
+								<p className="text-xs font-semibold">
+									{dragOver ? "Drop to add to timeline" : "Drag video here or click to browse"}
+								</p>
+								<p className="text-[9px] opacity-50 mt-0.5">
+									{timeline.length} clip{timeline.length !== 1 ? "s" : ""} · will concatenate in order
+								</p>
+							</div>
+						</div>
+					</div>
+				)}
 				{/* Video preview */}
 				<div className="flex-1 bg-black flex items-center justify-center overflow-hidden min-h-0 p-4 relative group/preview">
 					<div
 						className="relative bg-black flex items-center justify-center overflow-hidden rounded-lg border border-border"
-						style={{ aspectRatio: `${aspectRatioValue}`, maxWidth: "100%", maxHeight: "100%", width: "100%", height: "auto" }}
+						style={{ maxWidth: "100%", width: "100%", height: "auto", aspectRatio: `${aspectRatioValue}` }}
 					>
 						<video
 							key={filePath}
 							ref={videoRef}
 							src={toFileUrl(filePath)}
 							className="max-w-full max-h-full"
-							style={{ objectFit: "cover" }}
+							style={{ objectFit: "contain" }}
 							onLoadedMetadata={onLoadedMetadata}
 							onTimeUpdate={onTimeUpdate}
 							onEnded={() => setPlaying(false)}
 							volume={muted ? 0 : volume}
 						/>
 					</div>
-					{/* Replace overlay */}
-					<div className="absolute top-2 right-2 flex gap-2 opacity-0 group-hover/preview:opacity-100 transition-opacity">
-						<button onClick={handleBrowse} className="btn-ghost text-xs" title="Open file">
-							<FolderOpen size={12} /> Open
-						</button>
-					</div>
 				</div>
 
-				{/* ── Timeline ── */}
 				<div className="bg-[#0d0d0d] border-t border-border px-4 py-3 space-y-2 flex-shrink-0">
+					{/* Cut toolbar */}
+					<div className="flex items-center gap-2">
+						<button
+							onClick={() => setCutMode((m) => !m)}
+							className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold transition-all ${
+								cutMode
+									? "bg-y/20 text-y border border-y/50 shadow-[0_0_10px_rgba(212,240,0,0.15)]"
+									: "text-text-mid border border-border hover:border-y/40 hover:text-y/80"
+							}`}
+							title="Cut mode — click timeline to mark cuts [X]"
+						>
+							<Scissors size={13} />
+							<span>Cut</span>
+						</button>
+						{cutCount > 0 && (
+							<>
+								<span className="text-[10px] text-y font-mono flex items-center gap-1 bg-y/10 px-1.5 py-0.5 rounded">
+									{cutCount} cut{cutCount !== 1 ? "s" : ""}
+								</span>
+								<button
+									onClick={() => setCuts([])}
+									className="text-[10px] text-text-dim hover:text-white transition-colors ml-1"
+									title="Clear all cuts"
+								>Clear</button>
+							</>
+						)}
+					</div>
 					{duration > 0 && (
 						<div className="relative h-4 overflow-hidden select-none" style={{ fontSize: 0 }}>
 							{ticks.map((t) => (
@@ -369,8 +653,46 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 						</div>
 					)}
 
+					{/* Combined clip track when 2+ clips */}
+					{timeline.length > 1 && (
+						<div className="flex h-7 rounded overflow-hidden gap-px">
+							{(() => {
+								const totalDur = timeline.reduce((s, e) => s + (e.trimOut - e.trimIn), 0);
+								const clipColors = ["#D4F00033", "#00B4D833", "#FF6B6B33", "#51CF6633", "#FFA94D33", "#CC99FF33"];
+								return timeline.map((clip, idx) => {
+									const clipDur = clip.trimOut - clip.trimIn;
+									const pct = totalDur > 0 ? (clipDur / totalDur) * 100 : 0;
+									const isActive = idx === activeIdx;
+									return (
+										<div
+											key={clip.id}
+											onClick={() => selectClip(idx)}
+											className={`relative flex items-center px-2 text-[9px] font-mono truncate cursor-pointer transition-all border-r border-black/40 last:border-r-0 ${
+												isActive ? "font-bold ring-1 ring-yellow-400/70 z-10" : "hover:brightness-125"
+											}`}
+											style={{
+												width: `${pct}%`,
+												backgroundColor: isActive ? "#D4F00022" : clipColors[idx % clipColors.length],
+											}}
+											title={`${clip.name} (${formatTime(clipDur)})`}
+										>
+											<span className="truncate drop-shadow-[0_1px_1px_rgba(0,0,0,0.8)]">
+												{clip.name}
+											</span>
+											<span className="ml-auto text-[8px] opacity-70 flex-shrink-0 drop-shadow-[0_1px_1px_rgba(0,0,0,0.8)]">
+												{formatTime(clipDur)}
+											</span>
+										</div>
+									);
+								});
+							})()}
+						</div>
+					)}
+
 					<div
-						className="relative h-12 bg-muted rounded-lg overflow-hidden cursor-pointer group select-none"
+						className={`relative h-12 bg-muted rounded-lg overflow-hidden select-none ${
+							cutMode ? "cursor-crosshair" : "cursor-pointer"
+						} group`}
 						onMouseDown={handleTimelineMouseDown}
 						onContextMenu={handleTimelineContext}
 					>
@@ -396,6 +718,29 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 								<div className="w-full h-px bg-red-400/60" />
 							</div>
 						))}
+
+						{/* Scissor marker at each cut midpoint */}
+						{cuts.map((c, i) => {
+							const mid = (c.start + c.end) / 2;
+							return (
+								<div
+									key={`sc-${i}`}
+									className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 z-[6]"
+									style={{ left: `${pct(mid)}%` }}
+								>
+									<Scissors size={14} className="text-red-300 drop-shadow-[0_0_4px_rgba(255,100,100,0.5)]" />
+								</div>
+							);
+						})}
+
+						{scissorPos !== null && (
+							<div
+								className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 z-20 transition-opacity pointer-events-none"
+								style={{ left: `${pct(scissorPos)}%` }}
+							>
+								<Scissors size={16} className="text-y drop-shadow-[0_0_6px_rgba(212,240,0,0.6)]" />
+							</div>
+						)}
 
 						<div
 							className="absolute top-0 w-0.5 h-full bg-white z-10 shadow-lg"
@@ -506,17 +851,6 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 								title="Set OUT at current position [O]"
 							>Set OUT</button>
 
-							<div className="w-px h-5 bg-border mx-2" />
-
-							<button
-								onClick={removeSegment}
-								disabled={trimOut - trimIn < 0.5}
-								className="text-[10px] font-bold px-2 py-1 rounded border border-red-700 text-red-400 hover:bg-red-900/30 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-								title="Remove the IN–OUT segment [X]"
-							><Eraser size={12} className="inline mr-1" />Remove IN–OUT</button>
-
-							<div className="w-px h-5 bg-border mx-2" />
-
 							<button onClick={() => setMuted((m) => !m)} className="text-text-mid hover:text-white transition-colors p-1">
 								{muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
 							</button>
@@ -539,9 +873,9 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 							<span className="inline-flex items-center gap-2">
 								<span><kbd className="bg-muted px-1 rounded">I</kbd> IN</span>
 								<span><kbd className="bg-muted px-1 rounded">O</kbd> OUT</span>
-								<span><kbd className="bg-muted px-1 rounded">X</kbd> Cut</span>
+								<span><kbd className="bg-muted px-1 rounded">X</kbd> Cut@play</span>
+								<span><kbd className="bg-muted px-1 rounded">Esc</kbd> Exit cut</span>
 								<span><kbd className="bg-muted px-1 rounded">Space</kbd> Play</span>
-								<span><kbd className="bg-muted px-1 rounded">Right‑click</kbd> Quick Cut</span>
 							</span>
 						</div>
 					</div>
@@ -549,12 +883,103 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			</div>
 
 			{/* ── Right panel ── */}
-			<div className="w-64 flex-shrink-0 border-l border-border bg-[#0d0d0d] flex flex-col overflow-y-auto p-4 space-y-4">
-				<h3 className="font-bold text-white text-sm">Export Options</h3>
+			<div className="w-72 flex-shrink-0 border-l border-border bg-[#0d0d0d] flex flex-col overflow-y-auto p-4 space-y-4">
+				{/* ── Timeline ── */}
+				<div className="space-y-2">
+					<div className="flex items-center justify-between">
+						<span className="text-[10px] text-text-dim">{timeline.length} clip{timeline.length !== 1 ? "s" : ""}</span>
+					</div>
+					{timeline.length === 0 ? (
+						<p className="text-text-dim text-xs">
+							{filePath ? "No clips" : "Drop or open a video to start."}
+						</p>
+					) : (
+						<div className="space-y-1 max-h-48 overflow-y-auto">
+							{timeline.map((clip, idx) => (
+								<div
+									key={clip.id}
+									draggable
+									onDragStart={() => { dragSrcRef.current = idx; }}
+									onDragOver={(e) => {
+										e.preventDefault();
+										e.dataTransfer.dropEffect = "move";
+									}}
+									onDragEnter={(e) => {
+										e.preventDefault();
+										if (dragSrcRef.current !== null && dragSrcRef.current !== idx) {
+											(e.currentTarget as HTMLElement).style.borderTopColor = "#D4F000";
+											(e.currentTarget as HTMLElement).style.borderTopWidth = "2px";
+										}
+									}}
+									onDragLeave={(e) => {
+										(e.currentTarget as HTMLElement).style.borderTopColor = "";
+										(e.currentTarget as HTMLElement).style.borderTopWidth = "";
+									}}
+									onDrop={(e) => {
+										e.preventDefault();
+										(e.currentTarget as HTMLElement).style.borderTopColor = "";
+										(e.currentTarget as HTMLElement).style.borderTopWidth = "";
+										const from = dragSrcRef.current;
+										dragSrcRef.current = null;
+										if (from !== null && from !== idx) {
+											setTimeline((prev) => {
+												const next = [...prev];
+												const [moved] = next.splice(from!, 1);
+												next.splice(idx, 0, moved);
+												return next;
+											});
+											setActiveIdx(idx);
+										}
+									}}
+									onDragEnd={() => { dragSrcRef.current = null; }}
+										className={`flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer transition-colors ${
+											idx === activeIdx
+												? "bg-y/10 border border-y/40"
+												: "bg-muted border border-transparent hover:border-border"
+										}`}
+										onClick={() => selectClip(idx)}
+									>
+										<GripHorizontal size={11} className="text-text-dim flex-shrink-0 opacity-40 cursor-grab active:cursor-grabbing" />
+										<span className="truncate flex-1 text-text-mid font-mono" title={clip.name}>
+											{clip.name}
+										</span>
+										<span className="text-text-dim text-[9px] font-mono tabular-nums flex-shrink-0">
+											{formatTime(clip.trimOut - clip.trimIn)}
+										</span>
+										<button
+											onClick={(e) => { e.stopPropagation(); moveClip(idx, -1); }}
+											disabled={idx === 0}
+											className="p-0.5 text-text-dim hover:text-white disabled:opacity-20 flex-shrink-0"
+											title="Move up"
+										>
+											<ArrowUp size={10} />
+										</button>
+										<button
+											onClick={(e) => { e.stopPropagation(); moveClip(idx, 1); }}
+											disabled={idx === timeline.length - 1}
+											className="p-0.5 text-text-dim hover:text-white disabled:opacity-20 flex-shrink-0"
+											title="Move down"
+										>
+											<ArrowDown size={10} />
+										</button>
+										<button
+											onClick={(e) => { e.stopPropagation(); removeFromTimeline(idx); }}
+											className="p-0.5 text-red-400 hover:text-red-300 flex-shrink-0"
+											title="Remove from timeline"
+										>
+											<Trash2 size={10} />
+										</button>
+									</div>
+								))}
+						</div>
+					)}
+				</div>
+
+				<hr className="border-border" />
 
 				{filePath && (
 					<div className="space-y-1">
-						<p className="label">Clip Name</p>
+						<p className="label">Active Clip</p>
 						{renaming ? (
 							<div className="flex items-center gap-1">
 								<input
@@ -565,12 +990,12 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 										if (e.key === "Enter") handleRename();
 										if (e.key === "Escape") setRenaming(false);
 									}}
-									onBlur={() => setRenaming(false)}
+									onBlur={handleRename}
 									className="input text-xs py-1 flex-1 min-w-0"
 									autoFocus
 								/>
 								<button
-									onMouseDown={(e) => { e.preventDefault(); handleRename(); }}
+									onClick={handleRename}
 									className="p-1.5 rounded bg-y text-black hover:bg-yd transition-colors"
 								>
 									<Check size={13} />
@@ -578,12 +1003,13 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 							</div>
 						) : (
 							<div className="flex items-center gap-1 group">
-								<span className="text-xs text-white truncate flex-1">
-									{filePath.replace(/^.*[\\/]/, "")}
+								<span className="text-xs text-white truncate flex-1 font-mono">
+									{timeline[activeIdx]?.name ?? filePath.replace(/^.*[\\/]/, "")}
 								</span>
 								<button
 									onClick={() => {
-										const name = filePath.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "");
+										const entry = timeline[activeIdx];
+										const name = (entry?.name ?? "").replace(/\.[^.]+$/, "");
 										setRenameValue(name);
 										setRenaming(true);
 										setTimeout(() => renameInputRef.current?.select(), 50);
@@ -597,36 +1023,51 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					</div>
 				)}
 
+				{timeline.length > 1 && (
+					<button
+						onClick={handleQuickMerge}
+						disabled={exporting}
+						className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border-2 border-y/40 bg-y/5 text-y text-xs font-bold hover:bg-y/10 transition-colors disabled:opacity-50"
+					>
+						{exporting
+							? <><Loader2 size={14} className="animate-spin" /> Merging…</>
+							: <><Scissors size={14} /> Merge {timeline.length} Clips</>
+						}
+					</button>
+				)}
+
 				<Section title="Trim">
 					<Row label="In" val={formatTime(trimIn)} />
 					<Row label="Out" val={formatTime(trimOut)} />
 					<Row label="Duration" val={formatTime(trimOut - trimIn)} />
 				</Section>
 
-				<Section title="Cuts / Removed Segments">
-					{cuts.length === 0 ? (
-						<p className="text-text-dim text-xs">Set IN and OUT, then click <b>Remove IN–OUT</b> to cut a segment.</p>
-					) : (
-						<div className="space-y-1 max-h-40 overflow-y-auto">
-							{cuts.map((c, i) => (
-								<div key={i} className="flex items-center justify-between bg-muted rounded px-2 py-1 text-xs">
-									<span className="text-text-mid font-mono">
-										{formatTime(c.start)} – {formatTime(c.end)}
-										<span className="text-text-dim ml-1">({formatTime(c.end - c.start)})</span>
-									</span>
-									<button onClick={() => removeCut(i)} className="text-red-400 hover:text-red-300 flex-shrink-0 ml-1">
-										<Trash2 size={12} />
-									</button>
-								</div>
-							))}
-						</div>
-					)}
-					{cuts.length > 0 && (
-						<button onClick={() => setCuts([])} className="text-[10px] text-text-dim hover:text-white transition-colors flex items-center gap-1 mt-1">
-							<RotateCcw size={10} /> Clear all cuts
-						</button>
-					)}
-				</Section>
+				{timeline.length === 1 && (
+					<Section title="Cuts / Removed Segments">
+						{cuts.length === 0 ? (
+							<p className="text-text-dim text-xs">Right-click the timeline or press <kbd className="bg-muted px-1 rounded">X</kbd> to cut a segment.</p>
+						) : (
+							<div className="space-y-1 max-h-40 overflow-y-auto">
+								{cuts.map((c, i) => (
+									<div key={i} className="flex items-center justify-between bg-muted rounded px-2 py-1 text-xs">
+										<span className="text-text-mid font-mono">
+											{formatTime(c.start)} – {formatTime(c.end)}
+											<span className="text-text-dim ml-1">({formatTime(c.end - c.start)})</span>
+										</span>
+										<button onClick={() => removeCut(i)} className="text-red-400 hover:text-red-300 flex-shrink-0 ml-1">
+											<Trash2 size={12} />
+										</button>
+									</div>
+								))}
+							</div>
+						)}
+						{cuts.length > 0 && (
+							<button onClick={() => setCuts([])} className="text-[10px] text-text-dim hover:text-white transition-colors flex items-center gap-1 mt-1">
+								<RotateCcw size={10} /> Clear all cuts
+							</button>
+						)}
+					</Section>
+				)}
 
 				<Section title="Format">
 					<Select label="Container" value={expFormat} onChange={setExpFormat}
@@ -651,18 +1092,26 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					</div>
 				)}
 				{exportError && (
-					<div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-xs text-red-300">
-						⚠ {exportError}
+					<div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-xs text-red-300 flex items-start gap-2">
+						<span className="flex-1">⚠ {exportError}</span>
+						<button onClick={() => setExportError(null)} className="text-red-400 hover:text-white flex-shrink-0 mt-0.5">✕</button>
 					</div>
 				)}
 
 				{cloud.paired && filePath && (
+					<>
 					<button
-						onClick={() => {
+						onClick={async () => {
 							if (uploadBusy) return;
 							if (uploadJob?.status === "failed") { cloud.retryJob(uploadJob.id); return; }
-							const name = filePath.replace(/^.*[\\/]/, "");
-							cloud.addToQueue(filePath, name, 0);
+							const entry = timeline[activeIdx];
+							const name = entry?.name ?? filePath.replace(/^.*[\\/]/, "");
+							const stat = await window.clipsta?.getFileStats(filePath).catch(() => null);
+							cloud.addToQueue(filePath, name, stat?.size ?? 0, {
+								trimStart: trimIn > 0 ? trimIn : undefined,
+								trimEnd: trimOut < duration ? trimOut : undefined,
+								cuts: cuts.length > 0 ? cuts : undefined,
+							});
 						}}
 						disabled={uploadBusy}
 						className={`btn-ghost justify-center w-full py-2 ${uploadBusy ? "opacity-50" : ""} ${showUploaded ? "text-green-400" : ""} ${uploadJob?.status === "failed" ? "text-red-400" : ""}`}
@@ -671,6 +1120,13 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 						{showUploaded && !uploadBusy && <><Upload size={14} /> Uploaded</>}
 						{!uploadBusy && !showUploaded && <><Upload size={14} /> Upload to Cloud</>}
 					</button>
+					{uploadJob?.status === "failed" && uploadJob?.error && (
+						<div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-xs text-red-300 mt-1 flex items-start gap-2">
+							<span className="flex-1">Upload failed: {uploadJob.error}</span>
+							<button onClick={() => cloud.removeJob(uploadJob.id)} className="text-red-400 hover:text-white flex-shrink-0 mt-0.5">✕</button>
+						</div>
+					)}
+					</>
 				)}
 
 				<button onClick={handleExport} disabled={exporting}

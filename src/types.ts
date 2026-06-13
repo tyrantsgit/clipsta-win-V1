@@ -35,6 +35,9 @@ export interface UploadJob {
 	error?: string;
 	streamUid?: string;
 	shareUrl?: string;
+	trimStart?: number;
+	trimEnd?: number;
+	cuts?: { start: number; end: number }[];
 }
 
 export interface UploadClipResponse {
@@ -70,6 +73,9 @@ export interface UploadClipOpts {
 	durationSeconds: number;
 	bytes: number;
 	capturedAt: string;
+	trimStart?: number;
+	trimEnd?: number;
+	cuts?: { start: number; end: number }[];
 }
 
 export interface UploadStatusBody {
@@ -114,10 +120,25 @@ declare global {
 			getSystemInfo(): Promise<SystemInfo>;
 			getCloudConfig(): Promise<CloudConfig>;
 			readFile(path: string): Promise<ArrayBuffer>;
+			getFileStats(path: string): Promise<{ size: number; modifiedAt: string }>;
+			ensureDir(path: string): Promise<boolean>;
 			uploadClip(opts: UploadClipOpts): Promise<UploadClipResponse>;
 			notifyUploadStatus(body: UploadStatusBody): Promise<void>;
 		};
 	}
+}
+
+export interface FileStats {
+	size: number;
+	modifiedAt: string;
+}
+
+export interface TimelineEntry {
+	id: string;
+	path: string;
+	name: string;
+	trimIn: number;
+	trimOut: number;
 }
 
 export interface ExportOpts {
@@ -127,6 +148,7 @@ export interface ExportOpts {
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
+	timeline?: { path: string; trimIn: number; trimOut: number }[];
 }
 
 export interface CloudConfig {

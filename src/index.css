@@ -26,9 +26,9 @@ html, body, #root {
 
 /* Recording pulse */
 @keyframes rec { 0%,100%{opacity:1} 50%{opacity:.2} }
-.rec-pulse { animation: rec 1.2s ease-in-out infinite; }
 
-/* Slide in */
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
 @keyframes slideIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
 .slide-in { animation: slideIn .18s ease-out; }
 

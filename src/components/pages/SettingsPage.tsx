@@ -27,6 +27,16 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 	}, []);
 	const [saved, setSaved] = useState(false);
 	const [showPairingModal, setShowPairingModal] = useState(false);
+	const [justPaired, setJustPaired] = useState(false);
+
+	// Show paired animation when pairingConfirmed becomes true
+	useEffect(() => {
+		if (cloud.pairingConfirmed) {
+			setJustPaired(true);
+			const t = setTimeout(() => setJustPaired(false), 4000);
+			return () => clearTimeout(t);
+		}
+	}, [cloud.pairingConfirmed]);
 
 	const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
 		setLocal((prev) => ({ ...prev, [key]: value }));
@@ -163,15 +173,30 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						<div className="bg-muted rounded-lg p-3 space-y-2">
 							<div className="flex items-center justify-between">
 								<p className="text-xs text-text-dim font-semibold">Pairing</p>
-								{cloud.paired ? (
-									<span className="text-[10px] text-green-400 font-bold">✓ Paired</span>
+								{cloud.pairingConfirmed ? (
+									<span className={`text-[10px] text-green-400 font-bold ${justPaired ? "animate-pulse" : ""}`}>✓ Paired</span>
+								) : cloud.paired ? (
+									<span className="text-[10px] text-y-400 font-bold">Pending</span>
 								) : (
 									<span className="text-[10px] text-text-dim">Not paired</span>
 								)}
 							</div>
-							{cloud.pairingUrl && cloud.paired && (
+							{justPaired && (
+								<div className="flex items-center gap-2 text-green-400 text-xs py-1 animate-fadeIn">
+									<div className="w-5 h-5 rounded-full bg-green-500 flex items-center justify-center">
+										<span className="text-black text-[10px] font-bold">✓</span>
+									</div>
+									<span>Paired successfully! Your clips can now be uploaded to the cloud.</span>
+								</div>
+							)}
+							{cloud.pairingConfirmed && !justPaired && (
 								<div className="text-center py-2">
-									<p className="text-[10px] text-green-400">Paired successfully</p>
+									<p className="text-[10px] text-green-400">Device paired — ready to upload</p>
+								</div>
+							)}
+							{cloud.paired && !cloud.pairingConfirmed && (
+								<div className="text-center py-2">
+									<p className="text-[10px] text-text-dim">Waiting for phone to scan QR code…</p>
 								</div>
 							)}
 							<button
@@ -270,6 +295,19 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 									/>
 								</div>
 								<p className="text-text-dim text-xs">Open the Clipsta app on your iPhone and scan this QR code</p>
+								<div className="flex items-center justify-center gap-2 text-[10px] text-text-dim">
+									<span className="w-1.5 h-1.5 rounded-full bg-y animate-pulse" />
+									Waiting for phone to connect…
+								</div>
+								<button
+									onClick={() => {
+										cloud.confirmPairing();
+										setShowPairingModal(false);
+									}}
+									className="btn-y w-full justify-center text-xs py-2 mt-2"
+								>
+									Done — I've scanned the code
+								</button>
 							</div>
 						)}
 
@@ -285,10 +323,6 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 									Retry
 								</button>
 							</div>
-						)}
-
-						{cloud.paired && cloud.pairingUrl && !cloud.pairingLoading && (
-							<p className="text-green-400 text-xs text-center mt-3">✓ Device is paired</p>
 						)}
 					</div>
 				</div>

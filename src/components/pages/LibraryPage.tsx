@@ -30,7 +30,8 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		if (!confirm(`Add "${name}" to the library?`)) return;
 		const destPath = await window.clipsta?.importClip(path);
 		if (destPath && cloud.paired) {
-			cloud.addToQueue(destPath, name, 0);
+			const stat = await window.clipsta?.getFileStats(destPath).catch(() => null);
+			cloud.addToQueue(destPath, name, stat?.size ?? 0);
 		}
 		load();
 	};
@@ -286,12 +287,14 @@ function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, up
 						{formatSize(clip.size)} · {new Date(clip.createdAt).toLocaleDateString()}
 					</p>
 				</div>
+				<div className="flex items-center gap-1">
+					<button onClick={(e) => { e.stopPropagation(); onEdit(); }} className="p-1 text-text-dim hover:text-y border border-transparent hover:border-y rounded transition-colors" title="Edit clip">
+						<Scissors size={11} />
+					</button>
+				</div>
 				<div className="hidden group-hover:flex items-center gap-1">
 					<button onClick={(e) => { e.stopPropagation(); onPlay(); }} className="p-1 hover:text-y text-text-dim transition-colors">
 						<Play size={11} />
-					</button>
-					<button onClick={(e) => { e.stopPropagation(); onEdit(); }} className="p-1 hover:text-y text-text-dim transition-colors">
-						<Scissors size={11} />
 					</button>
 					<button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="p-1 hover:text-red-400 text-text-dim transition-colors">
 						<Trash2 size={11} />

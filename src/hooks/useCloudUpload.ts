@@ -7,6 +7,7 @@ interface CloudState {
 	pairingCode: string | null;
 	pairingError: string | null;
 	pairingLoading: boolean;
+	pairingConfirmed: boolean;
 	queue: UploadJob[];
 }
 
@@ -17,6 +18,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 		pairingCode: null,
 		pairingError: null,
 		pairingLoading: false,
+		pairingConfirmed: false,
 		queue: [],
 	});
 
@@ -57,7 +59,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 
 	// ── Pairing ───────────────────────────────────────────────────────────
 	const generatePairingCode = useCallback(async () => {
-		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true }));
+		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true, pairingConfirmed: false }));
 		const cfg = await getCloudConfig();
 		try {
 			const res = await fetch(`${cfg.apiBase}/pairing-tokens`, {
@@ -93,6 +95,11 @@ export function useCloudUpload(settings: AppSettings | null) {
 		}
 	}, [settings, getCloudConfig, getDeviceId]);
 
+	// Mark pairing as confirmed (called when user dismisses QR modal after scanning)
+	const confirmPairing = useCallback(() => {
+		setState((prev) => ({ ...prev, pairingConfirmed: true }));
+	}, []);
+
 	// Resume pairing on mount if we have a stored token
 	useEffect(() => {
 		if (settings?.cloudEnabled && settings?.cloudPairCode) {
@@ -117,9 +124,12 @@ export function useCloudUpload(settings: AppSettings | null) {
 						desktopDeviceId: getDeviceId(),
 						filePath: job.path,
 						fileName: job.name,
-						durationSeconds: 0,
+						durationSeconds: 30,
 						bytes: job.size,
 						capturedAt: new Date().toISOString(),
+						trimStart: job.trimStart,
+						trimEnd: job.trimEnd,
+						cuts: job.cuts,
 					});
 
 					updateJob(job.id, {
@@ -147,22 +157,21 @@ export function useCloudUpload(settings: AppSettings | null) {
 			pairingUrl: null,
 			pairingCode: null,
 			pairingError: null,
+			pairingConfirmed: false,
 		}));
 		window.clipsta?.setSetting("cloudPairCode", "");
 	}, []);
 
-	const addToQueue = useCallback((path: string, name: string, size: number) => {
+	const addToQueue = useCallback((path: string, name: string, size: number, trimOpts?: { trimStart?: number; trimEnd?: number; cuts?: { start: number; end: number }[] }) => {
 		const existing = queueRef.current.find((j) => j.path === path);
 		if (existing) {
 			if (existing.status === "queued" || existing.status === "uploading") return;
-			if (existing.status === "failed") {
-				updateJob(existing.id, { status: "queued", progress: 0, error: undefined });
-				setTimeout(processQueue, 100);
-				return;
-			}
+			updateJob(existing.id, { status: "queued", progress: 0, error: undefined, name, ...trimOpts });
+			setTimeout(processQueue, 100);
+			return;
 		}
 		const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued" }]);
+		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued", ...trimOpts }]);
 		setTimeout(processQueue, 100);
 	}, [syncQueue, updateJob, processQueue]);
 
@@ -211,6 +220,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	return {
 		...state,
 		generatePairingCode,
+		confirmPairing,
 		clearPairing,
 		addToQueue,
 		retryJob,

@@ -24,7 +24,7 @@ export default function App() {
 		setPage("editor");
 	};
 
-	const uploadCount = cloud.queue.filter((j) => j.status !== "done").length;
+	const uploadCount = cloud.queue.filter((j) => j.status === "queued" || j.status === "uploading").length;
 
 	return (
 		<div className="flex flex-col h-screen bg-bg overflow-hidden">
@@ -81,9 +81,9 @@ export default function App() {
 						{page === "library" && (
 							<LibraryPage onOpenEditor={openInEditor} cloud={cloud} />
 						)}
-						{page === "editor" && (
+						<div style={{ display: page === "editor" ? "flex" : "none", height: "100%", overflow: "hidden" }}>
 							<EditorPage initialFile={editorFile} settings={settings} cloud={cloud} />
-						)}
+						</div>
 						{page === "settings" && (
 							<SettingsPage settings={settings} updateSetting={updateSetting} saveAll={saveAll} cloud={cloud} />
 						)}
