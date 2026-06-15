@@ -38,6 +38,7 @@ export interface UploadJob {
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
+	retryCount?: number;
 }
 
 export interface UploadClipResponse {

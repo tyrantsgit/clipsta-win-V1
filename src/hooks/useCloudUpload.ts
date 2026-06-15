@@ -108,6 +108,9 @@ export function useCloudUpload(settings: AppSettings | null) {
 	}, [settings?.cloudEnabled, settings?.cloudPairCode]);
 
 	// ── Upload ────────────────────────────────────────────────────────────
+	const MAX_RETRIES = 5;
+	const RETRY_DELAYS = [1000, 2000, 4000, 8000, 16000];
+
 	const processQueue = useCallback(async () => {
 		if (processingRef.current) return;
 		processingRef.current = true;
@@ -139,7 +142,18 @@ export function useCloudUpload(settings: AppSettings | null) {
 						shareUrl: result?.shareUrl,
 					});
 				} catch (e: any) {
-					updateJob(job.id, { status: "failed", error: e.message ?? String(e) });
+					const retryCount = (job.retryCount ?? 0) + 1;
+					if (retryCount <= MAX_RETRIES) {
+						const delay = RETRY_DELAYS[retryCount - 1] ?? 16000;
+						updateJob(job.id, {
+							status: "queued",
+							retryCount,
+							error: `Retry ${retryCount}/${MAX_RETRIES}: ${e.message ?? String(e)}`,
+						});
+						await new Promise((r) => setTimeout(r, delay));
+					} else {
+						updateJob(job.id, { status: "failed", error: e.message ?? String(e) });
+					}
 				}
 			}
 		} finally {
@@ -166,7 +180,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 		const existing = queueRef.current.find((j) => j.path === path);
 		if (existing) {
 			if (existing.status === "queued" || existing.status === "uploading") return;
-			updateJob(existing.id, { status: "queued", progress: 0, error: undefined, name, ...trimOpts });
+			updateJob(existing.id, { status: "queued", progress: 0, error: undefined, name, retryCount: 0, ...trimOpts });
 			setTimeout(processQueue, 100);
 			return;
 		}
@@ -176,7 +190,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	}, [syncQueue, updateJob, processQueue]);
 
 	const retryJob = useCallback((id: string) => {
-		updateJob(id, { status: "queued", progress: 0, error: undefined });
+		updateJob(id, { status: "queued", progress: 0, error: undefined, retryCount: 0 });
 		setTimeout(processQueue, 100);
 	}, [updateJob, processQueue]);
 
