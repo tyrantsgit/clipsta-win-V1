@@ -6,13 +6,7 @@ import {
 } from "lucide-react";
 import type { AppSettings, ExportOpts, TimelineEntry } from "../../types";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
-
-function toFileUrl(p: string): string {
-	if (p.startsWith("file://")) return p;
-	const normalized = p.replace(/\\/g, "/");
-	const cleaned = normalized.startsWith("/") ? normalized.slice(1) : normalized;
-	return `file:///${cleaned.replace(/#/g, "%23").replace(/\?/g, "%3F")}`;
-}
+import { toFileUrl, formatTime, sanitizeName, getDroppedPaths, getTimeFromEvent } from "../../utils";
 
 interface Props {
 	initialFile: string | null;
@@ -199,17 +193,12 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		setCurrentTime(t);
 	};
 
-	const getTimeFromEvent = (clientX: number, parentEl: EventTarget & Element) => {
-		const rect = parentEl.getBoundingClientRect();
-		return ((clientX - rect.left) / rect.width) * duration;
-	};
-
 	// Drag-scrub state
 	const scrubRef = useRef(false);
 
 	const handleTimelineMouseDown = (e: React.MouseEvent) => {
 		const parent = e.currentTarget;
-		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent)));
+		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent, duration)));
 		if (cutMode) {
 			// Place cut at this position
 			setScissorPos(t);
@@ -224,7 +213,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		scrubRef.current = true;
 		const move = (me: MouseEvent) => {
 			if (!scrubRef.current) return;
-			const t2 = Math.max(0, Math.min(duration, getTimeFromEvent(me.clientX, parent)));
+			const t2 = Math.max(0, Math.min(duration, getTimeFromEvent(me.clientX, parent, duration)));
 			seek(t2);
 		};
 		const up = () => {
@@ -239,7 +228,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const handleTimelineContext = (e: React.MouseEvent) => {
 		e.preventDefault();
 		const parent = e.currentTarget as HTMLElement;
-		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent)));
+		const t = Math.max(0, Math.min(duration, getTimeFromEvent(e.clientX, parent, duration)));
 		setScissorPos(t);
 		setTimeout(() => setScissorPos(null), 600);
 		const half = 0.5;
@@ -273,13 +262,12 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	};
 
 	const cutAtPlayhead = () => {
+		const half = 0.5;
 		const t = videoRef.current?.currentTime ?? currentTime;
 		const start = Math.max(0, t - half);
 		const end = Math.min(duration, t + half);
 		setCuts((prev) => [...prev, { start, end }].sort((a, b) => a.start - b.start));
 	};
-
-	const sanitizeName = (s: string) => s.replace(/[<>:"/\\|?*]/g, "").trim() || "clip";
 
 	const handleQuickMerge = async () => {
 		if (timeline.length < 2) return;
@@ -1195,10 +1183,3 @@ function AspectPreview({ ratio }: { ratio: string }) {
 	);
 }
 
-function formatTime(s: number) {
-	if (!isFinite(s)) return "0:00";
-	const m = Math.floor(s / 60);
-	const sec = Math.floor(s % 60);
-	const ms = Math.floor((s % 1) * 10);
-	return `${m}:${String(sec).padStart(2, "0")}.${ms}`;
-}
