@@ -331,24 +331,6 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		}
 	};
 
-	const addExportedToTimeline = useCallback((path: string) => {
-		const name = path.replace(/^.*[\\/]/, "");
-		setTimeline((prev) => [...prev, { id: crypto.randomUUID(), path, name, trimIn: 0, trimOut: 0 }]);
-		const newIdx = timeline.length;
-		setActiveIdx(newIdx);
-		setTrimIn(0);
-		setTrimOut(0);
-		setCurrentTime(0);
-		setDuration(0);
-		setCuts([]);
-		setCutMode(false);
-		setScissorPos(null);
-		setExportDone(path);
-		setExportError(null);
-		setPlaying(false);
-		setResetKey((k) => k + 1);
-	}, [timeline.length]);
-
 	const removeCut = (idx: number) => {
 		setCuts((prev) => prev.filter((_, i) => i !== idx));
 	};
@@ -374,6 +356,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		try {
 			// Use first clip's path for IPC (will be overridden by timeline if multi)
 			const primaryPath = exportTimeline[0].path;
+			const exportingIdx = activeIdx;
 			const opts: ExportOpts = {
 				format: expFormat,
 				resolution: expResolution,
@@ -389,7 +372,19 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			const out = await window.clipsta?.exportRecording(primaryPath, savePath, opts);
 			setExportDone(out ?? null);
 			if (out) {
-				addExportedToTimeline(out);
+				const name = out.replace(/^.*[\\/]/, "");
+				if (exportTimeline.length > 1) {
+					setTimeline([{ id: crypto.randomUUID(), path: out, name, trimIn: 0, trimOut: 0 }]);
+					setActiveIdx(0);
+				} else {
+					setTimeline((prev) => prev.map((e, i) =>
+						i === exportingIdx ? { ...e, path: out, name, trimIn: 0, trimOut: 0 } : e
+					));
+				}
+				setTrimIn(0); setTrimOut(0); setCurrentTime(0); setDuration(0);
+				setCuts([]); setCutMode(false); setScissorPos(null);
+				setExportError(null); setPlaying(false);
+				setResetKey((k) => k + 1);
 			} else {
 				setExportError("Export failed — no output file was created");
 			}

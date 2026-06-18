@@ -335,17 +335,22 @@ ipcMain.handle(
 			}
 		}
 
-		// Resolution scale (must come before crop so crop uses target dimensions)
-		const scaleMap: Record<string, string> = {
-			"480p": "854:480", "720p": "1280:720",
-			"1080p": "1920:1080", "1440p": "2560:1440", "4k": "3840:2160",
-		};
-		if (opts.resolution && scaleMap[opts.resolution])
-			vfFilters.push(`scale=${scaleMap[opts.resolution]}`);
-
-		// Aspect ratio crop
+		// Aspect ratio crop (before scale — operates on source dimensions)
 		if (opts.aspectRatio === "9:16") vfFilters.push("crop=ih*9/16:ih");
 		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=ih*4/3:ih");
+
+		// Resolution scale (auto-calculate the other dimension to preserve aspect)
+		const pValues: Record<string, number> = {
+			"480p": 480, "720p": 720, "1080p": 1080, "1440p": 1440, "4k": 2160,
+		};
+		const p = opts.resolution ? pValues[opts.resolution] : null;
+		if (p) {
+			if (opts.aspectRatio !== "9:16") {
+				vfFilters.push(`scale=-2:${p}`);
+			} else {
+				vfFilters.push(`scale=${p}:-2`);
+			}
+		}
 
 		const args: string[] = [];
 		let isMultiClip = false;
