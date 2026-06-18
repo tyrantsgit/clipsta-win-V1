@@ -335,9 +335,9 @@ ipcMain.handle(
 			}
 		}
 
-		// Aspect ratio crop (before scale — operates on source dimensions)
-		if (opts.aspectRatio === "9:16") vfFilters.push("crop=ih*9/16:ih");
-		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=ih*4/3:ih");
+		// Aspect ratio crop (before scale — clamps to input width so it's safe on already-cropped sources)
+		if (opts.aspectRatio === "9:16") vfFilters.push("crop=min(iw\\,ih*9/16):ih");
+		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=min(iw\\,ih*4/3):ih");
 
 		// Resolution scale (auto-calculate the other dimension to preserve aspect)
 		const pValues: Record<string, number> = {
