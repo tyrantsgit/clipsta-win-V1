@@ -146,6 +146,7 @@ export interface ExportOpts {
 	format: string;
 	aspectRatio: string;
 	resolution: string;
+	fps?: number;
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];

@@ -88,8 +88,10 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			setTrimIn(entry.trimIn);
 			if (entry.trimOut > 0) setTrimOut(entry.trimOut);
 			setCurrentTime(0);
+			setDuration(0);
 			setCuts([]);
 			setCutMode(false);
+			setRenaming(false);
 			setExportDone(null);
 			setExportError(null);
 			setPlaying(false);
@@ -129,11 +131,12 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			setCuts([]);
 			setCutMode(false);
 			setPlaying(false);
-			if (activeIdx >= newTimeline.length) setActiveIdx(newTimeline.length - 1);
-			else if (activeIdx > idx) setActiveIdx(activeIdx - 1);
-			else if (activeIdx === idx) {
-				setActiveIdx(Math.min(idx, newTimeline.length - 1));
-			}
+		} else if (activeIdx >= newTimeline.length) {
+			setActiveIdx(newTimeline.length - 1);
+		} else if (activeIdx > idx) {
+			setActiveIdx(activeIdx - 1);
+		} else if (activeIdx === idx) {
+			setActiveIdx(Math.min(idx, newTimeline.length - 1));
 		}
 	}, [timeline, activeIdx]);
 
@@ -298,11 +301,25 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				format: "mp4",
 				resolution: expResolution,
 				aspectRatio: expAspect,
+				fps: settings.fps,
 				timeline: exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut })),
 			};
 			const out = await window.clipsta?.exportRecording(primaryPath, outPath, opts);
 			if (out) {
-				resetEditorForFile(out);
+				const name = out.replace(/^.*[\\/]/, "");
+				setTimeline([{ id: crypto.randomUUID(), path: out, name, trimIn: 0, trimOut: 0 }]);
+				setActiveIdx(0);
+				setTrimIn(0);
+				setTrimOut(0);
+				setCurrentTime(0);
+				setDuration(0);
+				setCuts([]);
+				setCutMode(false);
+				setScissorPos(null);
+				setExportDone(out);
+				setExportError(null);
+				setPlaying(false);
+				setResetKey((k) => k + 1);
 			} else {
 				setExportDone(null);
 				setExportError("Merge failed — no output file was created");
@@ -314,21 +331,23 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		}
 	};
 
-	const resetEditorForFile = useCallback((path: string) => {
+	const addExportedToTimeline = useCallback((path: string) => {
 		const name = path.replace(/^.*[\\/]/, "");
-		setTimeline([{ id: crypto.randomUUID(), path, name, trimIn: 0, trimOut: 0 }]);
+		setTimeline((prev) => [...prev, { id: crypto.randomUUID(), path, name, trimIn: 0, trimOut: 0 }]);
+		const newIdx = timeline.length;
+		setActiveIdx(newIdx);
 		setTrimIn(0);
 		setTrimOut(0);
 		setCurrentTime(0);
+		setDuration(0);
 		setCuts([]);
 		setCutMode(false);
 		setScissorPos(null);
 		setExportDone(path);
 		setExportError(null);
 		setPlaying(false);
-		setActiveIdx(0);
 		setResetKey((k) => k + 1);
-	}, []);
+	}, [timeline.length]);
 
 	const removeCut = (idx: number) => {
 		setCuts((prev) => prev.filter((_, i) => i !== idx));
@@ -359,6 +378,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				format: expFormat,
 				resolution: expResolution,
 				aspectRatio: expAspect,
+				fps: settings.fps,
 				timeline: exportTimeline.length > 1
 					? exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut }))
 					: undefined,
@@ -369,7 +389,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			const out = await window.clipsta?.exportRecording(primaryPath, savePath, opts);
 			setExportDone(out ?? null);
 			if (out) {
-				resetEditorForFile(out);
+				addExportedToTimeline(out);
 			} else {
 				setExportError("Export failed — no output file was created");
 			}
@@ -579,20 +599,21 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				{/* Video preview */}
 				<div className="flex-1 bg-black flex items-center justify-center overflow-hidden min-h-0 p-4 relative group/preview">
 					<div
-						className="relative bg-black flex items-center justify-center overflow-hidden rounded-lg border border-border"
-						style={{ maxWidth: "100%", width: "100%", height: "auto", aspectRatio: `${aspectRatioValue}` }}
+						className="relative bg-black flex items-center justify-center overflow-hidden rounded-lg border border-border w-full h-full"
 					>
+						{filePath && (
 						<video
 							key={filePath}
 							ref={videoRef}
 							src={toFileUrl(filePath)}
-							className="max-w-full max-h-full"
+							className="max-w-full max-h-full w-auto h-auto"
 							style={{ objectFit: "contain" }}
 							onLoadedMetadata={onLoadedMetadata}
 							onTimeUpdate={onTimeUpdate}
 							onEnded={() => setPlaying(false)}
+							onError={() => setExportError(`Cannot load file: ${filePath}`)}
 							volume={muted ? 0 : volume}
-						/>
+						/>)}
 					</div>
 				</div>
 

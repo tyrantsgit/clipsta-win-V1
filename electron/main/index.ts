@@ -324,7 +324,6 @@ ipcMain.handle(
 	"recording:export",
 	async (_e, inputPath: string, outputPath: string, opts: ExportOpts): Promise<string> => {
 		const vfFilters: string[] = [];
-		let concatFile: string | null = null;
 
 		// Cuts — build select expression to skip removed segments
 		if (opts.cuts && opts.cuts.length > 0) {
@@ -336,11 +335,7 @@ ipcMain.handle(
 			}
 		}
 
-		// Aspect ratio crop
-		if (opts.aspectRatio === "9:16") vfFilters.push("crop=ih*9/16:ih");
-		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=ih*4/3:ih");
-
-		// Resolution scale
+		// Resolution scale (must come before crop so crop uses target dimensions)
 		const scaleMap: Record<string, string> = {
 			"480p": "854:480", "720p": "1280:720",
 			"1080p": "1920:1080", "1440p": "2560:1440", "4k": "3840:2160",
@@ -348,22 +343,48 @@ ipcMain.handle(
 		if (opts.resolution && scaleMap[opts.resolution])
 			vfFilters.push(`scale=${scaleMap[opts.resolution]}`);
 
-		const args: string[] = [];
+		// Aspect ratio crop
+		if (opts.aspectRatio === "9:16") vfFilters.push("crop=ih*9/16:ih");
+		else if (opts.aspectRatio === "4:3") vfFilters.push("crop=ih*4/3:ih");
 
-		// Multi-clip timeline: use FFmpeg concat demuxer
+		const args: string[] = [];
+		let isMultiClip = false;
+
+		// Multi-clip timeline: use concat filter (handles varying codecs, applies trim per-clip)
 		if (opts.timeline && opts.timeline.length > 1) {
-			const concatPath = path.join(app.getPath("temp"), `clipsta_concat_${Date.now()}.txt`);
-			concatFile = concatPath;
-			const lines = ["ffconcat version 1.0"];
-			for (const clip of opts.timeline) {
+			isMultiClip = true;
+			const filterParts: string[] = [];
+			const inputLabels: string[] = [];
+			for (let i = 0; i < opts.timeline.length; i++) {
+				const clip = opts.timeline[i];
 				const p = clip.path.replace(/\\/g, "/");
-				lines.push(`file '${p.replace(/'/g, "'\\''")}'`);
-				if (clip.trimIn > 0) lines.push(`inpoint ${clip.trimIn}`);
-				const dur = clip.trimOut - clip.trimIn;
-				if (dur > 0) lines.push(`duration ${dur}`);
+				args.push("-hwaccel", "auto", "-i", p);
+				const vlabel = `v${i}`;
+				const alabel = `a${i}`;
+				if (clip.trimIn > 0 || (clip.trimOut > 0 && clip.trimOut > clip.trimIn)) {
+					const trimStart = clip.trimIn > 0 ? `start=${clip.trimIn}` : "";
+					const trimEnd = clip.trimOut > 0 ? `end=${clip.trimOut}` : "";
+					const trim = [trimStart, trimEnd].filter(Boolean).join(":");
+					filterParts.push(`[${i}:v]trim=${trim},setpts=PTS-STARTPTS[${vlabel}]`);
+					filterParts.push(`[${i}:a]atrim=${trim},asetpts=PTS-STARTPTS[${alabel}]`);
+				} else {
+					filterParts.push(`[${i}:v]setpts=PTS-STARTPTS[${vlabel}]`);
+					filterParts.push(`[${i}:a]asetpts=PTS-STARTPTS[${alabel}]`);
+				}
+				inputLabels.push(`[${vlabel}][${alabel}]`);
 			}
-			fs.writeFileSync(concatPath, lines.join("\n"), "utf-8");
-			args.push("-f", "concat", "-safe", "0", "-i", concatPath);
+			const concatStr = `${inputLabels.join("")}concat=n=${opts.timeline.length}:v=1:a=1:unsafe=1[vmerge][amerge]`;
+			filterParts.push(concatStr);
+
+			// Append resolution/crop filters to the merged video
+			if (vfFilters.length) {
+				filterParts.push(`[vmerge]${vfFilters.join(",")}[vout]`);
+				args.push("-filter_complex", filterParts.join(";"));
+				args.push("-map", "[vout]", "-map", "[amerge]");
+			} else {
+				args.push("-filter_complex", filterParts.join(";"));
+				args.push("-map", "[vmerge]", "-map", "[amerge]");
+			}
 		} else {
 			// Single clip
 			args.push("-hwaccel", "auto", "-i", inputPath);
@@ -371,7 +392,7 @@ ipcMain.handle(
 			if (opts.trimEnd != null) args.push("-to", String(opts.trimEnd));
 		}
 
-		if (vfFilters.length) args.push("-vf", vfFilters.join(","));
+		if (!isMultiClip && vfFilters.length) args.push("-vf", vfFilters.join(","));
 		if (opts.cuts && opts.cuts.length > 0) {
 			const aTerms = opts.cuts
 				.filter((c) => c.start < c.end)
@@ -382,14 +403,12 @@ ipcMain.handle(
 		}
 
 		args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23");
+		if (opts.fps) args.push("-r", String(opts.fps));
 		args.push("-c:a", "aac", "-b:a", "192k");
 		args.push("-movflags", "+faststart", "-y", outputPath);
 
 		return new Promise((resolve, reject) => {
 			execFile("ffmpeg", args, { timeout: 300000 }, (err2, _stdout, stderr) => {
-				if (concatFile) {
-					try { fs.unlinkSync(concatFile); } catch { /* ignore */ }
-				}
 				if (err2) {
 					const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
 					reject(`FFmpeg error: ${detail}`);
