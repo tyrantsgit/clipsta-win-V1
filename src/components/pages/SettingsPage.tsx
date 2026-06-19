@@ -107,7 +107,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 							onChange={(v) => update("aspectRatio", v)}
 							options={["16:9", "9:16", "4:3", "21:9"]} />
 						<NumberField label="Video Bitrate (kbps)" value={local.bitrate}
-							onChange={(v) => update("bitrate", v)} min={1000} max={50000} step={500} />
+							onChange={(v) => update("bitrate", v)} min={1000} max={100000} step={1000} />
 						<SelectField label="Buffer Duration" value={String(local.bufferDuration)}
 							onChange={(v) => update("bufferDuration", Number(v))}
 							options={["30", "60", "120", "180", "300"]}
@@ -148,7 +148,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						<Toggle label="Minimize to System Tray" checked={local.minimizeToTray}
 							onChange={(v) => update("minimizeToTray", v)}
 							description="Keep running in tray when window is closed" />
-						<Toggle label="Show Overlay (OBS-style)" checked={local.overlayEnabled}
+						<Toggle label="Show Overlay" checked={local.overlayEnabled}
 							onChange={(v) => update("overlayEnabled", v)}
 							description="Recording indicator while capturing" />
 					</div>
