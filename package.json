@@ -1,6 +1,6 @@
 {
   "name": "clipsta",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Gaming clip recorder — clip it before it's gone",
   "main": "dist-electron/main/index.js",
 	"scripts": {
