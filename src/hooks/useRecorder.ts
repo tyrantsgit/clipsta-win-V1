@@ -11,7 +11,7 @@ export interface RecorderState {
 	bufferSeconds: number;
 }
 
-const CHUNKS_PER_SECOND = 1;
+const CHUNKS_PER_SECOND = 10;
 
 export function useRecorder(settings: AppSettings | null) {
 	const [state, setState] = useState<RecorderState>({
@@ -122,7 +122,8 @@ export function useRecorder(settings: AppSettings | null) {
 			recorder.ondataavailable = (e) => {
 				if (e.data.size > 0) {
 					bufferRef.current.push({ chunk: e.data, ts: Date.now() });
-					const cutoff = Date.now() - 310_000;
+					const keepMs = ((settings?.bufferDuration ?? 60) + 10) * 1000;
+					const cutoff = Date.now() - keepMs;
 					bufferRef.current = bufferRef.current.filter((c) => c.ts >= cutoff);
 				}
 			};

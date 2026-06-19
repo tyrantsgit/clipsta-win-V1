@@ -130,6 +130,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 						durationSeconds: 30,
 						bytes: job.size,
 						capturedAt: new Date().toISOString(),
+						encoder: settings?.encoder,
 						trimStart: job.trimStart,
 						trimEnd: job.trimEnd,
 						cuts: job.cuts,

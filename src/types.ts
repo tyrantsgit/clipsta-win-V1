@@ -74,6 +74,7 @@ export interface UploadClipOpts {
 	durationSeconds: number;
 	bytes: number;
 	capturedAt: string;
+	encoder?: string;
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
@@ -149,6 +150,7 @@ export interface ExportOpts {
 	aspectRatio: string;
 	resolution: string;
 	fps?: number;
+	encoder?: string;
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];

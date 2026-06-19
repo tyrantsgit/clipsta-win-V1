@@ -27,6 +27,22 @@ function getFfmpegPath(): string {
 	return "ffmpeg";
 }
 
+function getEncoderArgs(encoder?: string): { codec: string; extra: string[] } {
+	switch (encoder) {
+		case "NVENC (NVIDIA)":
+			return { codec: "h264_nvenc", extra: ["-preset", "p7", "-rc", "vbr", "-cq", "23"] };
+		case "AMF (AMD)":
+			return { codec: "h264_amf", extra: ["-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23"] };
+		case "QuickSync (Intel)":
+			return { codec: "h264_qsv", extra: ["-preset", "veryfast", "-global_quality", "23"] };
+		case "HEVC (H.265)":
+			return { codec: "libx265", extra: ["-preset", "ultrafast", "-crf", "23"] };
+		case "x264 (Software)":
+		default:
+			return { codec: "libx264", extra: ["-preset", "ultrafast", "-crf", "23"] };
+	}
+}
+
 // ── Persistent settings ───────────────────────────────────────────────────────
 	const store = new Store<AppSettings>({
 		defaults: {
@@ -416,7 +432,8 @@ ipcMain.handle(
 			}
 		}
 
-		args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23");
+		const enc = getEncoderArgs(opts.encoder);
+		args.push("-c:v", enc.codec, ...enc.extra);
 		if (opts.fps) args.push("-r", String(opts.fps));
 		args.push("-c:a", "aac", "-b:a", "192k");
 		args.push("-movflags", "+faststart", "-y", outputPath);
@@ -598,6 +615,7 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 	durationSeconds: number;
 	bytes: number;
 	capturedAt: string;
+	encoder?: string;
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
@@ -640,7 +658,8 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 					exportArgs.push("-af", `aselect='not(${aTerms.join("+")})',asetpts=N/SR/TB`);
 				}
 			}
-			exportArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23");
+			const enc = getEncoderArgs(opts.encoder);
+			exportArgs.push("-c:v", enc.codec, ...enc.extra);
 			exportArgs.push("-c:a", "aac", "-b:a", "192k");
 			exportArgs.push("-movflags", "+faststart", "-y", cleanupPath);
 

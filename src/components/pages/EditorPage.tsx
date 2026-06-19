@@ -302,6 +302,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				resolution: expResolution,
 				aspectRatio: expAspect,
 				fps: settings.fps,
+				encoder: settings.encoder,
 				timeline: exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut })),
 			};
 			const out = await window.clipsta?.exportRecording(primaryPath, outPath, opts);
@@ -362,6 +363,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				resolution: expResolution,
 				aspectRatio: expAspect,
 				fps: settings.fps,
+				encoder: settings.encoder,
 				timeline: exportTimeline.length > 1
 					? exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut }))
 					: undefined,
