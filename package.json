@@ -51,6 +51,13 @@
       "dist/**/*",
       "dist-electron/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "bin/",
+        "to": ".",
+        "filter": ["ffmpeg.exe"]
+      }
+    ],
     "win": {
       "target": [
         {

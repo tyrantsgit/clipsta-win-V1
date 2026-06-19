@@ -110,6 +110,7 @@ declare global {
 			setSetting(key: string, value: unknown): Promise<boolean>;
 			setAllSettings(s: Partial<AppSettings>): Promise<boolean>;
 			browseFolder(): Promise<string | null>;
+			browseImportFolder(): Promise<string | null>;
 			browseFile(): Promise<string | null>;
 			openFolder(p: string): Promise<void>;
 			openFile(p: string): Promise<void>;
@@ -118,6 +119,7 @@ declare global {
 			deleteClip(p: string): Promise<boolean>;
 			renameClip(old: string, name: string): Promise<string>;
 			importClip(sourcePath: string): Promise<string>;
+			importFolder(folderPath: string): Promise<string[]>;
 			getSystemInfo(): Promise<SystemInfo>;
 			getCloudConfig(): Promise<CloudConfig>;
 			readFile(path: string): Promise<ArrayBuffer>;

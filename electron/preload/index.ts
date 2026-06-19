@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld("clipsta", {
 
 	// Dialogs
 	browseFolder: () => ipcRenderer.invoke("dialog:folder"),
+	browseImportFolder: () => ipcRenderer.invoke("dialog:importFolder"),
 	browseFile: () => ipcRenderer.invoke("dialog:file"),
 	browseSaveExport: (defaultName: string) => ipcRenderer.invoke("dialog:saveExport", defaultName),
 
@@ -41,6 +42,7 @@ contextBridge.exposeInMainWorld("clipsta", {
 	deleteClip: (p: string) => ipcRenderer.invoke("clips:delete", p),
 	renameClip: (old: string, name: string) => ipcRenderer.invoke("clips:rename", old, name),
 	importClip: (sourcePath: string) => ipcRenderer.invoke("clips:import", sourcePath),
+	importFolder: (folderPath: string) => ipcRenderer.invoke("clips:importFolder", folderPath),
 
 	// System
 	getSystemInfo: () => ipcRenderer.invoke("system:info"),

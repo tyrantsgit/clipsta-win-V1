@@ -580,14 +580,9 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 							}`}
 						>
 							<Plus size={18} />
-							<div className="text-center">
-								<p className="text-xs font-semibold">
-									{dragOver ? "Drop to add to timeline" : "Drag video here or click to browse"}
-								</p>
-								<p className="text-[9px] opacity-50 mt-0.5">
-									{timeline.length} clip{timeline.length !== 1 ? "s" : ""} · will concatenate in order
-								</p>
-							</div>
+							<p className="text-xs font-semibold text-center">
+								{dragOver ? "Drop to add to timeline" : "Drag video here or click to browse"}
+							</p>
 						</div>
 					</div>
 				)}
@@ -711,7 +706,14 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 						<div
 							className="absolute top-0 h-full bg-[#D4F00022]"
 							style={{ left: `${pct(trimIn)}%`, width: `${pct(trimOut) - pct(trimIn)}%` }}
-						/>
+						>
+							<div className="absolute left-0 top-1/2 -translate-y-1/2 -translate-x-1/2 bg-y text-black text-[9px] font-bold px-1.5 py-0.5 rounded shadow-lg pointer-events-none select-none z-30">
+								IN
+							</div>
+							<div className="absolute right-0 top-1/2 -translate-y-1/2 translate-x-1/2 bg-y text-black text-[9px] font-bold px-1.5 py-0.5 rounded shadow-lg pointer-events-none select-none z-30">
+								OUT
+							</div>
+						</div>
 
 						{cuts.map((c, i) => (
 							<div
@@ -754,7 +756,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 						</div>
 
 						<div
-							className="absolute top-0 h-full w-4 -translate-x-1/2 flex items-center cursor-ew-resize group/handle z-20"
+							className="absolute top-0 h-full w-6 -translate-x-1/2 flex items-center cursor-ew-resize group/handle z-20"
 							style={{ left: `${pct(trimIn)}%` }}
 							onMouseDown={(e) => {
 								e.stopPropagation();
@@ -769,14 +771,11 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 								window.addEventListener("mouseup", up);
 							}}
 						>
-							<div className="w-1 h-full bg-y rounded-l group-hover/handle:shadow-[0_0_8px_#D4F000]" />
-							<div className="absolute top-0 bg-y text-black text-[8px] font-black px-1 py-0.5 rounded-br flex items-center gap-0.5">
-								<span className="text-[6px]">▶</span> IN
-							</div>
+							<div className="w-2 h-full bg-y group-hover/handle:shadow-[0_0_12px_#D4F000]" />
 						</div>
 
 						<div
-							className="absolute top-0 h-full w-4 translate-x-1/2 right-0 flex items-center cursor-ew-resize group/handle z-20"
+							className="absolute top-0 h-full w-6 -translate-x-1/2 flex items-center cursor-ew-resize group/handle z-20"
 							style={{ left: `${pct(trimOut)}%` }}
 							onMouseDown={(e) => {
 								e.stopPropagation();
@@ -791,10 +790,7 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 								window.addEventListener("mouseup", up);
 							}}
 						>
-							<div className="w-1 h-full bg-y rounded-r group-hover/handle:shadow-[0_0_8px_#D4F000]" />
-							<div className="absolute top-0 right-0 bg-y text-black text-[8px] font-black px-1 py-0.5 rounded-bl flex items-center gap-0.5">
-								OUT <span className="text-[6px]">◀</span>
-							</div>
+							<div className="w-2 h-full bg-y group-hover/handle:shadow-[0_0_12px_#D4F000]" />
 						</div>
 					</div>
 
@@ -1141,10 +1137,6 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					}
 				</button>
 
-				<p className="text-text-dim text-[10px] text-center">
-					Export requires FFmpeg in PATH.<br />
-					<a href="https://ffmpeg.org/download.html" className="text-y underline">Download FFmpeg</a>
-				</p>
 			</div>
 		</div>
 	);

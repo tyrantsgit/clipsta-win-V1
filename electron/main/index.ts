@@ -18,6 +18,15 @@ import { execFile } from "child_process";
 import Store from "electron-store";
 import os from "os";
 
+// ── FFmpeg resolver (bundled resource, then PATH) ──────────────────────────────
+function getFfmpegPath(): string {
+	const bundled = path.join(process.resourcesPath, "ffmpeg.exe");
+	if (fs.existsSync(bundled)) return bundled;
+	const devPath = path.join(__dirname, "../../bin/ffmpeg.exe");
+	if (fs.existsSync(devPath)) return devPath;
+	return "ffmpeg";
+}
+
 // ── Persistent settings ───────────────────────────────────────────────────────
 	const store = new Store<AppSettings>({
 		defaults: {
@@ -412,8 +421,9 @@ ipcMain.handle(
 		args.push("-c:a", "aac", "-b:a", "192k");
 		args.push("-movflags", "+faststart", "-y", outputPath);
 
+		const ffmpeg = getFfmpegPath();
 		return new Promise((resolve, reject) => {
-			execFile("ffmpeg", args, { timeout: 300000 }, (err2, _stdout, stderr) => {
+			execFile(ffmpeg, args, { timeout: 300000 }, (err2, _stdout, stderr) => {
 				if (err2) {
 					const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
 					reject(`FFmpeg error: ${detail}`);
@@ -447,6 +457,14 @@ ipcMain.handle("dialog:folder", async () => {
 	const r = await dialog.showOpenDialog(mainWindow!, {
 		properties: ["openDirectory", "createDirectory"],
 		title: "Choose clips output folder",
+	});
+	return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle("dialog:importFolder", async () => {
+	const r = await dialog.showOpenDialog(mainWindow!, {
+		properties: ["openDirectory"],
+		title: "Select a folder of video clips to import",
 	});
 	return r.canceled ? null : r.filePaths[0];
 });
@@ -510,6 +528,31 @@ ipcMain.handle("clips:import", async (_e, sourcePath: string) => {
 	}
 	fs.copyFileSync(sourcePath, dest);
 	return dest;
+});
+
+ipcMain.handle("clips:importFolder", async (_e, sourceFolder: string) => {
+	const folder = store.get("outputFolder");
+	ensureOutputFolder();
+	const imported: string[] = [];
+	const files = fs.readdirSync(sourceFolder)
+		.filter((f) => /\.(webm|mp4|mkv|mov)$/i.test(f));
+	for (const f of files) {
+		const src = path.join(sourceFolder, f);
+		const dest = path.join(folder, f);
+		const ext = path.extname(f);
+		const base = path.basename(f, ext);
+		if (fs.existsSync(dest)) {
+			let i = 1;
+			while (fs.existsSync(path.join(folder, `${base} (${i})${ext}`))) i++;
+			const destPath = path.join(folder, `${base} (${i})${ext}`);
+			fs.copyFileSync(src, destPath);
+			imported.push(destPath);
+		} else {
+			fs.copyFileSync(src, dest);
+			imported.push(dest);
+		}
+	}
+	return imported;
 });
 
 // ── IPC: system info ──────────────────────────────────────────────────────────
@@ -602,7 +645,8 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 			exportArgs.push("-movflags", "+faststart", "-y", cleanupPath);
 
 			await new Promise<void>((resolve, reject) => {
-				execFile("ffmpeg", exportArgs, { timeout: 300000 }, (err2, _stdout, stderr) => {
+				const ffmpeg = getFfmpegPath();
+				execFile(ffmpeg, exportArgs, { timeout: 300000 }, (err2, _stdout, stderr) => {
 					if (err2) {
 						const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
 						reject(`FFmpeg export error: ${detail}`);

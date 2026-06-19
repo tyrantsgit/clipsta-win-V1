@@ -9,6 +9,8 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 	const [selected, setSelected] = useState<ClipFile | null>(null);
 	const [search, setSearch] = useState("");
 	const [playing, setPlaying] = useState<string | null>(null);
+	const [dragOver, setDragOver] = useState(false);
+	const dragCounterRef = useRef(0);
 	const videoRef = useRef<HTMLVideoElement>(null);
 
 	const load = useCallback(async () => {
@@ -36,17 +38,87 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		load();
 	};
 
+	const addFolder = async () => {
+		const folder = await window.clipsta?.browseImportFolder();
+		if (!folder) return;
+		const imported = await window.clipsta?.importFolder(folder) ?? [];
+		if (imported.length === 0) {
+			alert("No video files (MP4, WebM, MKV, MOV) found in the selected folder.");
+			return;
+		}
+		const names = imported.map((p) => p.replace(/^.*[\\/]/, ""));
+		if (!confirm(`Add ${imported.length} clip${imported.length !== 1 ? "s" : ""} from this folder?\n${names.join("\n")}`)) return;
+		if (cloud.paired) {
+			for (const p of imported) {
+				const name = p.replace(/^.*[\\/]/, "");
+				const stat = await window.clipsta?.getFileStats(p).catch(() => null);
+				cloud.addToQueue(p, name, stat?.size ?? 0);
+			}
+		}
+		load();
+	};
+
+	const handleDragEnter = (e: React.DragEvent) => {
+		e.preventDefault();
+		dragCounterRef.current++;
+		setDragOver(true);
+	};
+
+	const handleDragOver = (e: React.DragEvent) => {
+		e.preventDefault();
+	};
+
+	const handleDragLeave = (e: React.DragEvent) => {
+		e.preventDefault();
+		dragCounterRef.current--;
+		if (dragCounterRef.current <= 0) {
+			dragCounterRef.current = 0;
+			setDragOver(false);
+		}
+	};
+
+	const handleDrop = async (e: React.DragEvent) => {
+		e.preventDefault();
+		dragCounterRef.current = 0;
+		setDragOver(false);
+		const paths: string[] = [];
+		for (const f of Array.from(e.dataTransfer.files)) {
+			const p = (f as any).path || f.name;
+			if (p && /\.(webm|mp4|mkv|mov)$/i.test(p)) paths.push(p);
+		}
+		if (paths.length === 0) return;
+		const imported: string[] = [];
+		for (const p of paths) {
+			const dest = await window.clipsta?.importClip(p);
+			if (dest) imported.push(dest);
+		}
+		if (cloud.paired) {
+			for (const p of imported) {
+				const name = p.replace(/^.*[\\/]/, "");
+				const stat = await window.clipsta?.getFileStats(p).catch(() => null);
+				cloud.addToQueue(p, name, stat?.size ?? 0);
+			}
+		}
+		load();
+	};
+
 	const deleteClip = async (clip: ClipFile) => {
 		if (!confirm(`Delete "${clip.name}"?`)) return;
-		if (videoRef.current) {
-			videoRef.current.pause();
-			videoRef.current.removeAttribute("src");
-			videoRef.current.load();
+		try {
+			if (videoRef.current) {
+				videoRef.current.pause();
+				videoRef.current.removeAttribute("src");
+				videoRef.current.load();
+			}
+			setPlaying(null);
+			setSelected(null);
+			await new Promise((r) => setTimeout(r, 100));
+			await window.clipsta?.deleteClip(clip.path);
+			load();
+		} catch (e) {
+			console.error("Delete failed:", e);
+			alert("Failed to delete clip. The file may be in use by another application.");
 		}
-		setPlaying(null);
-		setSelected(null);
-		await window.clipsta?.deleteClip(clip.path);
-		load();
 	};
 
 	const playClip = (clip: ClipFile) => {
@@ -62,7 +134,22 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 	};
 
 	return (
-		<div className="h-full flex overflow-hidden">
+		<div
+			className="h-full flex overflow-hidden"
+			onDragEnter={handleDragEnter}
+			onDragOver={handleDragOver}
+			onDragLeave={handleDragLeave}
+			onDrop={handleDrop}
+		>
+			{dragOver && (
+				<div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 pointer-events-none">
+					<div className="rounded-2xl border-2 border-dashed border-y p-10 text-center bg-[#1c1c00]/80 backdrop-blur-sm shadow-[0_0_60px_rgba(212,240,0,0.1)]">
+						<Film size={40} className="mx-auto mb-3 text-y" />
+						<p className="text-y text-lg font-bold">Drop to add to library</p>
+						<p className="text-text-dim text-sm mt-1">Supports MP4, WebM, MKV, MOV</p>
+					</div>
+				</div>
+			)}
 			<div className="w-72 flex-shrink-0 border-r border-border flex flex-col">
 				<div className="p-4 border-b border-border space-y-3">
 					<div className="flex items-center justify-between">
@@ -71,14 +158,10 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 							<button onClick={load} className="text-text-dim hover:text-y transition-colors" title="Refresh">
 								<RefreshCw size={14} className={loading ? "animate-spin" : ""} />
 							</button>
-							<button onClick={addClip} className="text-text-dim hover:text-y transition-colors" title="Add clip">
+							<button onClick={addClip} className="text-text-dim hover:text-y transition-colors" title="Add video file">
 								<Plus size={14} />
 							</button>
-							<button
-								onClick={() => window.clipsta?.openFolder("")}
-								className="text-text-dim hover:text-y transition-colors"
-								title="Open folder"
-							>
+							<button onClick={addFolder} className="text-text-dim hover:text-y transition-colors" title="Add folder of clips">
 								<FolderOpen size={14} />
 							</button>
 						</div>
@@ -268,6 +351,7 @@ function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, up
 	return (
 		<div
 			onClick={onClick}
+			onDoubleClick={onPlay}
 			className={`rounded-lg p-2.5 cursor-pointer border transition-all group
 				${active ? "border-y bg-[#1c1c00]" : "border-transparent hover:border-border hover:bg-card"}`}
 		>
