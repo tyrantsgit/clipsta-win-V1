@@ -41,7 +41,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 		let id = settings?.desktopDeviceId;
 		if (!id) {
 			if (!pairingDeviceIdRef.current) {
-				pairingDeviceIdRef.current = `desktop_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+				pairingDeviceIdRef.current = `desktop_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 			}
 			id = pairingDeviceIdRef.current;
 		}
@@ -110,6 +110,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// ── Upload ────────────────────────────────────────────────────────────
 	const MAX_RETRIES = 5;
 	const RETRY_DELAYS = [1000, 2000, 4000, 8000, 16000];
+	const MAX_DONE_JOBS = 50;
 
 	const processQueue = useCallback(async () => {
 		if (processingRef.current) return;
@@ -181,12 +182,21 @@ export function useCloudUpload(settings: AppSettings | null) {
 		const existing = queueRef.current.find((j) => j.path === path);
 		if (existing) {
 			if (existing.status === "queued" || existing.status === "uploading") return;
-			updateJob(existing.id, { status: "queued", progress: 0, error: undefined, name, retryCount: 0, ...trimOpts });
+			updateJob(existing.id, { status: "queued" as const, progress: 0, error: undefined, name, retryCount: 0, ...trimOpts });
 			setTimeout(processQueue, 100);
 			return;
 		}
 		const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		syncQueue([...queueRef.current, { id, path, name, size, progress: 0, status: "queued", ...trimOpts }]);
+		const newJob: UploadJob = { id, path, name, size, progress: 0, status: "queued", ...trimOpts };
+		const next = [...queueRef.current, newJob];
+		// Prune old done/failed jobs to cap memory
+		const doneFailed = next.filter((j) => j.status === "done" || j.status === "failed");
+		if (doneFailed.length > MAX_DONE_JOBS) {
+			const keepIds = new Set(doneFailed.slice(-MAX_DONE_JOBS).map((j) => j.id));
+			syncQueue(next.filter((j) => j.status === "queued" || j.status === "uploading" || keepIds.has(j.id)));
+		} else {
+			syncQueue(next);
+		}
 		setTimeout(processQueue, 100);
 	}, [syncQueue, updateJob, processQueue]);
 

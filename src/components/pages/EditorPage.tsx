@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	Scissors, Download, RotateCcw, Volume2, VolumeX, FileUp,
 	Play, Pause, SkipBack, SkipForward, Crop, Loader2, Trash2, Eraser, FolderOpen, Upload, Pen, Check,
@@ -403,24 +403,29 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		}
 	};
 
-	const pct = (t: number) => duration > 0 ? (t / duration) * 100 : 0;
+	const pct = useCallback((t: number) => duration > 0 ? (t / duration) * 100 : 0, [duration]);
 
 	// ── Keyboard shortcuts ────────────────────────────────────────────────
+	const togglePlayRef = useRef(togglePlay);
+	togglePlayRef.current = togglePlay;
+	const cutAtPlayheadRef = useRef(cutAtPlayhead);
+	cutAtPlayheadRef.current = cutAtPlayhead;
+
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
 			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
-			const t = videoRef.current?.currentTime ?? currentTime;
+			const t = videoRef.current?.currentTime ?? 0;
 			switch (e.code) {
-				case "Space": e.preventDefault(); togglePlay(); break;
+				case "Space": e.preventDefault(); togglePlayRef.current(); break;
 				case "KeyI": setTrimIn(t); if (videoRef.current) videoRef.current.currentTime = t; break;
 				case "KeyO": setTrimOut(t); break;
-				case "KeyX": e.preventDefault(); cutAtPlayhead(); break;
+				case "KeyX": e.preventDefault(); cutAtPlayheadRef.current(); break;
 				case "Escape": setCutMode(false); break;
 			}
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	});
+	}, []);
 
 	// ── Drag-and-drop handlers (counter-based to avoid child-element flicker) ──
 	const dragCounterRef = useRef(0);
@@ -473,12 +478,15 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			}[expAspect] ?? 16 / 9;
 
 	// ── Time ruler ticks ───────────────────────────────────────────────────
-	const tickInterval = Math.max(1, Math.floor(10 / timelineScale));
-	const ticks: number[] = [];
-	if (duration > 0 && isFinite(duration)) {
-		const maxTicks = 10000;
-		for (let t = 0, count = 0; t <= duration && count < maxTicks; t += tickInterval, count++) ticks.push(t);
-	}
+	const ticks = useMemo(() => {
+		const tickInterval = Math.max(1, Math.floor(10 / timelineScale));
+		const result: number[] = [];
+		if (duration > 0 && isFinite(duration)) {
+			const maxTicks = 10000;
+			for (let t = 0, count = 0; t <= duration && count < maxTicks; t += tickInterval, count++) result.push(t);
+		}
+		return result;
+	}, [duration, timelineScale]);
 
 	if (!filePath) {
 		return (
@@ -610,8 +618,8 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 							onTimeUpdate={onTimeUpdate}
 							onEnded={() => setPlaying(false)}
 							onError={() => setExportError(`Cannot load file: ${filePath}`)}
-							volume={muted ? 0 : volume}
 						/>)}
+						<VolumeSync videoRef={videoRef} muted={muted} volume={volume} />
 					</div>
 				</div>
 
@@ -1149,6 +1157,14 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			</div>
 		</div>
 	);
+}
+
+function VolumeSync({ videoRef, muted, volume }: { videoRef: React.RefObject<HTMLVideoElement | null>; muted: boolean; volume: number }) {
+	useEffect(() => {
+		const v = videoRef.current;
+		if (v) { v.muted = muted; v.volume = volume; }
+	}, [muted, volume, videoRef]);
+	return null;
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

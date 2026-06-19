@@ -107,6 +107,7 @@ export function useRecorder(settings: AppSettings | null) {
 			setState((s) => ({ ...s, error: null, status: "recording" }));
 			const stream = await getStream(sourceId);
 			streamRef.current = stream;
+			const capturedAux = auxStreamsRef.current;
 			bufferRef.current = [];
 			durationRef.current = 0;
 
@@ -130,8 +131,8 @@ export function useRecorder(settings: AppSettings | null) {
 
 			recorder.onstop = () => {
 				clearInterval(timerRef.current!);
-				streamRef.current?.getTracks().forEach((t) => t.stop());
-				auxStreamsRef.current.forEach((s) => s.getTracks().forEach((t) => t.stop()));
+				stream.getTracks().forEach((t) => t.stop());
+				capturedAux.forEach((s) => s.getTracks().forEach((t) => t.stop()));
 				auxStreamsRef.current = [];
 			};
 

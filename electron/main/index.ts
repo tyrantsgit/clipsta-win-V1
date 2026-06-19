@@ -19,11 +19,15 @@ import Store from "electron-store";
 import os from "os";
 
 // ── FFmpeg resolver (bundled resource, then PATH) ──────────────────────────────
+let _ffmpegPath: string | null = null;
+
 function getFfmpegPath(): string {
+	if (_ffmpegPath) return _ffmpegPath;
 	const bundled = path.join(process.resourcesPath, "ffmpeg.exe");
-	if (fs.existsSync(bundled)) return bundled;
+	if (fs.existsSync(bundled)) { _ffmpegPath = bundled; return bundled; }
 	const devPath = path.join(__dirname, "../../bin/ffmpeg.exe");
-	if (fs.existsSync(devPath)) return devPath;
+	if (fs.existsSync(devPath)) { _ffmpegPath = devPath; return devPath; }
+	_ffmpegPath = "ffmpeg";
 	return "ffmpeg";
 }
 
@@ -271,7 +275,7 @@ function ensureOutputFolder() {
 function ensureDesktopDeviceId() {
 	let id = store.get("desktopDeviceId");
 	if (!id) {
-		id = `desktop_${crypto.randomUUID().replaceAll("-", "")}`;
+		id = `desktop_${crypto.randomUUID().replace(/-/g, "")}`;
 		store.set("desktopDeviceId", id);
 	}
 }
@@ -312,6 +316,7 @@ ipcMain.handle("recording:setState", (_e, recording: boolean) => {
 	isRecording = recording;
 	refreshTrayMenu();
 	if (recording) {
+		if (powerBlockId !== null) powerSaveBlocker.stop(powerBlockId);
 		powerBlockId = powerSaveBlocker.start("prevent-display-sleep");
 	} else if (powerBlockId !== null) {
 		powerSaveBlocker.stop(powerBlockId);
@@ -340,7 +345,7 @@ ipcMain.handle("recording:save", async (_e, arrayBuffer: ArrayBuffer, fileName: 
 	const folder = store.get("outputFolder");
 	ensureOutputFolder();
 	const filePath = path.join(folder, fileName);
-	fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+	await fs.promises.writeFile(filePath, Buffer.from(arrayBuffer));
 	return filePath;
 });
 
@@ -440,7 +445,7 @@ ipcMain.handle(
 
 		const ffmpeg = getFfmpegPath();
 		return new Promise((resolve, reject) => {
-			execFile(ffmpeg, args, { timeout: 300000 }, (err2, _stdout, stderr) => {
+			execFile(ffmpeg, args, { timeout: 300000, maxBuffer: 100 * 1024 * 1024 }, (err2, _stdout, stderr) => {
 				if (err2) {
 					const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
 					reject(`FFmpeg error: ${detail}`);
@@ -504,29 +509,31 @@ ipcMain.handle("shell:openFile", (_e, p: string) => shell.openPath(p));
 ipcMain.handle("shell:showItem", (_e, p: string) => shell.showItemInFolder(p));
 
 // ── IPC: clip library ─────────────────────────────────────────────────────────
-ipcMain.handle("clips:list", () => {
+ipcMain.handle("clips:list", async () => {
 	const folder = store.get("outputFolder");
-	if (!fs.existsSync(folder)) return [];
-	return fs
-		.readdirSync(folder)
-		.filter((f) => /\.(webm|mp4|mkv|mov)$/i.test(f))
-		.map((f) => {
-			const full = path.join(folder, f);
-			const stat = fs.statSync(full);
-			return { name: f, path: full, size: stat.size, createdAt: stat.birthtime.toISOString() };
-		})
-		.sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
+	if (!folder || !fs.existsSync(folder)) return [];
+	const entries = await fs.promises.readdir(folder, { withFileTypes: true });
+	const results: { name: string; path: string; size: number; createdAt: string }[] = [];
+	for (const entry of entries) {
+		if (!/\.(webm|mp4|mkv|mov)$/i.test(entry.name)) continue;
+		const full = path.join(folder, entry.name);
+		try {
+			const stat = await fs.promises.stat(full);
+			results.push({ name: entry.name, path: full, size: stat.size, createdAt: stat.birthtime.toISOString() });
+		} catch { /* file may have been deleted between readdir and stat */ }
+	}
+	return results.sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
 });
 
-ipcMain.handle("clips:delete", (_e, p: string) => {
-	if (fs.existsSync(p)) fs.unlinkSync(p);
+ipcMain.handle("clips:delete", async (_e, p: string) => {
+	if (fs.existsSync(p)) await fs.promises.unlink(p);
 	return true;
 });
 
-ipcMain.handle("clips:rename", (_e, oldPath: string, newName: string) => {
+ipcMain.handle("clips:rename", async (_e, oldPath: string, newName: string) => {
 	const dir = path.dirname(oldPath);
 	const newPath = path.join(dir, newName);
-	fs.renameSync(oldPath, newPath);
+	await fs.promises.rename(oldPath, newPath);
 	return newPath;
 });
 
@@ -539,11 +546,12 @@ ipcMain.handle("clips:import", async (_e, sourcePath: string) => {
 		const ext = path.extname(name);
 		const base = path.basename(name, ext);
 		let i = 1;
-		while (fs.existsSync(dest.replace(name, `${base} (${i})${ext}`))) i++;
-		fs.copyFileSync(sourcePath, path.join(folder, `${base} (${i})${ext}`));
-		return path.join(folder, `${base} (${i})${ext}`);
+		while (fs.existsSync(path.join(folder, `${base} (${i})${ext}`))) i++;
+		const finalDest = path.join(folder, `${base} (${i})${ext}`);
+		await fs.promises.copyFile(sourcePath, finalDest);
+		return finalDest;
 	}
-	fs.copyFileSync(sourcePath, dest);
+	await fs.promises.copyFile(sourcePath, dest);
 	return dest;
 });
 
@@ -551,8 +559,8 @@ ipcMain.handle("clips:importFolder", async (_e, sourceFolder: string) => {
 	const folder = store.get("outputFolder");
 	ensureOutputFolder();
 	const imported: string[] = [];
-	const files = fs.readdirSync(sourceFolder)
-		.filter((f) => /\.(webm|mp4|mkv|mov)$/i.test(f));
+	const entries = await fs.promises.readdir(sourceFolder);
+	const files = entries.filter((f) => /\.(webm|mp4|mkv|mov)$/i.test(f));
 	for (const f of files) {
 		const src = path.join(sourceFolder, f);
 		const dest = path.join(folder, f);
@@ -562,10 +570,10 @@ ipcMain.handle("clips:importFolder", async (_e, sourceFolder: string) => {
 			let i = 1;
 			while (fs.existsSync(path.join(folder, `${base} (${i})${ext}`))) i++;
 			const destPath = path.join(folder, `${base} (${i})${ext}`);
-			fs.copyFileSync(src, destPath);
+			await fs.promises.copyFile(src, destPath);
 			imported.push(destPath);
 		} else {
-			fs.copyFileSync(src, dest);
+			await fs.promises.copyFile(src, dest);
 			imported.push(dest);
 		}
 	}
@@ -582,19 +590,18 @@ ipcMain.handle("system:info", () => ({
 }));
 
 // ── IPC: read file for upload ─────────────────────────────────────────────────
-ipcMain.handle("file:read", (_e, filePath: string) => {
-	return fs.readFileSync(filePath).buffer;
+ipcMain.handle("file:read", async (_e, filePath: string) => {
+	const buf = await fs.promises.readFile(filePath);
+	return buf.buffer;
 });
 
-ipcMain.handle("file:stat", (_e, filePath: string) => {
-	const s = fs.statSync(filePath);
+ipcMain.handle("file:stat", async (_e, filePath: string) => {
+	const s = await fs.promises.stat(filePath);
 	return { size: s.size, modifiedAt: s.mtime.toISOString() };
 });
 
-ipcMain.handle("file:ensureDir", (_e, dirPath: string) => {
-	if (!fs.existsSync(dirPath)) {
-		fs.mkdirSync(dirPath, { recursive: true });
-	}
+ipcMain.handle("file:ensureDir", async (_e, dirPath: string) => {
+	await fs.promises.mkdir(dirPath, { recursive: true });
 	return true;
 });
 
@@ -665,7 +672,7 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 
 			await new Promise<void>((resolve, reject) => {
 				const ffmpeg = getFfmpegPath();
-				execFile(ffmpeg, exportArgs, { timeout: 300000 }, (err2, _stdout, stderr) => {
+				execFile(ffmpeg, exportArgs, { timeout: 300000, maxBuffer: 100 * 1024 * 1024 }, (err2, _stdout, stderr) => {
 					if (err2) {
 						const detail = stderr ? stderr.split("\n").slice(-3).join(" ").trim() : err2.message;
 						reject(`FFmpeg export error: ${detail}`);
@@ -709,7 +716,7 @@ ipcMain.handle("upload:clip", async (_e, opts: {
 		const clipData = await clipRes.json();
 
 		// Step 2: Upload file to the returned uploadUrl via multipart form-data
-		const fileBuf = fs.readFileSync(uploadPath);
+		const fileBuf = await fs.promises.readFile(uploadPath);
 		const mime = uploadName.endsWith(".webm") ? "video/webm"
 			: uploadName.endsWith(".mkv") ? "video/x-matroska"
 			: uploadName.endsWith(".mov") ? "video/quicktime"
@@ -772,6 +779,8 @@ interface ExportOpts {
 	format: string;
 	aspectRatio: string;
 	resolution: string;
+	encoder?: string;
+	fps?: number;
 	trimStart?: number;
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];

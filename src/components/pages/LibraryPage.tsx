@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Film, FolderOpen, Trash2, Scissors, Play, RefreshCw, Search, Upload, Loader2, CheckCircle, XCircle, Plus } from "lucide-react";
 import type { ClipFile, UploadJob } from "../../types";
 import type { useCloudUpload } from "../../hooks/useCloudUpload";
@@ -18,6 +18,7 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		try {
 			const list = await window.clipsta?.listClips() ?? [];
 			setClips(list);
+			setSelected((prev) => (prev && list.some((c) => c.path === prev.path) ? prev : null));
 		} finally {
 			setLoading(false);
 		}
@@ -127,7 +128,10 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		setTimeout(() => videoRef.current?.play(), 100);
 	};
 
-	const filtered = clips.filter((c) => c.name.toLowerCase().includes(search.toLowerCase()));
+	const filtered = useMemo(() => {
+		const lowered = search.toLowerCase();
+		return clips.filter((c) => c.name.toLowerCase().includes(lowered));
+	}, [clips, search]);
 
 	const getUploadStatus = (clip: ClipFile): UploadJob | undefined => {
 		return cloud.queue.find((j) => j.path === clip.path);
@@ -285,6 +289,7 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 	);
 }
 
+const MAX_THUMB_CACHE = 200;
 const thumbCache = new Map<string, string>();
 const thumbQueue = new Set<string>();
 
@@ -321,6 +326,10 @@ function useThumbnail(path: string): string | null {
 				const ctx = canvas.getContext("2d")!;
 				ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 				const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+				if (thumbCache.size >= MAX_THUMB_CACHE) {
+					const firstKey = thumbCache.keys().next().value;
+					if (firstKey) thumbCache.delete(firstKey);
+				}
 				thumbCache.set(path, dataUrl);
 				thumbQueue.delete(path);
 				setThumb(dataUrl);
