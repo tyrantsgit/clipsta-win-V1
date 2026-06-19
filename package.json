@@ -3,15 +3,18 @@
   "version": "1.0.1",
   "description": "Gaming clip recorder — clip it before it's gone",
   "main": "dist-electron/main/index.js",
-	"scripts": {
-		"dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-		"build:win": "vite build && electron-builder --win --x64",
-		"build": "vite build && electron-builder",
-		"test": "vitest run",
-		"test:watch": "vitest"
-	},
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build:win": "vite build && electron-builder --win --x64",
+    "build": "vite build && electron-builder",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "dependencies": {
+    "canvas": "^3.2.3",
     "electron-store": "^8.2.0",
+    "png-to-ico": "^3.0.1",
+    "pngjs": "^7.0.0",
     "qrcode.react": "^4.2.0"
   },
   "devDependencies": {
@@ -55,7 +58,9 @@
       {
         "from": "bin/",
         "to": ".",
-        "filter": ["ffmpeg.exe"]
+        "filter": [
+          "ffmpeg.exe"
+        ]
       }
     ],
     "win": {

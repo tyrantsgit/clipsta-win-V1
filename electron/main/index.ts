@@ -190,9 +190,9 @@ async function createWindow() {
 
 // ── Tray ──────────────────────────────────────────────────────────────────────
 function createTray() {
-	const icoPath = path.join(__dirname, "../../dist/icon.ico");
-	const icon = fs.existsSync(icoPath)
-		? nativeImage.createFromPath(icoPath).resize({ width: 16, height: 16 })
+	const trayPath = path.join(__dirname, "../../dist/tray.png");
+	const icon = fs.existsSync(trayPath)
+		? nativeImage.createFromPath(trayPath)
 		: nativeImage.createEmpty();
 	tray = new Tray(icon);
 	tray.setToolTip("Clipsta");
