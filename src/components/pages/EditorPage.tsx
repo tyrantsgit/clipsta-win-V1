@@ -60,6 +60,8 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const renameInputRef = useRef<HTMLInputElement>(null);
 	const [resetKey, setResetKey] = useState(0);
 
+	const renameRef = useRef<HTMLDivElement>(null);
+
 	const handleRename = async () => {
 		const entry = timeline[activeIdx];
 		if (!entry || !renameValue.trim()) return;
@@ -67,6 +69,10 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 		const ext = entry.path.replace(/^.*\./, "");
 		const newName = ext ? `${base}.${ext}` : base;
 		setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, name: newName } : e));
+		setRenaming(false);
+	};
+
+	const cancelRename = () => {
 		setRenaming(false);
 	};
 
@@ -983,20 +989,21 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 					<div className="space-y-1">
 						<p className="label">Active Clip</p>
 						{renaming ? (
-							<div className="flex items-center gap-1">
+							<div ref={renameRef} className="flex items-center gap-1">
 								<input
 									ref={renameInputRef}
+									key="rename-input"
 									value={renameValue}
 									onChange={(e) => setRenameValue(e.target.value)}
 									onKeyDown={(e) => {
 										if (e.key === "Enter") handleRename();
-										if (e.key === "Escape") setRenaming(false);
+										if (e.key === "Escape") cancelRename();
 									}}
-									onBlur={handleRename}
-									className="input text-xs py-1 flex-1 min-w-0"
+									className="bg-[#1a1a1a] border border-border rounded-lg px-2 py-1 text-xs text-white flex-1 min-w-0 outline-none focus:border-y transition-colors"
 									autoFocus
 								/>
 								<button
+									onMouseDown={(e) => e.preventDefault()}
 									onClick={handleRename}
 									className="p-1.5 rounded bg-y text-black hover:bg-yd transition-colors"
 								>
