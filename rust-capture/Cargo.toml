@@ -1,0 +1,40 @@
+[package]
+name = "clipsta-capture"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "clipsta-capture"
+path = "src/main.rs"
+
+[dependencies]
+wgc = { git = "https://github.com/Atliac/wgc.git" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_System_Threading",
+  "Win32_System_Performance",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Media_MediaFoundation",
+  "Win32_Devices_Properties",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
