@@ -32,12 +32,16 @@
     {
       "identifier": "fs:scope",
       "allow": [
-        { "path": "**" }
+        { "path": "$APPDATA/**" },
+        { "path": "$VIDEO/**" },
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$TEMP/clipsta_*" },
+        { "path": "$HOME/Videos/**" },
+        { "path": "$HOME/Desktop/**" }
       ]
     },
     "shell:default",
     "shell:allow-open",
-    "shell:allow-execute",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
     "global-shortcut:allow-unregister-all",

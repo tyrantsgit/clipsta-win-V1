@@ -125,7 +125,6 @@ impl WatchFolderService {
         if let Some(tx) = sig.take() {
             let _ = tx.send(());
         }
-        eprintln!("[watch_folder] stopped");
     }
 
     /// Check if the service is currently active.
@@ -237,7 +236,6 @@ async fn poll_loop(
                         };
 
                         let _ = app.emit("watch-folder:new-file", &payload);
-                        eprintln!("[watch_folder] new file detected: {} ({} bytes)", file_name, current_size);
 
                         let mut state = inner.lock();
                         state.seen_files.insert(path.clone());

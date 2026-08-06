@@ -30,7 +30,7 @@
         "enable": true,
         "scope": ["**"]
       },
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' asset: https://asset.localhost; connect-src 'self' https://clipsta-api.godson594.workers.dev https://* http://*; img-src 'self' asset: https://asset.localhost blob: data:; media-src * 'unsafe-inline' blob: data: asset: https://asset.localhost; font-src 'self' data:"
+      "csp": "default-src 'self' 'unsafe-inline' asset: http://asset.localhost; connect-src 'self' https://clipsta-api.godson594.workers.dev https://*.cloudflarestream.com https://*.videodelivery.net; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' blob: data: asset: http://asset.localhost; font-src 'self' data:"
     }
   },
   "bundle": {
@@ -46,7 +46,10 @@
     "resources": ["resources/ffmpeg.exe"],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "headerImage": null,
+        "sidebarImage": null
       }
     }
   },

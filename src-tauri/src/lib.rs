@@ -6,6 +6,7 @@
 //! - In-process WGC + WASAPI capture (no separate process)
 
 pub mod audio;
+pub mod cloud_proxy;
 pub mod commands;
 pub mod gpu_capture;
 pub mod lossless_trim;
@@ -115,6 +116,11 @@ pub fn run() {
             commands::watch_folder_start,
             commands::watch_folder_stop,
             commands::watch_folder_status,
+            // Cloud Proxy (API key stays backend-side)
+            cloud_proxy::cloud_get_config,
+            cloud_proxy::cloud_generate_pairing,
+            cloud_proxy::cloud_request_upload,
+            cloud_proxy::cloud_notify_status,
         ])
         .setup(|app| {
             // Load settings (non-fatal: use defaults if file is corrupted)
@@ -147,12 +153,17 @@ pub fn run() {
                     if name.starts_with("clipsta_clip_video_") || name.starts_with("clipsta_concat_") {
                         let _ = std::fs::remove_file(entry.path());
                     }
+                    // Remove old debug log files
+                    if name.starts_with("clipsta_") && (name.ends_with(".log") || name.ends_with(".txt")) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                 }
             }
 
             // Manage state
             app.manage(store.clone());
             app.manage(session);
+            app.manage(cloud_proxy::HttpClient::new());
 
             // Create and manage watch folder service
             let watch_service = WatchFolderService::new();

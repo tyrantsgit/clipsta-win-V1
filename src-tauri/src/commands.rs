@@ -71,49 +71,54 @@ pub async fn clips_list(store: State<'_, SettingsStore>) -> Result<Vec<ClipFile>
     if !folder.exists() {
         return Ok(Vec::new());
     }
-    let mut clips = Vec::new();
-    // Recursive scan for clips in game-name subfolders (ShadowPlay style)
-    fn scan_dir(dir: &std::path::Path, clips: &mut Vec<ClipFile>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                scan_dir(&path, clips);
-                continue;
-            }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                if meta.len() == 0 { continue; } // Skip empty/failed clips
-                let created = meta
-                    .created()
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Local> = t.into();
-                        dt.to_rfc3339()
-                    })
-                    .unwrap_or_default();
-                clips.push(ClipFile {
-                    name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                    path: path.to_string_lossy().to_string(),
-                    size: meta.len(),
-                    created_at: created,
-                });
+    // Run the recursive filesystem scan off the async executor thread
+    tokio::task::spawn_blocking(move || {
+        let mut clips = Vec::new();
+        fn scan_dir(dir: &std::path::Path, clips: &mut Vec<ClipFile>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, clips);
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() == 0 { continue; }
+                    let created = meta
+                        .created()
+                        .map(|t| {
+                            let dt: chrono::DateTime<chrono::Local> = t.into();
+                            dt.to_rfc3339()
+                        })
+                        .unwrap_or_default();
+                    clips.push(ClipFile {
+                        name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        path: path.to_string_lossy().to_string(),
+                        size: meta.len(),
+                        created_at: created,
+                    });
+                }
             }
         }
-    }
-    scan_dir(&folder, &mut clips);
-    clips.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(clips)
+        scan_dir(&folder, &mut clips);
+        clips.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        clips
+    })
+    .await
+    .map_err(|e| format!("clips_list task failed: {}", e))
 }
 
 #[tauri::command]
-pub async fn clips_delete(path: String) -> Result<bool, String> {
+pub async fn clips_delete(path: String, store: State<'_, SettingsStore>) -> Result<bool, String> {
+    validate_clip_path(&path, &store)?;
     if std::path::Path::new(&path).exists() {
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
@@ -121,7 +126,12 @@ pub async fn clips_delete(path: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn clips_rename(old_path: String, new_name: String) -> Result<String, String> {
+pub async fn clips_rename(old_path: String, new_name: String, store: State<'_, SettingsStore>) -> Result<String, String> {
+    validate_clip_path(&old_path, &store)?;
+    // Sanitize new_name: no path separators allowed
+    if new_name.contains('/') || new_name.contains('\\') || new_name.contains("..") {
+        return Err("Invalid file name".to_string());
+    }
     let dir = std::path::Path::new(&old_path)
         .parent()
         .ok_or("No parent dir")?;
@@ -135,6 +145,18 @@ pub async fn clips_import(
     source_path: String,
     store: State<'_, SettingsStore>,
 ) -> Result<String, String> {
+    // Validate source is a video file
+    let ext = std::path::Path::new(&source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
+        return Err("Only video files (mp4, webm, mkv, mov) can be imported".to_string());
+    }
+    if source_path.starts_with("\\\\") || source_path.contains("..") {
+        return Err("Invalid source path".to_string());
+    }
     let folder = ensure_output_folder(&store);
     let name = std::path::Path::new(&source_path)
         .file_name()
@@ -235,16 +257,11 @@ pub async fn wgc_start_recording(
         let _ = app_handle.emit("wgc:segment", &seg);
     });
 
-    let (out_w, out_h) = (1280u32, 720u32);
-    eprintln!("[wgc_start_recording] calling session.start with fps={} bitrate={} no_audio={} ({}x{})",
-        fps, bitrate, no_audio, out_w, out_h);
     let info = session.start(capture_opts, on_segment).map_err(|e| {
         let msg = format!("Capture start failed: {}", e);
-        eprintln!("[wgc_start_recording] {}", msg);
         let _ = app.emit("wgc:error", &msg);
         msg
     })?;
-    eprintln!("[wgc_start_recording] success: {}x{} @ {}fps", info.width, info.height, info.fps);
 
     Ok(serde_json::json!({
         "width": info.width,
@@ -294,12 +311,8 @@ pub async fn wgc_save_clip(
     let output_path = game_folder.join(&file_name);
     let output_str = output_path.to_string_lossy().to_string();
 
-    eprintln!("[wgc_save_clip] saving {}s clip to: {}", seconds, output_str);
-
     // Use the new persistent-encoder pipeline: keyframe-aligned slice from
     // the in-memory encoded ring → MF Sink Writer → MP4.
-    // This is instant (no transcoding) because the ring already contains
-    // encoded H.264 frames ready for passthrough muxing.
     match session.save_clip(seconds, &output_str) {
         Ok(path) => {
             let _ = app.emit("wgc:clipSaved", &path);
@@ -307,12 +320,10 @@ pub async fn wgc_save_clip(
             if settings.clip_sound_enabled {
                 let _ = app.emit("play-clip-sound", ());
             }
-            eprintln!("[wgc_save_clip] clip saved: {}", path);
             Ok(Some(path))
         }
         Err(e) => {
             let msg = format!("{}", e);
-            eprintln!("[wgc_save_clip] save failed: {}", msg);
             // If the ring doesn't have enough data yet, return None (not an error)
             if msg.contains("Not enough") || msg.contains("No keyframe") {
                 Ok(None)
@@ -357,6 +368,10 @@ pub async fn wgc_save_full_recording(
 
 #[tauri::command]
 pub async fn shell_open_folder(path: String) -> Result<(), String> {
+    // Reject UNC paths and special devices
+    if path.starts_with("\\\\") || path.contains("..") {
+        return Err("Invalid path".to_string());
+    }
     Command::new("explorer")
         .arg(&path)
         .spawn()
@@ -366,6 +381,9 @@ pub async fn shell_open_folder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn shell_open_file(path: String) -> Result<(), String> {
+    if path.starts_with("\\\\") || path.contains("..") {
+        return Err("Invalid path".to_string());
+    }
     Command::new("explorer")
         .arg(&path)
         .spawn()
@@ -375,6 +393,9 @@ pub async fn shell_open_file(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn shell_show_item(path: String) -> Result<(), String> {
+    if path.starts_with("\\\\") || path.contains("..") {
+        return Err("Invalid path".to_string());
+    }
     Command::new("explorer")
         .args(["/select,", &path])
         .spawn()
@@ -383,7 +404,8 @@ pub async fn shell_show_item(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn file_stat(file_path: String) -> Result<serde_json::Value, String> {
+pub async fn file_stat(file_path: String, store: State<'_, SettingsStore>) -> Result<serde_json::Value, String> {
+    validate_accessible_path(&file_path, &store)?;
     let meta = std::fs::metadata(&file_path).map_err(|e| e.to_string())?;
     let modified = meta
         .modified()
@@ -400,12 +422,32 @@ pub async fn file_stat(file_path: String) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub async fn file_ensure_dir(dir_path: String) -> Result<bool, String> {
+    // Only allow creating dirs under known safe locations
+    if dir_path.starts_with("\\\\") || dir_path.contains("..") {
+        return Err("Invalid directory path".to_string());
+    }
+    let path = std::path::Path::new(&dir_path);
+    let allowed = [
+        dirs::video_dir(),
+        dirs::download_dir(),
+        dirs::home_dir().map(|h| h.join("Videos")),
+        Some(std::env::temp_dir()),
+    ];
+    let is_allowed = allowed.iter().flatten().any(|d| path.starts_with(d));
+    if !is_allowed {
+        // Also allow if it's under AppData
+        let appdata_ok = dirs::data_dir().map(|d| path.starts_with(d)).unwrap_or(false);
+        if !appdata_ok {
+            return Err("Directory path not in allowed location".to_string());
+        }
+    }
     std::fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
 #[tauri::command]
-pub async fn file_copy_to_downloads(file_path: String) -> Result<String, String> {
+pub async fn file_copy_to_downloads(file_path: String, store: State<'_, SettingsStore>) -> Result<String, String> {
+    validate_accessible_path(&file_path, &store)?;
     let downloads = dirs::download_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
     let name = std::path::Path::new(&file_path)
@@ -435,6 +477,25 @@ pub struct ExportOpts {
     pub brightness: Option<u32>,
     pub contrast: Option<u32>,
     pub saturation: Option<u32>,
+    pub speed_segments: Option<Vec<SpeedSegmentOpts>>,
+    pub transitions: Option<Vec<TransitionOpts>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedSegmentOpts {
+    pub start: f64,
+    pub end: f64,
+    pub speed: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionOpts {
+    pub time: f64,
+    #[serde(rename = "type")]
+    pub transition_type: String,
+    pub duration: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,16 +522,15 @@ pub async fn compress_for_upload(file_path: String) -> Result<Option<String>, St
 
 #[tauri::command]
 pub async fn recording_export(
+    app: AppHandle,
     input_path: String,
     output_path: String,
     opts: ExportOpts,
 ) -> Result<String, String> {
-    // Use FFmpeg for export (runs as separate process — no NVENC conflicts).
-    // Core capture pipeline remains pure MF/D3D11 per spec.
     let output_clone = output_path.clone();
 
     tokio::task::spawn_blocking(move || {
-        ffmpeg_export(&input_path, &output_path, &opts)
+        ffmpeg_export_with_progress(&app, &input_path, &output_path, &opts)
     })
     .await
     .map_err(|e| format!("Export task failed: {}", e))?
@@ -479,172 +539,101 @@ pub async fn recording_export(
     Ok(output_clone)
 }
 
-/// Export using FFmpeg as external process.
-/// Handles trim, aspect ratio, resolution changes without conflicting with NVENC.
-fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
-    let mut args: Vec<String> = vec!["-y".to_string()]; // overwrite output
+/// Wrapper that runs FFmpeg with real-time progress parsing from stderr.
+/// Replaces the old estimation-based approach with actual FFmpeg progress.
+fn ffmpeg_export_with_progress(app: &AppHandle, input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    use std::io::BufRead;
 
-    // Trim: seek input
-    if let Some(start) = opts.trim_start {
-        if start > 0.0 {
-            args.push("-ss".to_string());
-            args.push(format!("{:.3}", start));
-        }
-    }
-
-    args.push("-i".to_string());
-    args.push(input.to_string());
-
-    // Trim: end time
-    if let Some(end) = opts.trim_end {
-        let start = opts.trim_start.unwrap_or(0.0);
-        let duration = end - start;
-        if duration > 0.0 {
-            args.push("-t".to_string());
-            args.push(format!("{:.3}", duration));
-        }
-    }
-
-    // Output framerate from user settings (default 60fps)
-    args.push("-r".to_string());
-    args.push(format!("{}", opts.fps.unwrap_or(60)));
-
-    // Video codec: use NVENC (separate process doesn't conflict with capture's NVENC)
-    args.push("-c:v".to_string());
-    args.push("h264_nvenc".to_string());
-    args.push("-preset".to_string());
-    args.push("p7".to_string());  // Highest quality preset
-    args.push("-profile:v".to_string());
-    args.push("high".to_string());
-    args.push("-rc".to_string());
-    args.push("vbr".to_string());
-    args.push("-cq".to_string());
-    args.push("18".to_string());  // High quality (lower = better, 18 is visually lossless)
-    args.push("-b:v".to_string());
-    args.push("20M".to_string());
-    args.push("-maxrate".to_string());
-    args.push("30M".to_string());
-    // Keyframe every 2 seconds (YouTube/Shorts optimal)
-    args.push("-g".to_string());
-    args.push("120".to_string());
-    // Color space tagging (matches ShadowPlay exactly)
-    args.push("-color_primaries".to_string());
-    args.push("bt709".to_string());
-    args.push("-color_trc".to_string());
-    args.push("bt709".to_string());
-    args.push("-colorspace".to_string());
-    args.push("bt709".to_string());
-    args.push("-color_range".to_string());
-    args.push("tv".to_string());  // Limited range (16-235) — same as ShadowPlay
-
-    // Resolution + Aspect ratio combined filter
-    // For vertical formats (9:16, 4:5, 1:1), we need special handling:
-    // Scale height to target, then crop width (not the other way around)
-    let is_vertical = opts.aspect_ratio.as_deref() == Some("9:16") || opts.aspect_ratio.as_deref() == Some("4:5");
-    let is_square = opts.aspect_ratio.as_deref() == Some("1:1");
-
-    if is_vertical || is_square {
-        // For vertical/square: determine target height, scale to fit, then crop
-        let target_h: u32 = match opts.resolution.as_deref() {
-            Some("480p") => 854,     // 480×854 for 9:16
-            Some("720p") => 1280,    // 720×1280 for 9:16
-            Some("1080p") => 1920,   // 1080×1920 for 9:16 (YouTube Shorts)
-            Some("1440p") => 2560,
-            _ => 1920,               // Default to 1080p vertical
-        };
-        let filter = if is_square {
-            // Square: scale to fit, then center-crop to square
-            let side = match opts.resolution.as_deref() {
-                Some("480p") => 480,
-                Some("720p") => 720,
-                Some("1080p") => 1080,
-                Some("1440p") => 1440,
-                _ => 1080,
-            };
-            format!("scale=-2:{},crop={}:{}", side, side, side)
-        } else if opts.aspect_ratio.as_deref() == Some("4:5") {
-            let target_w = target_h * 4 / 5;
-            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
-        } else {
-            // 9:16: scale height to target, crop width to 9/16 of height
-            let target_w = target_h * 9 / 16;
-            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
-        };
-        args.push("-vf".to_string());
-        args.push(filter);
+    // Get input duration for percentage calculation
+    let input_duration = get_video_duration(input).unwrap_or(30.0);
+    // If trim is set, use trimmed duration
+    let effective_duration = if let (Some(start), Some(end)) = (opts.trim_start, opts.trim_end) {
+        end - start
     } else {
-        // Landscape (16:9, 4:3, 21:9): normal scale
-        if let Some(ref res) = opts.resolution {
-            match res.as_str() {
-                "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
-                "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
-                "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
-                "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
-                "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
-                _ => {}
+        input_duration
+    };
+
+    // Build the FFmpeg command args using the same logic as ffmpeg_export
+    // We need to replicate the arg building to run with piped stderr
+    let result = ffmpeg_export_piped(app, input, output, opts, effective_duration);
+
+    // Emit 100% on completion
+    let _ = app.emit("export:progress", 100u32);
+
+    result
+}
+
+/// Run FFmpeg with piped stderr for real-time progress, with proper error handling.
+fn ffmpeg_export_piped(app: &AppHandle, input: &str, output: &str, opts: &ExportOpts, effective_duration: f64) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+
+    // First try NVENC path, building args manually
+    let args = build_export_args(input, output, opts, false)?;
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+
+    let mut child = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|e| format!("Failed to run FFmpeg: {}", e))?;
+
+    // Parse stderr for progress in real-time
+    let mut last_error_line = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        let reader = std::io::BufReader::new(stderr);
+        let mut last_pct: u32 = 0;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            // Parse time= for progress
+            if let Some(time_pos) = line.find("time=") {
+                let time_str = &line[time_pos + 5..];
+                if let Some(end) = time_str.find(|c: char| c == ' ' || c == '\r') {
+                    let time_val = &time_str[..end];
+                    if let Some(secs) = parse_ffmpeg_time(time_val) {
+                        let pct = if effective_duration > 0.0 {
+                            ((secs / effective_duration) * 100.0).min(99.0) as u32
+                        } else { 0 };
+                        if pct != last_pct {
+                            last_pct = pct;
+                            let _ = app.emit("export:progress", pct);
+                        }
+                    }
+                }
+            }
+            // Track error lines
+            if line.contains("Error") || line.contains("error") || line.contains("Cannot") || line.contains("Invalid") {
+                last_error_line = line.clone();
             }
         }
     }
 
-    // Video adjustments: brightness, contrast, saturation via eq filter
-    let has_adjustments = opts.brightness.is_some() || opts.contrast.is_some() || opts.saturation.is_some();
-    if has_adjustments {
-        let b = opts.brightness.unwrap_or(100) as f64 / 100.0;  // 1.0 = normal
-        let c = opts.contrast.unwrap_or(100) as f64 / 100.0;
-        let s = opts.saturation.unwrap_or(100) as f64 / 100.0;
-        // FFmpeg eq filter: brightness is -1.0 to 1.0 (0 = normal), contrast/saturation are multipliers
-        let eq_filter = format!("eq=brightness={:.2}:contrast={:.2}:saturation={:.2}", b - 1.0, c, s);
-        if let Some(pos) = args.iter().position(|a| a == "-vf") {
-            let existing = args[pos + 1].clone();
-            args[pos + 1] = format!("{},{}", existing, eq_filter);
-        } else {
-            args.push("-vf".to_string());
-            args.push(eq_filter);
-        }
-    }
+    let status = child.wait().map_err(|e| format!("FFmpeg error: {}", e))?;
 
-    args.push("-c:a".to_string());
-    args.push("aac".to_string());
-    args.push("-b:a".to_string());
-    args.push("320k".to_string());
-
-    // Output
-    args.push(output.to_string());
-
-    // Find ffmpeg
-    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found. Install via: winget install ffmpeg".to_string())?;
-
-    // Run ffmpeg
-    use std::os::windows::process::CommandExt;
-
-    let result = std::process::Command::new(&ffmpeg_path)
-        .args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
-        .map_err(|e| format!("Failed to run FFmpeg: {}", e))?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        // Try software encoder fallback if NVENC fails
-        if stderr.contains("Cannot load") || stderr.contains("nvenc") || stderr.contains("No NVENC") {
+    if !status.success() {
+        // If NVENC failed, try software fallback
+        if last_error_line.contains("nvenc") || last_error_line.contains("Cannot load") || last_error_line.contains("No NVENC") {
             return ffmpeg_export_software(input, output, opts);
         }
-        return Err(format!("FFmpeg failed: {}", stderr.lines().last().unwrap_or("unknown error")));
+        return Err(format!("Export failed: {}", if last_error_line.is_empty() { "unknown error".to_string() } else { last_error_line }));
     }
 
     Ok(())
 }
 
-/// Fallback: use libx264 software encoder if NVENC unavailable in FFmpeg
-fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+/// Build FFmpeg args for export (shared between piped and non-piped paths).
+fn build_export_args(input: &str, output: &str, opts: &ExportOpts, software: bool) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = vec!["-y".to_string()];
 
+    // Trim: input seek (will be removed if speed segments are present)
+    let mut has_input_trim = false;
     if let Some(start) = opts.trim_start {
         if start > 0.0 {
             args.push("-ss".to_string());
             args.push(format!("{:.3}", start));
+            has_input_trim = true;
         }
     }
 
@@ -660,18 +649,38 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
         }
     }
 
-    // Output framerate from user settings (default 60fps)
+    // Framerate
     args.push("-r".to_string());
     args.push(format!("{}", opts.fps.unwrap_or(60)));
 
-    args.push("-c:v".to_string());
-    args.push("libx264".to_string());
-    args.push("-preset".to_string());
-    args.push("medium".to_string());
-    args.push("-crf".to_string());
-    args.push("18".to_string());  // High quality (visually lossless)
+    // Video codec
+    if software {
+        args.push("-c:v".to_string());
+        args.push("libx264".to_string());
+        args.push("-preset".to_string());
+        args.push("medium".to_string());
+        args.push("-crf".to_string());
+        args.push("18".to_string());
+    } else {
+        args.push("-c:v".to_string());
+        args.push("h264_nvenc".to_string());
+        args.push("-preset".to_string());
+        args.push("p7".to_string());
+        args.push("-profile:v".to_string());
+        args.push("high".to_string());
+        args.push("-rc".to_string());
+        args.push("vbr".to_string());
+        args.push("-cq".to_string());
+        args.push("18".to_string());
+        args.push("-b:v".to_string());
+        args.push("20M".to_string());
+        args.push("-maxrate".to_string());
+        args.push("30M".to_string());
+        args.push("-g".to_string());
+        args.push("120".to_string());
+    }
 
-    // Resolution + Aspect ratio (same logic as NVENC path)
+    // Resolution / aspect ratio
     let is_vertical = opts.aspect_ratio.as_deref() == Some("9:16") || opts.aspect_ratio.as_deref() == Some("4:5");
     let is_square = opts.aspect_ratio.as_deref() == Some("1:1");
 
@@ -692,6 +701,7 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
             let target_w = target_h * 4 / 5;
             format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
         } else {
+            // 9:16
             let target_w = target_h * 9 / 16;
             format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
         };
@@ -710,7 +720,7 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
         }
     }
 
-    // Video adjustments (same as NVENC path)
+    // Video adjustments
     let has_adjustments = opts.brightness.is_some() || opts.contrast.is_some() || opts.saturation.is_some();
     if has_adjustments {
         let b = opts.brightness.unwrap_or(100) as f64 / 100.0;
@@ -726,21 +736,114 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
         }
     }
 
+    // Speed ramping via filter_complex
+    if let Some(ref speed_segs) = opts.speed_segments {
+        if !speed_segs.is_empty() {
+            let trim_start = opts.trim_start.unwrap_or(0.0);
+            let trim_end = opts.trim_end.unwrap_or_else(|| get_video_duration(input).unwrap_or(300.0));
+
+            // Remove -ss and -t — trim is handled inside filter_complex
+            if let Some(pos) = args.iter().position(|a| a == "-ss") {
+                args.remove(pos + 1);
+                args.remove(pos);
+            }
+            if let Some(pos) = args.iter().position(|a| a == "-t") {
+                args.remove(pos + 1);
+                args.remove(pos);
+            }
+
+            // Speed segments are already in absolute file time (from the video element's currentTime)
+            // No offset needed — they already reference the correct positions in the file.
+            let adjusted_segs: Vec<SpeedSegmentOpts> = speed_segs.iter().map(|s| SpeedSegmentOpts {
+                start: s.start.max(trim_start),
+                end: s.end.min(trim_end),
+                speed: s.speed,
+            }).filter(|s| s.end > s.start).collect();
+
+            let (filter_complex, _, _) = build_speed_filters_with_range(&adjusted_segs, trim_start, trim_end);
+
+            // Remove -vf if present (will be incorporated into filter_complex)
+            if let Some(pos) = args.iter().position(|a| a == "-vf") {
+                let existing_vf = args[pos + 1].clone();
+                args.remove(pos + 1);
+                args.remove(pos);
+                let full_fc = format!("{};[vout]{}[vfinal]", filter_complex, existing_vf);
+                args.push("-filter_complex".to_string());
+                args.push(full_fc);
+                args.push("-map".to_string());
+                args.push("[vfinal]".to_string());
+            } else {
+                args.push("-filter_complex".to_string());
+                args.push(filter_complex);
+                args.push("-map".to_string());
+                args.push("[vout]".to_string());
+            }
+            args.push("-map".to_string());
+            args.push("[aout]".to_string());
+        }
+    }
+
     args.push("-c:a".to_string());
     args.push("aac".to_string());
     args.push("-b:a".to_string());
     args.push("320k".to_string());
     args.push(output.to_string());
 
-    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+    Ok(args)
+}
 
+/// Parse FFmpeg time format "HH:MM:SS.xx" to seconds.
+fn parse_ffmpeg_time(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        3 => {
+            let h: f64 = parts[0].parse().ok()?;
+            let m: f64 = parts[1].parse().ok()?;
+            let s: f64 = parts[2].parse().ok()?;
+            Some(h * 3600.0 + m * 60.0 + s)
+        }
+        1 => parts[0].parse().ok(),
+        _ => None,
+    }
+}
+
+/// Get video duration using FFmpeg -i (probe).
+fn get_video_duration(path: &str) -> Option<f64> {
     use std::os::windows::process::CommandExt;
+    let ffmpeg_path = find_ffmpeg()?;
+    let output = std::process::Command::new(&ffmpeg_path)
+        .args(["-i", path])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Look for "Duration: HH:MM:SS.xx"
+    if let Some(pos) = stderr.find("Duration: ") {
+        let dur_str = &stderr[pos + 10..];
+        if let Some(end) = dur_str.find(',') {
+            return parse_ffmpeg_time(&dur_str[..end]);
+        }
+    }
+    None
+}
+
+/// Build FFmpeg args (shared between progress and non-progress paths).
+
+/// Fallback: software encoder (libx264) if NVENC is unavailable.
+/// Uses the same build_export_args logic with software=true, so speed segments work correctly.
+fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let args = build_export_args(input, output, opts, true)?;
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
 
     let result = std::process::Command::new(&ffmpeg_path)
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("FFmpeg failed: {}", e))?;
 
@@ -884,6 +987,67 @@ pub async fn hotkeys_resume(app: AppHandle, store: State<'_, SettingsStore>) -> 
 
 // ── Helper functions ──────────────────────────────────────────────────────────
 
+/// Validate that a path is within the clips output folder (for delete/rename operations).
+/// Prevents path traversal attacks where the frontend could delete arbitrary files.
+fn validate_clip_path(path: &str, store: &SettingsStore) -> Result<(), String> {
+    let settings = store.get();
+    let output_folder = if settings.output_folder.is_empty() {
+        dirs::video_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+            .join("Clipsta")
+    } else {
+        PathBuf::from(&settings.output_folder)
+    };
+
+    let target = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|_| "Path does not exist or is invalid".to_string())?;
+    let allowed = output_folder
+        .canonicalize()
+        .unwrap_or(output_folder);
+
+    if !target.starts_with(&allowed) {
+        return Err("Access denied: path is outside the clips folder".to_string());
+    }
+    Ok(())
+}
+
+/// Validate that a path is within one of the allowed directories (output folder, videos, downloads, temp).
+/// Less restrictive than validate_clip_path — used for read-only operations like file_stat.
+fn validate_accessible_path(path: &str, store: &SettingsStore) -> Result<(), String> {
+    let settings = store.get();
+    let target = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|_| "Path does not exist or is invalid".to_string())?;
+
+    let allowed_dirs: Vec<PathBuf> = [
+        Some(PathBuf::from(&settings.output_folder)),
+        dirs::video_dir(),
+        dirs::download_dir(),
+        dirs::home_dir().map(|h| h.join("Videos")),
+        dirs::home_dir().map(|h| h.join("Desktop")),
+        Some(std::env::temp_dir()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| !p.as_os_str().is_empty())
+    .collect();
+
+    for dir in &allowed_dirs {
+        if let Ok(canonical) = dir.canonicalize() {
+            if target.starts_with(&canonical) {
+                return Ok(());
+            }
+        }
+        // Also check without canonicalize (dir might not exist yet)
+        if target.starts_with(dir) {
+            return Ok(());
+        }
+    }
+
+    Err("Access denied: path is outside allowed directories".to_string())
+}
+
 fn ensure_output_folder(store: &SettingsStore) -> PathBuf {
     let settings = store.get();
     let folder = if settings.output_folder.is_empty() {
@@ -927,17 +1091,6 @@ fn unique_path(folder: &std::path::Path, name: &str) -> PathBuf {
     }
 }
 
-fn resolve_target_res(setting: &str) -> Option<(u32, u32)> {
-    match setting {
-        "480p" => Some((854, 480)),
-        "720p" => Some((1280, 720)),
-        "1080p" => Some((1920, 1080)),
-        "1440p" => Some((2560, 1440)),
-        "4k" => Some((3840, 2160)),
-        _ => None,
-    }
-}
-
 fn resolve_game_bar_bitrate(resolution: &str, fps: u32) -> u32 {
     // Bitrates matched from actual NVIDIA ShadowPlay clip analysis.
     // Real ShadowPlay 720p60 clip measured at ~8 Mbps (8048 kb/s).
@@ -959,35 +1112,15 @@ fn resolve_game_bar_bitrate(resolution: &str, fps: u32) -> u32 {
 
 
 fn sysinfo_total_mem() -> u64 {
-    // Use kernel32 GlobalMemoryStatusEx via raw FFI
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct MEMORYSTATUSEX {
-        dwLength: u32,
-        dwMemoryLoad: u32,
-        ullTotalPhys: u64,
-        ullAvailPhys: u64,
-        ullTotalPageFile: u64,
-        ullAvailPageFile: u64,
-        ullTotalVirtual: u64,
-        ullAvailVirtual: u64,
-        ullAvailExtendedVirtual: u64,
-    }
-    extern "system" {
-        fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
-    }
-    unsafe {
-        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
-        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if GlobalMemoryStatusEx(&mut status) != 0 {
-            status.ullTotalPhys
-        } else {
-            0
-        }
-    }
+    mem_status().map(|s| s.0).unwrap_or(0)
 }
 
 fn sysinfo_free_mem() -> u64 {
+    mem_status().map(|s| s.1).unwrap_or(0)
+}
+
+/// Returns (total_physical, available_physical) in bytes.
+fn mem_status() -> Option<(u64, u64)> {
     #[repr(C)]
     #[allow(non_snake_case)]
     struct MEMORYSTATUSEX {
@@ -1008,9 +1141,9 @@ fn sysinfo_free_mem() -> u64 {
         let mut status: MEMORYSTATUSEX = std::mem::zeroed();
         status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if GlobalMemoryStatusEx(&mut status) != 0 {
-            status.ullAvailPhys
+            Some((status.ullTotalPhys, status.ullAvailPhys))
         } else {
-            0
+            None
         }
     }
 }
@@ -1019,6 +1152,113 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Build an FFmpeg filter_complex for segment-based speed ramping.
+/// Same as build_speed_filters but with an explicit start/end range.
+/// This is used when trim is active — the segments are already in absolute time,
+/// and range_start/range_end define the output boundaries.
+fn build_speed_filters_with_range(segments: &[SpeedSegmentOpts], range_start: f64, range_end: f64) -> (String, String, bool) {
+    if segments.is_empty() {
+        // No speed changes, just trim
+        let video_filter = format!(
+            "[0:v]trim={:.3}:{:.3},setpts=PTS-STARTPTS[vout]",
+            range_start, range_end
+        );
+        let audio_filter = format!(
+            "[0:a]atrim={:.3}:{:.3},asetpts=PTS-STARTPTS[aout]",
+            range_start, range_end
+        );
+        return (format!("{};{}", video_filter, audio_filter), String::new(), true);
+    }
+
+    // Build ranges within the specified range
+    let mut ranges: Vec<(f64, f64, f64)> = Vec::new();
+    let mut cursor = range_start;
+
+    let mut sorted_segs = segments.to_vec();
+    sorted_segs.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+
+    for seg in &sorted_segs {
+        let seg_start = seg.start.max(range_start);
+        let seg_end = seg.end.min(range_end);
+        if seg_start >= seg_end { continue; }
+
+        if seg_start > cursor + 0.01 {
+            ranges.push((cursor, seg_start, 1.0));
+        }
+        ranges.push((seg_start, seg_end, seg.speed));
+        cursor = seg_end;
+    }
+    if cursor < range_end - 0.01 {
+        ranges.push((cursor, range_end, 1.0));
+    }
+
+    if ranges.is_empty() {
+        ranges.push((range_start, range_end, 1.0));
+    }
+
+    let n = ranges.len();
+    let mut video_parts = Vec::new();
+    let mut audio_parts = Vec::new();
+    let mut v_labels = Vec::new();
+    let mut a_labels = Vec::new();
+
+    for (i, (start, end, speed)) in ranges.iter().enumerate() {
+        let inv_speed = 1.0 / speed;
+        let vl = format!("v{}", i);
+        let al = format!("a{}", i);
+
+        video_parts.push(format!(
+            "[0:v]trim={:.3}:{:.3},setpts={:.4}*(PTS-STARTPTS)[{}]",
+            start, end, inv_speed, vl
+        ));
+
+        let atempo_chain = build_atempo_chain(*speed);
+        audio_parts.push(format!(
+            "[0:a]atrim={:.3}:{:.3},asetpts=PTS-STARTPTS{}[{}]",
+            start, end,
+            if atempo_chain.is_empty() { String::new() } else { format!(",{}", atempo_chain) },
+            al
+        ));
+
+        v_labels.push(format!("[{}]", vl));
+        a_labels.push(format!("[{}]", al));
+    }
+
+    let video_filter = format!(
+        "{};{}concat=n={}:v=1:a=0[vout]",
+        video_parts.join(";"),
+        v_labels.join(""),
+        n
+    );
+    let audio_filter = format!(
+        "{};{}concat=n={}:v=0:a=1[aout]",
+        audio_parts.join(";"),
+        a_labels.join(""),
+        n
+    );
+
+    (format!("{};{}", video_filter, audio_filter), String::new(), true)
+}
+
+/// Build atempo chain for a given speed (handles range 0.5-100 per filter).
+fn build_atempo_chain(speed: f64) -> String {
+    if (speed - 1.0).abs() < 0.01 {
+        return String::new();
+    }
+    let mut tempo = speed;
+    let mut parts = Vec::new();
+    while tempo < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        tempo /= 0.5;
+    }
+    while tempo > 100.0 {
+        parts.push("atempo=100.0".to_string());
+        tempo /= 100.0;
+    }
+    parts.push(format!("atempo={:.4}", tempo));
+    parts.join(",")
 }
 
 

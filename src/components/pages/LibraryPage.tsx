@@ -335,8 +335,8 @@ function useThumbnail(path: string): string | null {
 			} catch { thumbQueue.delete(path); thumbActive--; }
 			video.remove();
 		};
-		video.onerror = () => { thumbQueue.delete(path); thumbActive--; video.remove(); };
-		return () => { cancelled = true; thumbActive--; video.remove(); };
+		video.onerror = () => { thumbQueue.delete(path); thumbActive--; video.src = ""; video.load(); video.remove(); };
+		return () => { cancelled = true; thumbActive--; video.src = ""; video.load(); video.remove(); };
 	}, [path]);
 
 	return thumb;
@@ -349,10 +349,27 @@ const ClipRow = React.memo(function ClipRow({ clip, active, onClick, onPlay, onD
 	onUpload?: () => void; uploadStatus?: UploadJob;
 }) {
 	const thumb = useThumbnail(clip.path);
+	const [hoverPreview, setHoverPreview] = useState(false);
+	const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	const onMouseEnter = () => {
+		hoverTimerRef.current = setTimeout(() => setHoverPreview(true), 1000);
+	};
+	const onMouseLeave = () => {
+		if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+		hoverTimerRef.current = null;
+		setHoverPreview(false);
+	};
 
 	return (
-		<div onClick={onClick} onDoubleClick={onPlay}
-			className={`rounded-lg p-2.5 cursor-pointer border transition-all group ${active ? "border-y bg-[#1c1c00]" : "border-transparent hover:border-border hover:bg-card"}`}>
+		<div onClick={onClick} onDoubleClick={onPlay} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}
+			className={`rounded-lg p-2.5 cursor-pointer border transition-all group relative ${active ? "border-y bg-[#1c1c00]" : "border-transparent hover:border-border hover:bg-card"}`}>
+			{/* Hover video preview popup */}
+			{hoverPreview && (
+				<div className="absolute left-full top-0 ml-2 z-50 rounded-lg overflow-hidden shadow-2xl border border-border bg-black" style={{ width: 220, height: 124 }}>
+					<video src={toFileUrl(clip.path)} autoPlay muted loop className="w-full h-full object-cover" />
+				</div>
+			)}
 			<div className="flex items-center gap-2">
 				<div className="w-14 h-9 bg-muted rounded flex-shrink-0 overflow-hidden flex items-center justify-center">
 					{thumb ? <img src={thumb} alt="" className="w-full h-full object-cover" /> : <Film size={16} className="text-text-dim" />}

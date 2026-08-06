@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import React from "react";
 import { Film, Scissors, Settings, Zap, Upload } from "lucide-react";
 import type { Page } from "./types";
 import { useSettings } from "./hooks/useSettings";
@@ -6,22 +7,28 @@ import { useRecorder } from "./hooks/useRecorder";
 import { useCloudUpload } from "./hooks/useCloudUpload";
 import TitleBar from "./components/TitleBar";
 import LibraryPage from "./components/pages/LibraryPage";
-import EditorPage from "./components/pages/EditorPage";
+const EditorPage = React.lazy(() => import("./components/pages/EditorPage"));
 import SettingsPage from "./components/pages/SettingsPage";
 import StatusBar from "./components/StatusBar";
 import SaveNotification from "./components/SaveNotification";
+import ExportToast from "./components/ExportToast";
 import bridge from "./tauri-bridge";
 
 export default function App() {
 	const [page, setPage] = useState<Page>("capture");
 	const [editorFile, setEditorFile] = useState<string | null>(null);
+	const [exportedFile, setExportedFile] = useState<string | null>(null);
 	const { settings, loaded, updateSetting, saveAll } = useSettings();
 	const recorder = useRecorder(loaded ? settings : null);
 	const cloud = useCloudUpload(loaded ? settings : null);
 
 	const openInEditor = (filePath: string) => {
-		setEditorFile(filePath);
-		setPage("editor");
+		// Force a reset by clearing first, then setting — ensures useEffect fires even for same file
+		setEditorFile(null);
+		setTimeout(() => {
+			setEditorFile(filePath);
+			setPage("editor");
+		}, 0);
 	};
 
 	const uploadCount = cloud.queue.filter((j) => j.status === "queued" || j.status === "uploading").length;
@@ -75,7 +82,7 @@ export default function App() {
 	}, []);
 
 	return (
-		<div className="flex flex-col h-screen bg-bg overflow-hidden">
+		<div className="flex flex-col h-screen bg-bg overflow-hidden" data-theme={settings.theme ?? "dark"}>
 			<TitleBar />
 
 			<div className="flex flex-1 overflow-hidden">
@@ -116,7 +123,9 @@ export default function App() {
 						{page === "capture" && <StatusPage recorder={recorder} settings={settings} />}
 						{page === "library" && <LibraryPage onOpenEditor={openInEditor} cloud={cloud} />}
 						<div style={{ display: page === "editor" ? "flex" : "none", height: "100%", overflow: "hidden" }}>
-							<EditorPage initialFile={editorFile} settings={settings} cloud={cloud} />
+							<React.Suspense fallback={<div className="flex-1 flex items-center justify-center text-text-dim">Loading editor...</div>}>
+								<EditorPage initialFile={editorFile} settings={settings} cloud={cloud} onExportDone={setExportedFile} />
+							</React.Suspense>
 						</div>
 						{page === "settings" && <SettingsPage settings={settings} updateSetting={updateSetting} saveAll={saveAll} cloud={cloud} />}
 					</div>
@@ -125,6 +134,7 @@ export default function App() {
 			</div>
 
 			<SaveNotification path={recorder.state.savedPath} />
+			<ExportToast path={exportedFile} />
 		</div>
 	);
 }

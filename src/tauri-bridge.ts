@@ -251,80 +251,36 @@ export function copyToDownloads(filePath: string): Promise<string> {
 }
 
 // ── Cloud ───────────────────────────────────────────────────────────────────
-const CLOUD_CONFIG: CloudConfig = {
-	apiBase: "https://clipsta-api.godson594.workers.dev",
-	apiKey: "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96",
-};
+// API key is stored in the Rust backend — never exposed to the frontend.
 
 export function getCloudConfig(): Promise<CloudConfig> {
-	return Promise.resolve(CLOUD_CONFIG);
+	return invoke<CloudConfig>("cloud_get_config");
 }
 
 export async function uploadClip(opts: UploadClipOpts): Promise<UploadClipResponse> {
-	const cfg = CLOUD_CONFIG;
-
-	// Compress large clips before upload: re-encode to 720p at lower bitrate.
-	// This reduces a 300MB 1440p clip to ~30-50MB 720p — fast to upload and view.
-	let uploadFilePath = opts.filePath;
-	let uploadBytes = opts.bytes;
-	let uploadFileName = opts.fileName;
-	let tempCompressed: string | null = null;
-
-	if (opts.bytes > 50 * 1024 * 1024) { // Only compress if >50MB
-		try {
-			// Use Rust-side Media Foundation compression for reliability
-			const compressedPath: string | null = await invoke("compress_for_upload", { filePath: opts.filePath });
-			if (compressedPath) {
-				const { stat } = await import("@tauri-apps/plugin-fs");
-				const compStat = await stat(compressedPath);
-				if (compStat.size && compStat.size > 0) {
-					uploadFilePath = compressedPath;
-					uploadBytes = compStat.size;
-					uploadFileName = compressedPath.replace(/^.*[\\/]/, "");
-					tempCompressed = compressedPath;
-				}
-			}
-		} catch (e) {
-			// Compression failed — fall back to original file
-			console.warn("[upload] compression failed, using original:", e);
-		}
+	// Reject files over 200MB
+	if (opts.bytes > 200 * 1024 * 1024) {
+		throw new Error(`File too large for upload (${Math.round(opts.bytes / 1024 / 1024)}MB). Max 200MB.`);
 	}
 
-	// Reject files still over 200MB after compression
-	if (uploadBytes > 200 * 1024 * 1024) {
-		if (tempCompressed) { try { const { remove } = await import("@tauri-apps/plugin-fs"); await remove(tempCompressed); } catch {} }
-		throw new Error(`File too large for upload (${Math.round(uploadBytes / 1024 / 1024)}MB). Max 200MB.`);
-	}
-
-	// Step 1: Request upload URL from API
-	const clipRes = await fetch(`${cfg.apiBase}/clip-uploads`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"X-Clipsta-Test-Key": cfg.apiKey,
-		},
-		body: JSON.stringify({
+	// Step 1: Request upload URL via backend proxy (API key stays server-side)
+	const clipData = await invoke<UploadClipResponse & { uploadUrl: string }>("cloud_request_upload", {
+		req: {
 			desktopDeviceId: opts.desktopDeviceId,
-			fileName: uploadFileName,
+			fileName: opts.fileName,
 			durationSeconds: opts.durationSeconds,
-			bytes: uploadBytes,
+			bytes: opts.bytes,
 			capturedAt: opts.capturedAt,
-		}),
+		},
 	});
-	if (!clipRes.ok) {
-		if (tempCompressed) { try { const { remove } = await import("@tauri-apps/plugin-fs"); await remove(tempCompressed); } catch {} }
-		const errBody = await clipRes.text().catch(() => "");
-		throw new Error(`clip-uploads failed: HTTP ${clipRes.status} ${errBody}`);
-	}
-	const clipData = await clipRes.json() as UploadClipResponse & { uploadUrl: string };
 
-	// Step 2: Read compressed file and upload
+	// Step 2: Read file and upload directly to the pre-signed upload URL
+	// (The upload URL is pre-signed and doesn't need our API key)
 	const { readFile } = await import("@tauri-apps/plugin-fs");
 	let fileBytes: Uint8Array;
 	try {
-		fileBytes = await readFile(uploadFilePath);
+		fileBytes = await readFile(opts.filePath);
 	} catch (e: any) {
-		if (tempCompressed) { try { const { remove } = await import("@tauri-apps/plugin-fs"); await remove(tempCompressed); } catch {} }
 		throw new Error(`Failed to read clip file: ${e?.message ?? e}`);
 	}
 
@@ -338,26 +294,14 @@ export async function uploadClip(opts: UploadClipOpts): Promise<UploadClipRespon
 
 	const uploadRes = await fetch(clipData.uploadUrl, { method: "POST", body: formData });
 	if (!uploadRes.ok) {
-		if (tempCompressed) { try { const { remove } = await import("@tauri-apps/plugin-fs"); await remove(tempCompressed); } catch {} }
 		throw new Error(`Upload failed: HTTP ${uploadRes.status}`);
 	}
-
-	// Clean up temp compressed file
-	if (tempCompressed) { try { const { remove } = await import("@tauri-apps/plugin-fs"); await remove(tempCompressed); } catch {} }
 
 	return clipData;
 }
 
 export async function notifyUploadStatus(body: UploadStatusBody): Promise<void> {
-	const cfg = CLOUD_CONFIG;
-	await fetch(`${cfg.apiBase}/desktop-upload-status`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"X-Clipsta-Test-Key": cfg.apiKey,
-		},
-		body: JSON.stringify(body),
-	}).catch(() => {});
+	await invoke("cloud_notify_status", { body }).catch(() => {});
 }
 
 // ── MP4 Inspection ──────────────────────────────────────────────────────────

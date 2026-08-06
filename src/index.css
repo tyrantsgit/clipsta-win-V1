@@ -11,6 +11,14 @@
   --color-text-dim: #999;
 }
 
+/* OLED theme: pure black backgrounds */
+[data-theme="oled"] {
+  --color-bg: #000000;
+  --color-card: #0a0a0a;
+  --color-muted: #111111;
+  --color-border: #1e1e1e;
+}
+
 @utility no-drag {
   -webkit-app-region: no-drag;
 }
@@ -22,7 +30,9 @@ html, body, #root {
   overflow: hidden;
   background: #0a0a0a;
   color: #fff;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Segoe UI Variable', 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   user-select: none;
 }
@@ -49,6 +59,46 @@ html, body, #root {
 /* Yellow glow on record button */
 .glow-y { box-shadow: 0 0 24px #D4F00055; }
 .glow-red { box-shadow: 0 0 24px #ff000055; }
+
+/* Speed ramp indicator animation */
+@keyframes overlayFadeIn { from{opacity:0} to{opacity:1} }
+.animate-fadeIn { animation: overlayFadeIn 0.5s ease-out forwards; }
+
+/* Transition button hover previews */
+@keyframes transGlitch {
+	0%, 100% { transform: translate(0); filter: none; }
+	20% { transform: translate(-2px, 1px); filter: hue-rotate(90deg); }
+	40% { transform: translate(2px, -1px); filter: hue-rotate(-90deg); }
+	60% { transform: translate(-1px, -1px); filter: saturate(2); }
+	80% { transform: translate(1px, 1px); filter: brightness(1.5); }
+}
+@keyframes transWhipPan {
+	0% { transform: translateX(0); filter: blur(0); }
+	50% { transform: translateX(3px); filter: blur(2px); }
+	100% { transform: translateX(0); filter: blur(0); }
+}
+@keyframes transFlash {
+	0%, 100% { background: transparent; }
+	50% { background: rgba(255,255,255,0.8); }
+}
+@keyframes transZoomIn {
+	0%, 100% { transform: scale(1); }
+	50% { transform: scale(1.15); }
+}
+@keyframes transZoomOut {
+	0%, 100% { transform: scale(1); }
+	50% { transform: scale(0.85); }
+}
+@keyframes transCrossfade {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.3; }
+}
+.trans-hover-glitch:hover { animation: transGlitch 0.5s ease-in-out; }
+.trans-hover-whip-pan:hover { animation: transWhipPan 0.4s ease-in-out; }
+.trans-hover-flash:hover { animation: transFlash 0.4s ease-in-out; }
+.trans-hover-zoom-in:hover { animation: transZoomIn 0.4s ease-in-out; }
+.trans-hover-zoom-out:hover { animation: transZoomOut 0.4s ease-in-out; }
+.trans-hover-crossfade:hover { animation: transCrossfade 0.5s ease-in-out; }
 
 @layer components {
   .btn-y {

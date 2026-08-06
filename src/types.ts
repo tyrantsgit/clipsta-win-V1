@@ -29,6 +29,7 @@ export interface AppSettings {
 	orientation: string;
 	watchFolderPath: string;
 	watchFolderEnabled: boolean;
+	theme: "dark" | "oled";
 }
 
 export interface UploadJob {
@@ -138,11 +139,12 @@ export interface ExportOpts {
 	brightness?: number;
 	contrast?: number;
 	saturation?: number;
+	speedSegments?: { start: number; end: number; speed: number }[];
+	transitions?: { time: number; type: string; duration: number }[];
 }
 
 export interface CloudConfig {
 	apiBase: string;
-	apiKey: string;
 }
 
 export interface SystemInfo {
@@ -200,3 +202,20 @@ export interface TrimResult {
 	extraBefore: number;
 }
 
+
+// ── Speed Ramping & Transitions ─────────────────────────────────────────────
+export interface SpeedSegment {
+	id: string;
+	start: number;
+	end: number;
+	speed: number; // 0.25 = quarter speed, 1 = normal, 2 = double, etc.
+}
+
+export type TransitionType = "crossfade" | "glitch" | "whip-pan" | "flash" | "zoom-in" | "zoom-out";
+
+export interface Transition {
+	id: string;
+	time: number; // position in timeline where transition occurs (at a cut point)
+	type: TransitionType;
+	duration: number; // seconds (0.3 - 1.0 typical)
+}

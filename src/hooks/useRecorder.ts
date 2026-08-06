@@ -18,13 +18,12 @@ function pad(n: number) { return String(n).padStart(2, "0"); }
  * ShadowPlay-style file naming: "{GameName} {YYYY.MM.DD} - {HH.MM.SS.ff}.DVR.mp4"
  * Example: "Battlefield 6 2026.07.26 - 19.56.14.04.DVR.mp4"
  */
-function makeFileName(_label: string, ext: string): string {
+function makeFileName(_label: string, ext: string, gameName?: string): string {
 	const now = new Date();
 	const date = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())}`;
 	const time = `${pad(now.getHours())}.${pad(now.getMinutes())}.${pad(now.getSeconds())}.${pad(Math.floor(now.getMilliseconds() / 10))}`;
-	// Use "Desktop" as fallback when no game is detected
-	const gameName = (window as any).__clipsta_active_game || "Desktop";
-	return `${gameName} ${date} - ${time}.DVR.${ext}`;
+	const name = gameName || (window as any).__clipsta_active_game || "Desktop";
+	return `${name} ${date} - ${time}.DVR.${ext}`;
 }
 
 export function useRecorder(settings: AppSettings | null) {
@@ -117,7 +116,13 @@ export function useRecorder(settings: AppSettings | null) {
 		try {
 			setState((s) => ({ ...s, status: "saving", error: null }));
 			const label = seconds <= 30 ? "30sec" : seconds <= 60 ? "1min" : "5min";
-			const fileName = makeFileName(label, "mp4");
+			// Query active window title now (at save time) instead of constant polling
+			let activeGame = (window as any).__clipsta_active_game || "Desktop";
+			try {
+				activeGame = await bridge.getActiveWindowTitle();
+				(window as any).__clipsta_active_game = activeGame;
+			} catch { /* keep last known */ }
+			const fileName = makeFileName(label, "mp4", activeGame);
 			const noAudio = settings?.audioSource === "none" || !(settings?.captureAudio ?? true);
 			const micDevice = (settings?.audioSource === "mic" || settings?.audioSource === "both")
 				? (settings?.audioInputDeviceId || "default")
@@ -195,23 +200,13 @@ export function useRecorder(settings: AppSettings | null) {
 		return () => clearTimeout(timer);
 	}, [settings?.fps]);
 
-	// ShadowPlay-style game detection: poll the active window title
-	// and store it globally so makeFileName() can use it for clip naming.
+	// ShadowPlay-style game detection: query active window only at save time.
+	// No constant polling — getActiveWindowTitle() is called in makeFileName().
+	// We just seed the initial value on mount.
 	useEffect(() => {
-		let active = true;
-		const poll = async () => {
-			while (active) {
-				try {
-					const title = await bridge.getActiveWindowTitle();
-					(window as any).__clipsta_active_game = title;
-				} catch {
-					// Ignore errors — keep last known game name
-				}
-				await new Promise((r) => setTimeout(r, 2000)); // Poll every 2 seconds
-			}
-		};
-		poll();
-		return () => { active = false; };
+		bridge.getActiveWindowTitle().then((title) => {
+			(window as any).__clipsta_active_game = title;
+		}).catch(() => {});
 	}, []);
 
 	// WGC clip-saved event
@@ -226,53 +221,100 @@ export function useRecorder(settings: AppSettings | null) {
 		};
 	}, []);
 
-	// Clip sound — camera shutter effect
+	// Clip sound — realistic DSLR camera shutter (pooled AudioContext for performance)
+	const audioCtxRef = useRef<AudioContext | null>(null);
 	useEffect(() => {
 		const unlistenPromise = bridge.onPlayClipSound(() => {
 			try {
-				const ctx = new AudioContext();
+				if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
+					audioCtxRef.current = new AudioContext();
+				}
+				const ctx = audioCtxRef.current;
+				if (ctx.state === "suspended") {
+					ctx.resume().catch(() => {});
+				}
 				const now = ctx.currentTime;
 
-				// Click transient (short impulse)
-				const clickBuf = ctx.createBuffer(1, 128, ctx.sampleRate);
-				const clickData = clickBuf.getChannelData(0);
-				for (let i = 0; i < 128; i++) {
-					clickData[i] = (Math.random() * 2 - 1) * Math.exp(-i / 8);
+				// === DSLR Camera Shutter Sound ===
+				// 1. Mirror slap (sharp attack, low-mid frequency thud)
+				const mirrorLen = Math.floor(ctx.sampleRate * 0.015);
+				const mirrorBuf = ctx.createBuffer(1, mirrorLen, ctx.sampleRate);
+				const mirrorData = mirrorBuf.getChannelData(0);
+				for (let i = 0; i < mirrorLen; i++) {
+					const t = i / ctx.sampleRate;
+					mirrorData[i] = Math.sin(t * 800 * Math.PI * 2) * Math.exp(-i / (mirrorLen * 0.2)) * 0.8
+						+ (Math.random() * 2 - 1) * Math.exp(-i / (mirrorLen * 0.1)) * 0.3;
 				}
-				const click = ctx.createBufferSource();
-				click.buffer = clickBuf;
-				const clickGain = ctx.createGain();
-				clickGain.gain.setValueAtTime(0.6, now);
-				clickGain.gain.exponentialRampToValueAtTime(0.001, now + 0.03);
-				click.connect(clickGain);
-				clickGain.connect(ctx.destination);
-				click.start(now);
+				const mirror = ctx.createBufferSource();
+				mirror.buffer = mirrorBuf;
+				const mirrorGain = ctx.createGain();
+				mirrorGain.gain.setValueAtTime(0.7, now);
+				mirrorGain.gain.exponentialRampToValueAtTime(0.001, now + 0.02);
+				mirror.connect(mirrorGain);
+				mirrorGain.connect(ctx.destination);
+				mirror.start(now);
 
-				// Shutter mechanism sound (filtered noise burst)
-				const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 0.06 | 0, ctx.sampleRate);
-				const noiseData = noiseBuf.getChannelData(0);
-				for (let i = 0; i < noiseData.length; i++) {
-					noiseData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (noiseData.length * 0.15));
+				// 2. Shutter curtain (quick mechanical slide — band-passed noise)
+				const curtainLen = Math.floor(ctx.sampleRate * 0.04);
+				const curtainBuf = ctx.createBuffer(1, curtainLen, ctx.sampleRate);
+				const curtainData = curtainBuf.getChannelData(0);
+				for (let i = 0; i < curtainLen; i++) {
+					curtainData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (curtainLen * 0.25));
 				}
-				const noise = ctx.createBufferSource();
-				noise.buffer = noiseBuf;
-				const hp = ctx.createBiquadFilter();
-				hp.type = "highpass";
-				hp.frequency.value = 2000;
-				const noiseGain = ctx.createGain();
-				noiseGain.gain.setValueAtTime(0.35, now + 0.01);
-				noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.07);
-				noise.connect(hp);
-				hp.connect(noiseGain);
-				noiseGain.connect(ctx.destination);
-				noise.start(now + 0.01);
+				const curtain = ctx.createBufferSource();
+				curtain.buffer = curtainBuf;
+				const bp = ctx.createBiquadFilter();
+				bp.type = "bandpass";
+				bp.frequency.value = 3500;
+				bp.Q.value = 1.5;
+				const curtainGain = ctx.createGain();
+				curtainGain.gain.setValueAtTime(0.5, now + 0.015);
+				curtainGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+				curtain.connect(bp);
+				bp.connect(curtainGain);
+				curtainGain.connect(ctx.destination);
+				curtain.start(now + 0.015);
 
-				// Cleanup
-				setTimeout(() => ctx.close().catch(() => {}), 200);
+				// 3. Body resonance (subtle low thump that gives weight)
+				const bodyOsc = ctx.createOscillator();
+				bodyOsc.type = "sine";
+				bodyOsc.frequency.setValueAtTime(180, now);
+				bodyOsc.frequency.exponentialRampToValueAtTime(80, now + 0.05);
+				const bodyGain = ctx.createGain();
+				bodyGain.gain.setValueAtTime(0.3, now);
+				bodyGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+				bodyOsc.connect(bodyGain);
+				bodyGain.connect(ctx.destination);
+				bodyOsc.start(now);
+				bodyOsc.stop(now + 0.07);
+
+				// 4. Second curtain (closing) — slightly delayed, softer
+				const curtain2Len = Math.floor(ctx.sampleRate * 0.025);
+				const curtain2Buf = ctx.createBuffer(1, curtain2Len, ctx.sampleRate);
+				const curtain2Data = curtain2Buf.getChannelData(0);
+				for (let i = 0; i < curtain2Len; i++) {
+					curtain2Data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (curtain2Len * 0.2));
+				}
+				const curtain2 = ctx.createBufferSource();
+				curtain2.buffer = curtain2Buf;
+				const bp2 = ctx.createBiquadFilter();
+				bp2.type = "bandpass";
+				bp2.frequency.value = 2800;
+				bp2.Q.value = 2;
+				const curtain2Gain = ctx.createGain();
+				curtain2Gain.gain.setValueAtTime(0.35, now + 0.055);
+				curtain2Gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+				curtain2.connect(bp2);
+				bp2.connect(curtain2Gain);
+				curtain2Gain.connect(ctx.destination);
+				curtain2.start(now + 0.055);
 			} catch { /* ignore */ }
 		});
 		return () => {
 			unlistenPromise.then((u) => u()).catch(() => {});
+			// Close the pooled AudioContext on unmount
+			audioCtxRef.current?.close().catch(() => {});
+			audioCtxRef.current = null;
 		};
 	}, []);
 

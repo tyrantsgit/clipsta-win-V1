@@ -1,92 +1,189 @@
-# Clipsta v2.3 — Instant Replay for PC
+# Clipsta v2.3
 
-ShadowPlay-style instant replay built with Tauri v2, Windows Graphics Capture, and Media Foundation hardware encoding.
+**The gaming clip recorder that just works.** Always recording, always ready. Save the last 30 seconds, 1 minute, or 5 minutes of gameplay with a single hotkey — just like NVIDIA ShadowPlay, but open and customizable.
 
-## Architecture
+Built with Tauri v2 + React + Windows Graphics Capture + Hardware H.264 encoding.
 
-```
-Windows Graphics Capture (WGC)
-→ Direct3D 11 BGRA texture (native screen resolution)
-→ ID3D11VideoProcessor (scale + BGRA-to-NV12 color conversion)
-→ One persistent asynchronous H.264 Media Foundation encoder (NVENC/AMD VCE)
-→ Dedicated encoder thread (blocking GetEvent loop)
-→ EncodedMediaRing (in-memory H.264 frames + PCM audio, 5-minute rolling buffer)
-→ Keyframe-aligned slice on save (NAL unit type 5/7 + MFSampleExtension_CleanPoint)
-→ Media Foundation Sink Writer (H.264 passthrough + PCM→AAC encoding)
-→ H.264/AAC MP4 output
-```
+---
 
-## Output Format (matches ShadowPlay)
+## Features
 
-| Property | Value |
-|----------|-------|
-| Resolution | 1920×1088 (16-pixel aligned) |
-| Aspect Ratio | 16:9 |
-| Codec | H.264 High Profile, Level 4.2 |
-| FPS | 60 fps (wall-clock PTS) |
-| Rate Control | CBR ~8 Mbps |
-| Audio | AAC-LC, 48kHz, Stereo |
-| Container | MP4 (mp42/isom) |
-| File naming | `{GameName} {YYYY.MM.DD} - {HH.MM.SS.ff}.DVR.mp4` |
+### 🎮 Instant Replay Buffer
+- **Always-on recording** — captures your screen continuously in the background
+- **Hotkey clip saves** — press a key to save the last 30s, 1 min, or 5 min
+- **ShadowPlay-style naming** — clips named by game: `Battlefield 6 2026.08.05 - 17.18.49.76.DVR.mp4`
+- **720p60 @ 8 Mbps** — matches ShadowPlay quality with BT.709 color metadata
+- **Minimize to tray** — recording continues when the window is hidden
 
-## Key Features
+### ⚡ GPU-Accelerated Pipeline
+- **Windows Graphics Capture (WGC)** — compositor-level capture, zero game impact
+- **Hardware H.264 encoding** — NVENC (NVIDIA), AMF (AMD), or QuickSync (Intel)
+- **D3D11 Video Processor** — GPU-accelerated BGRA→NV12 scaling
+- **Dedicated encoder thread** — async MFT with backpressure, never blocks capture
+- **Arc-wrapped ring buffer** — zero-copy clip saves, recycled buffer pool
 
-- **Instant Replay** — Continuously buffers last 5 minutes (configurable), save clips instantly via hotkey
-- **Zero re-encoding on save** — H.264 passthrough muxing (~67ms to save a 60s clip)
-- **Minimal FPS impact** — Dedicated encoder thread, non-blocking WGC callback, CBR at 1080p
-- **Game detection** — Active window title polled for ShadowPlay-style clip naming
-- **Desktop + game audio** — WASAPI loopback capture, always-on (per spec)
-- **Optional microphone** — Mixed into audio stream when enabled
-- **Cloud upload** — Paired mobile device upload with retry/backoff
-- **Library** — Auto-refreshes on clip save, recursive folder scan, in-app preview
-- **Global hotkeys** — Ctrl+Shift+G (30s), Alt+F9 (1min), Alt+F10 (5min)
-- **System tray** — Minimize to tray, context menu for quick saves
-- **NSIS installer** — Kills running processes before install, currentUser mode
+### ✂️ Professional Editor
+- **Trim** — set IN/OUT points with prominent centered controls
+- **Drag-to-Cut** — click and drag to mark sections for removal with live preview
+  - Draggable cut edges to resize after placement
+  - Red diagonal stripe pattern clearly shows cut areas
+  - Playback automatically skips cut sections (preview final result)
+- **Speed Ramping** — mark sections for slow-mo (0.1x–4x) with visual SVG curves
+  - Click ⚡ Speed, drag on timeline to set start/end
+  - Draggable speed segment edges
+  - Live playback rate control during preview
+- **Transitions** — Crossfade, Glitch, Whip Pan, Flash, Zoom In/Out at cut points
+  - Hover preview animations on transition buttons
+  - Adjustable duration slider
+- **Undo/Redo** — Ctrl+Z / Ctrl+Y with 50-step history
+- **Frame-by-frame** — Left/Right arrow keys step ±1 frame
+- **Thumbnail strip** — video frame previews above the timeline
+- **Draggable playhead** — grab and scrub the timeline
+- **Multi-clip timeline** — drag and reorder multiple clips
+- **Export presets** — YT Shorts, TikTok, Reels, Square, Original
+- **Aspect ratio** — 16:9, 9:16, 1:1, 4:5, 4:3, 21:9 with live preview
+- **Video adjustments** — Brightness, Contrast, Saturation
+- **Export progress bar** — real-time percentage from FFmpeg
+- **NVENC + software fallback** — works on any GPU
 
-## Technical Guardrails
+### 📚 Library
+- **Clip browser** — auto-scans your clips folder with game subfolders
+- **Thumbnail previews** — extracted video frames for each clip
+- **Hover preview** — hold over a clip for 1s to see a video popup
+- **Search** — filter clips by name
+- **Quick actions** — Play, Edit, Upload, Delete, Show in folder
+- **Import** — drag & drop or browse files/folders
+- **Copy to Downloads** — one-click export
 
-| # | Constraint | Implementation |
-|---|-----------|----------------|
-| 1 | One live hardware encoder per session | ✅ Single PersistentEncoder for entire session, never recreated |
-| 2 | 16-pixel aligned dimensions | ✅ 1920×1088 (both ÷16 cleanly) |
-| 3 | Pin VP source/dest rectangles | ✅ VideoProcessorSetStreamSourceRect + DestRect + OutputTargetRect (NVIDIA fix) |
-| 4 | Pre-fill NV12 pool with legal black | ✅ Y=16, U=V=128 via staging texture (AMD green-line fix) |
-| 5 | Set rate control after SetOutputType | ✅ NVIDIA requires SetOutputType → D3D Manager → ICodecAPI order |
-| 6 | Configure both bitrate and VBV buffer | ✅ CBR mode + VBV = 2× bitrate via ICodecAPI |
-| 7 | Detect keyframes by NAL unit parsing | ✅ NAL type 5/7 + MFSampleExtension_CleanPoint fallback |
-| 8 | Clean frame/audio grid timestamps | ✅ Wall-clock PTS for video + sample counter PTS for audio (both from session start) |
-| 9 | Desktop audio always on | ✅ WASAPI loopback mandatory, only mic is optional |
-| 10 | Don't block save guard while uploading | ✅ is_saving released immediately after mux, uploads queued separately |
-| 11 | No FFmpeg/OBS bundled for core path | ✅ Core pipeline is pure MF/D3D11 |
+### ☁️ Cloud Upload
+- **Mobile pairing** — QR code pairing with companion app
+- **Auto-upload** — new clips automatically queued
+- **Retry with backoff** — up to 5 retries with exponential delay
+- **Upload queue** — progress tracking, pause, retry individual clips
+- **API key secured** — stored in Rust backend, never exposed to frontend
 
-## File Structure
+### ⚙️ Settings
+- **Searchable** — filter settings by keyword
+- **Theme** — Dark (default) or OLED Black (pure #000)
+- **Hotkeys** — fully customizable global shortcuts
+- **Audio** — Desktop + Mic with device selection
+- **Buffer duration** — 30s to 5 minutes
+- **Watch folder** — auto-detect new clips from other recorders
+- **Minimize to tray** — configurable behavior
 
-| File | Responsibility |
-|------|---------------|
-| `src-tauri/src/gpu_capture.rs` | WGC capture, D3D11 VideoProcessor, persistent encoder, ring buffer, save/mux |
-| `src-tauri/src/commands.rs` | Tauri IPC handlers (start/stop/save recording, clips, settings, export) |
-| `src-tauri/src/settings.rs` | Settings store (JSON persistence, RwLock) |
-| `src-tauri/src/audio.rs` | WASAPI desktop loopback + mic capture |
-| `src-tauri/src/lib.rs` | Tauri app setup, tray, global shortcuts |
-| `src/hooks/useRecorder.ts` | Frontend capture state, auto-start, hotkey handling |
-| `src/hooks/useCloudUpload.ts` | Cloud pairing, upload queue, retry logic |
-| `src/components/pages/LibraryPage.tsx` | Clip library with auto-refresh |
-| `src/components/pages/SettingsPage.tsx` | Settings UI |
+### 🎵 Audio
+- **WASAPI loopback** — captures system/game audio
+- **Microphone mixing** — optional mic input with device selection
+- **DSLR camera shutter sound** — satisfying 4-layer capture feedback
+- **AAC encoding** — at mux time (no real-time audio encoding overhead)
+
+### 🔒 Security
+- **Restricted CSP** — no `unsafe-eval`, limited `connect-src`
+- **Path validation** — all file operations validated against allowed directories
+- **No shell execution** — frontend cannot execute arbitrary commands
+- **API key backend-only** — cloud API key never reaches the webview
+- **Atomic settings writes** — crash-safe temp file + rename pattern
+
+---
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `I` | Set trim IN point |
+| `O` | Set trim OUT point |
+| `X` | Quick cut at playhead (2s) |
+| `S` | Mark speed segment start/end |
+| `Space` | Play / Pause |
+| `←` / `→` | Step back/forward 1 frame |
+| `Ctrl+Z` | Undo |
+| `Ctrl+Y` | Redo |
+| `Esc` | Exit cut/speed mode |
+
+---
+
+## System Requirements
+
+- **OS:** Windows 10 1903+ / Windows 11
+- **GPU:** Any GPU with D3D11 support (NVIDIA, AMD, Intel)
+- **Encoder:** NVENC, AMF, QuickSync, or software fallback (libx264)
+- **RAM:** 4GB minimum, 8GB+ recommended
+- **Disk:** SSD recommended for clip saves
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Framework | Tauri v2 |
+| Frontend | React 19 + TypeScript + Tailwind CSS v4 |
+| Backend | Rust |
+| Capture | Windows Graphics Capture (WGC) |
+| Encoding | Media Foundation Async MFT (Hardware H.264) |
+| Scaling | D3D11 Video Processor (BGRA→NV12) |
+| Audio | WASAPI Loopback + Capture |
+| Muxing | MF Sink Writer (H.264 passthrough + AAC) |
+| Export | FFmpeg (bundled) with NVENC/libx264 |
+| Icons | Lucide React |
+| Installer | NSIS |
+
+---
 
 ## Build
 
 ```bash
-# Requirements: Rust, Node.js, Windows 10/11 SDK
+# Install dependencies
 npm install
-npx tauri build
-# Output: src-tauri/target/release/bundle/nsis/Clipsta_2.3.0_x64-setup.exe
+
+# Development
+npm run tauri dev
+
+# Production build
+npm run tauri build
 ```
 
-## Fixes Applied (v2.3)
+Requires:
+- Node.js 18+
+- Rust 1.70+
+- Windows SDK (for Media Foundation headers)
+- `ffmpeg.exe` in `src-tauri/resources/`
 
-- **Audio desync fixed**: Video PTS uses wall-clock elapsed time from session start (matching audio's sample-counter wall-clock basis). Previously used frame counter which drifted from real time.
-- **Capture fail fixed**: Removed D3D device manager before SetOutputType (caused `0xC00D6D76`). Correct order: SetOutputType → SET_D3D_MANAGER → ICodecAPI.
-- **Keyframe detection fixed**: Added `MFSampleExtension_CleanPoint` fallback + `CODECAPI_AVEncMPVGOPSize` (2s GOP). Hardware encoder uses MFT-provided output samples (`MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`).
-- **Mux error fixed**: Added `MF_MT_AVG_BITRATE` to Sink Writer media types (fixes `0xC00D36B4`).
-- **Library scan**: Now recursive — finds clips in game-name subfolders (ShadowPlay style).
-- **Default folder**: `C:\Users\{user}\Videos\Clipsta`
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  WGC Frame Callback (non-blocking)              │
+│  → D3D11 Video Processor (BGRA→NV12, GPU)      │
+│  → try_send to channel (backpressure, cap 4)    │
+└──────────────────────┬──────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────┐
+│  Dedicated Encoder Thread                        │
+│  → Async MFT GetEvent loop                      │
+│  → ProcessInput (NV12 texture)                   │
+│  → ProcessOutput (H.264 NAL units)              │
+│  → Arc::new(data) → ring.push_video()           │
+└──────────────────────┬──────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────┐
+│  EncodedMediaRing (Arc-wrapped, pool-recycled)   │
+│  → VecDeque<EncodedFrame> + keyframe index      │
+│  → Prune by duration, recycle buffers           │
+└──────────────────────┬──────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────┐
+│  save_clip() — on hotkey press                   │
+│  → Lock ring (~80μs), Arc::clone slice          │
+│  → Unlock → MF Sink Writer (passthrough mux)   │
+│  → MP4 file with BT.709 color tags             │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## License
+
+Private — © Clipsta

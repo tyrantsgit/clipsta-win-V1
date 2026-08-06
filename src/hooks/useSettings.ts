@@ -33,6 +33,7 @@ export const DEFAULTS: AppSettings = {
 	orientation: "landscape",
 	watchFolderPath: "",
 	watchFolderEnabled: false,
+	theme: "dark" as const,
 };
 
 export function useSettings() {

@@ -16,6 +16,7 @@ interface Props {
 export default function SettingsPage({ settings, updateSetting, saveAll, cloud }: Props) {
 	const [local, setLocal] = useState<AppSettings>({ ...settings });
 	const [initialSynced, setInitialSynced] = useState(false);
+	const [settingsSearch, setSettingsSearch] = useState("");
 	useEffect(() => {
 		if (!initialSynced && settings !== DEFAULTS) { setLocal({ ...settings }); setInitialSynced(true); }
 	}, [settings, initialSynced]);
@@ -107,14 +108,21 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					<p className="text-text-dim text-sm mt-0.5">Configure recording, hotkeys and export</p>
 				</div>
 				<div className="flex items-center gap-3">
+					<input
+						type="text"
+						placeholder="Search settings..."
+						value={settingsSearch}
+						onChange={(e) => setSettingsSearch(e.target.value)}
+						className="input py-1.5 px-3 text-sm w-44"
+					/>
 					<button onClick={() => setLocal({ ...DEFAULTS })} className="btn-ghost"><RotateCcw size={14} /> Reset Defaults</button>
 					<button onClick={handleSave} className="btn-y"><Save size={14} />{saved ? "Saved ✓" : "Save Settings"}</button>
 				</div>
 			</div>
 
-			<div className="space-y-6">
+			<div className="space-y-6" data-search={settingsSearch}>
 				{/* Hotkeys */}
-				<Section icon={<Keyboard size={16} />} title="Hotkeys">
+				<Section icon={<Keyboard size={16} />} title="Hotkeys" search={settingsSearch}>
 					<p className="text-text-dim text-xs mb-3">These work globally even when minimized to tray.</p>
 					<div className="grid grid-cols-3 gap-4">
 						<HotkeyField label="Save Last 30 Seconds" value={local.hotkeyClip30Sec || "Super+Alt+G"} onChange={(v) => update("hotkeyClip30Sec", v)} />
@@ -124,7 +132,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				</Section>
 
 				{/* Video */}
-				<Section icon={<Monitor size={16} />} title="Video">
+				<Section icon={<Monitor size={16} />} title="Video" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
 						<SelectField label="Resolution" value={local.resolution} onChange={(v) => update("resolution", v)} options={["480p", "720p", "1080p", "1440p", "4k"]} />
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
@@ -137,7 +145,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				</Section>
 
 				{/* Audio */}
-				<Section icon={<Volume2 size={16} />} title="Audio">
+				<Section icon={<Volume2 size={16} />} title="Audio" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
 						<SelectField label="Audio Source" value={local.audioSource} onChange={(v) => update("audioSource", v)} options={["desktop", "mic", "both", "none"]} display={(v) => v === "desktop" ? "Desktop Audio" : v === "mic" ? "Microphone only" : v === "both" ? "Desktop + Microphone" : "None"} />
 						<NumberField label="Audio Bitrate (kbps)" value={local.audioBitrate} onChange={(v) => update("audioBitrate", v)} min={64} max={320} step={32} />
@@ -161,7 +169,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				</Section>
 
 				{/* Capture */}
-				<Section icon={<Cpu size={16} />} title="Capture Behavior">
+				<Section icon={<Cpu size={16} />} title="Capture Behavior" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
 						<Toggle label="Auto Game Detection" checked={local.gameDetect} onChange={(v) => update("gameDetect", v)} description="Automatically capture the active fullscreen game" />
 						<Toggle label="Minimize to System Tray" checked={local.minimizeToTray} onChange={(v) => update("minimizeToTray", v)} description="Keep running in tray when window is closed" />
@@ -170,8 +178,37 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					</div>
 				</Section>
 
+				{/* Appearance */}
+				<Section icon={<Monitor size={16} />} title="Appearance" search={settingsSearch}>
+					<div className="space-y-3">
+						<p className="text-text-dim text-xs">Choose your preferred theme</p>
+						<div className="flex gap-3">
+							<button
+								onClick={() => update("theme", "dark" as any)}
+								className={`flex-1 flex flex-col items-center gap-2 px-4 py-3 rounded-lg border-2 transition-all ${
+									(local.theme ?? "dark") === "dark" ? "border-y bg-y/5" : "border-border hover:border-y/40"
+								}`}
+							>
+								<div className="w-10 h-6 rounded bg-[#0a0a0a] border border-[#2a2a2a]" />
+								<span className="text-xs font-semibold text-white">Dark</span>
+								<span className="text-[9px] text-text-dim">Default</span>
+							</button>
+							<button
+								onClick={() => update("theme", "oled" as any)}
+								className={`flex-1 flex flex-col items-center gap-2 px-4 py-3 rounded-lg border-2 transition-all ${
+									local.theme === "oled" ? "border-y bg-y/5" : "border-border hover:border-y/40"
+								}`}
+							>
+								<div className="w-10 h-6 rounded bg-[#000000] border border-[#1e1e1e]" />
+								<span className="text-xs font-semibold text-white">OLED Black</span>
+								<span className="text-[9px] text-text-dim">Pure black</span>
+							</button>
+						</div>
+					</div>
+				</Section>
+
 				{/* Cloud */}
-				<Section icon={<Cloud size={16} />} title="Cloud Upload">
+				<Section icon={<Cloud size={16} />} title="Cloud Upload" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
 						<Toggle label="Enable Cloud Upload" checked={local.cloudEnabled} onChange={(v) => update("cloudEnabled", v)} description="Upload clips to your paired mobile device" />
 						<Toggle label="Auto-Upload New Clips" checked={local.autoUpload} onChange={(v) => update("autoUpload", v)} description="Automatically queue new recordings" />
@@ -261,7 +298,24 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 
 
 // ── Helper Components ───────────────────────────────────────────────────────
-function Section({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+function Section({ icon, title, children, search }: { icon: React.ReactNode; title: string; children: React.ReactNode; search?: string }) {
+	// If search is active, hide sections that don't match
+	if (search && search.length > 0) {
+		const q = search.toLowerCase();
+		const titleMatch = title.toLowerCase().includes(q);
+		// Check common keywords per section
+		const keywords: Record<string, string> = {
+			"Hotkeys": "shortcut key bind clip save record",
+			"Video": "resolution fps frame rate bitrate quality",
+			"Audio": "microphone mic sound device desktop game",
+			"Capture": "buffer duration output folder path",
+			"Appearance": "theme dark oled minimize tray",
+			"Cloud": "upload pair device sync mobile",
+			"Watch Folder": "watch monitor folder auto import",
+		};
+		const sectionKeywords = keywords[title] ?? "";
+		if (!titleMatch && !sectionKeywords.includes(q)) return null;
+	}
 	return (
 		<div className="card p-5 space-y-4">
 			<div className="flex items-center gap-2 border-b border-border pb-3">

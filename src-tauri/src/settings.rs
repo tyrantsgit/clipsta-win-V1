@@ -41,6 +41,7 @@ pub struct AppSettings {
     pub orientation: String,
     pub watch_folder_path: String,
     pub watch_folder_enabled: bool,
+    pub theme: String,
 }
 
 impl Default for AppSettings {
@@ -79,6 +80,7 @@ impl Default for AppSettings {
             orientation: "landscape".to_string(),
             watch_folder_path: String::new(),
             watch_folder_enabled: false,
+            theme: "dark".to_string(),
         }
     }
 }

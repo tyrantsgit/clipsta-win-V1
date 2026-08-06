@@ -35,7 +35,6 @@ export function useCloudUpload(settings: AppSettings | null) {
 			} catch {
 				cloudConfigRef.current = {
 					apiBase: "https://clipsta-api.godson594.workers.dev",
-					apiKey: "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96",
 				};
 			}
 		}
@@ -65,24 +64,10 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// ── Pairing ───────────────────────────────────────────────────────────
 	const generatePairingCode = useCallback(async () => {
 		setState((prev) => ({ ...prev, pairingError: null, pairingLoading: true, pairingConfirmed: false }));
-		const cfg = await getCloudConfig();
 		try {
-			const res = await fetch(`${cfg.apiBase}/pairing-tokens`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"X-Clipsta-Test-Key": cfg.apiKey,
-				},
-				body: JSON.stringify({
-					desktopDeviceId: getDeviceId(),
-					desktopName: "Clipsta Desktop",
-				}),
-			});
-			if (!res.ok) {
-				const body = await res.json().catch(() => ({}));
-				throw new Error((body as any).error ?? `HTTP ${res.status}`);
-			}
-			const data = (await res.json()) as { token: string; pairingUrl: string; expiresAt: string };
+			// Use backend proxy — API key stays server-side
+			const { invoke } = await import("@tauri-apps/api/core");
+			const data = await invoke<{ token: string; pairingUrl: string; expiresAt: string }>("cloud_generate_pairing");
 			setState((prev) => ({
 				...prev,
 				paired: true,
@@ -90,15 +75,14 @@ export function useCloudUpload(settings: AppSettings | null) {
 				pairingCode: data.token,
 				pairingLoading: false,
 			}));
-			bridge.setSetting("cloudPairCode", data.token).catch(() => {});
 		} catch (e: any) {
 			setState((prev) => ({
 				...prev,
-				pairingError: `Pairing failed: ${e.message ?? ""}`,
+				pairingError: `Pairing failed: ${e?.message ?? e ?? ""}`,
 				pairingLoading: false,
 			}));
 		}
-	}, [getCloudConfig, getDeviceId]);
+	}, []);
 
 	const confirmPairing = useCallback(() => {
 		setState((prev) => ({ ...prev, pairingConfirmed: true }));

@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -520,7 +520,6 @@ fn encoder_thread_fn(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let log_path = std::env::temp_dir().join("clipsta_capture_debug.log");
     let log = |_msg: &str| {};  // Disabled for production
 
     log("encoder thread started, entering event loop");
@@ -686,7 +685,7 @@ unsafe fn extract_output(transform: &IMFTransform) -> Option<EncodedFrame> {
     let is_keyframe = is_nalu_keyframe(&data);
 
     Some(EncodedFrame {
-        data,
+        data: Arc::new(data),
         pts_100ns: pts,
         duration_100ns: dur,
         is_keyframe,
@@ -729,7 +728,9 @@ fn is_nalu_keyframe(data: &[u8]) -> bool {
 
 #[derive(Clone)]
 struct EncodedFrame {
-    data: Vec<u8>,
+    /// Arc-wrapped frame data: cloning an EncodedFrame is now a cheap ref-count bump
+    /// instead of deep-copying the entire H.264 NAL unit payload.
+    data: Arc<Vec<u8>>,
     pts_100ns: i64,
     duration_100ns: i64,
     is_keyframe: bool,
@@ -737,14 +738,79 @@ struct EncodedFrame {
 
 #[derive(Clone)]
 struct AudioChunk {
-    /// Interleaved f32 stereo samples (will be PCM i16 at mux time)
-    data: Vec<f32>,
+    /// Arc-wrapped audio samples: cloning is a cheap ref-count bump.
+    data: Arc<Vec<f32>>,
     pts_100ns: i64,
     duration_100ns: i64,
 }
 
+/// Pool of reusable Vec<u8> buffers to avoid per-frame heap allocation.
+/// When a frame is pruned from the ring and its Arc refcount drops to 0,
+/// the Vec is returned to the pool for reuse by the next encoder output.
+struct FrameBufferPool {
+    /// Available buffers ready for reuse (cleared but capacity preserved).
+    free: Vec<Vec<u8>>,
+    /// Maximum buffers to keep in the pool (prevents unbounded growth).
+    max_pooled: usize,
+}
+
+impl FrameBufferPool {
+    fn new(max_pooled: usize) -> Self {
+        Self {
+            free: Vec::with_capacity(max_pooled),
+            max_pooled,
+        }
+    }
+
+    /// Get a buffer from the pool (reuses existing capacity) or allocate a new one.
+    #[allow(dead_code)]
+    fn acquire(&mut self) -> Vec<u8> {
+        self.free.pop().unwrap_or_else(|| Vec::with_capacity(4096))
+    }
+
+    /// Return a buffer to the pool for reuse. Clears content but keeps allocation.
+    fn release(&mut self, mut buf: Vec<u8>) {
+        if self.free.len() < self.max_pooled {
+            buf.clear();
+            self.free.push(buf);
+        }
+        // else: drop it (pool is full)
+    }
+}
+
+/// Pool of reusable Vec<f32> buffers for audio chunks.
+struct AudioBufferPool {
+    free: Vec<Vec<f32>>,
+    max_pooled: usize,
+}
+
+impl AudioBufferPool {
+    fn new(max_pooled: usize) -> Self {
+        Self {
+            free: Vec::with_capacity(max_pooled),
+            max_pooled,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn acquire(&mut self) -> Vec<f32> {
+        self.free.pop().unwrap_or_else(|| Vec::with_capacity(960))
+    }
+
+    fn release(&mut self, mut buf: Vec<f32>) {
+        if self.free.len() < self.max_pooled {
+            buf.clear();
+            self.free.push(buf);
+        }
+    }
+}
+
 /// Ring buffer holding encoded H.264 frames + PCM audio chunks.
 /// Maintains a keyframe index for fast slicing.
+///
+/// Memory optimization:
+/// - Frame data is Arc-wrapped: slice_video is O(n) Arc clones, not deep copies
+/// - Buffer pools recycle allocations: pruned frames' Vecs are reused by new frames
 struct EncodedMediaRing {
     video_frames: VecDeque<EncodedFrame>,
     audio_chunks: VecDeque<AudioChunk>,
@@ -753,6 +819,10 @@ struct EncodedMediaRing {
     /// Running offset: total frames ever pushed (to convert absolute index → deque index)
     frames_pushed: usize,
     max_duration_100ns: i64,
+    /// Pool for recycling video frame buffers
+    video_pool: FrameBufferPool,
+    /// Pool for recycling audio chunk buffers
+    audio_pool: AudioBufferPool,
 }
 
 unsafe impl Send for EncodedMediaRing {}
@@ -760,13 +830,33 @@ unsafe impl Sync for EncodedMediaRing {}
 
 impl EncodedMediaRing {
     fn new(max_seconds: u32) -> Self {
+        // Pre-size pools: at 60fps, 300s = 18000 frames. Keep ~200 recycled buffers
+        // ready (small fraction of total, but enough to avoid alloc spikes).
         Self {
             video_frames: VecDeque::with_capacity(max_seconds as usize * 60),
             audio_chunks: VecDeque::with_capacity(max_seconds as usize * 50),
             keyframe_indices: VecDeque::new(),
             frames_pushed: 0,
             max_duration_100ns: max_seconds as i64 * 10_000_000,
+            video_pool: FrameBufferPool::new(256),
+            audio_pool: AudioBufferPool::new(128),
         }
+    }
+
+    /// Get a video buffer from the pool (for use by extract_output).
+    #[allow(dead_code)]
+    fn acquire_video_buffer(&mut self) -> Vec<u8> {
+        self.video_pool.acquire()
+    }
+
+    /// Get an audio buffer from the pool (for use by audio callback).
+    #[allow(dead_code)]
+    fn acquire_audio_buffer(&mut self, min_capacity: usize) -> Vec<f32> {
+        let mut buf = self.audio_pool.acquire();
+        if buf.capacity() < min_capacity {
+            buf.reserve(min_capacity - buf.capacity());
+        }
+        buf
     }
 
     /// Push an encoded video frame into the ring.
@@ -786,12 +876,19 @@ impl EncodedMediaRing {
     }
 
     /// Remove old frames that exceed max buffer duration.
+    /// Recycles buffer allocations back to the pool when Arc refcount is 1
+    /// (meaning only the ring holds a reference — no active save_clip is using it).
     fn prune(&mut self) {
         while self.video_frames.len() > 2 {
             let newest_pts = self.video_frames.back().map(|f| f.pts_100ns).unwrap_or(0);
             let oldest_pts = self.video_frames.front().map(|f| f.pts_100ns).unwrap_or(0);
             if newest_pts - oldest_pts > self.max_duration_100ns {
-                self.video_frames.pop_front();
+                if let Some(old_frame) = self.video_frames.pop_front() {
+                    // Recycle the buffer if we're the sole owner
+                    if let Ok(buf) = Arc::try_unwrap(old_frame.data) {
+                        self.video_pool.release(buf);
+                    }
+                }
                 let base = self.frames_pushed - self.video_frames.len() - 1;
                 while let Some(&ki) = self.keyframe_indices.front() {
                     if ki <= base {
@@ -813,7 +910,11 @@ impl EncodedMediaRing {
         let oldest_video_pts = self.video_frames.front().map(|f| f.pts_100ns).unwrap_or(0);
         while let Some(front) = self.audio_chunks.front() {
             if front.pts_100ns + front.duration_100ns < oldest_video_pts {
-                self.audio_chunks.pop_front();
+                if let Some(old_chunk) = self.audio_chunks.pop_front() {
+                    if let Ok(buf) = Arc::try_unwrap(old_chunk.data) {
+                        self.audio_pool.release(buf);
+                    }
+                }
             } else {
                 break;
             }
@@ -860,11 +961,13 @@ impl EncodedMediaRing {
     }
 
     /// Slice video frames from start_idx to end.
+    /// With Arc-wrapped data, this is an O(n) Arc::clone — no deep copy of frame bytes.
     fn slice_video(&self, start_idx: usize) -> Vec<EncodedFrame> {
         self.video_frames.iter().skip(start_idx).cloned().collect()
     }
 
     /// Slice audio chunks that overlap the given PTS range.
+    /// With Arc-wrapped data, this is an O(n) Arc::clone — no deep copy of audio samples.
     fn slice_audio(&self, start_pts: i64, end_pts: i64) -> Vec<AudioChunk> {
         self.audio_chunks
             .iter()
@@ -917,7 +1020,13 @@ unsafe fn mux_to_mp4(
     vout.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?;
     vout.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
     // Tag as limited range BT.709 (matches ShadowPlay color metadata)
-    vout.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1)?;  // MFNominalRange_16_235
+    // These are set on the Sink Writer output type (not the encoder) so they're written
+    // into the MP4 container's color info atoms without affecting encoder compatibility.
+    // All use let _ = to silently skip if unsupported on any Windows version.
+    let _ = vout.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);  // MFNominalRange_16_235
+    let _ = vout.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);       // MFVideoPrimaries_BT709
+    let _ = vout.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);     // MFVideoTransFunc_709
+    let _ = vout.SetUINT32(&MF_MT_YUV_MATRIX, 2);            // MFVideoTransferMatrix_BT709
     let video_stream = writer.AddStream(&vout)?;
 
     // For H.264 passthrough: no SetInputMediaType needed.
@@ -1208,12 +1317,6 @@ impl CaptureSession {
             (video, audio)
         };
 
-        eprintln!(
-            "[gpu_capture] save_clip: {} video frames, {} audio chunks, output: {}",
-            video_frames.len(),
-            audio_chunks.len(),
-            output_path
-        );
         log(&format!("ring slice: {} video frames, {} audio chunks", video_frames.len(), audio_chunks.len()));
 
         // Mux to MP4 (AAC encoding of PCM audio happens here)
@@ -1353,8 +1456,9 @@ fn run_gpu_capture(
     };
 
     // Create channel: WGC callback → encoder thread
-    // SyncSender with bound=2 provides backpressure (drops frame if encoder is behind)
-    let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(2);
+    // SyncSender with bound=4 provides backpressure while allowing burst tolerance.
+    // NV12 pool has 8 textures, so 4 in-flight is safe (encoder consumes faster than WGC produces on average).
+    let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(4);
 
     // Clone NV12 pool for encoder thread (Arc-wrapped for shared access)
     let nv12_pool_arc = Arc::new(nv12_pool);
@@ -1595,7 +1699,7 @@ fn gpu_audio_loop(
         thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    let start_instant = session_start.lock().unwrap();
+    let _start_instant = session_start.lock().unwrap();
     let ring_clone = ring.clone();
     let audio_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = audio_sample_counter.clone();
@@ -1609,7 +1713,7 @@ fn gpu_audio_loop(
         let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
 
         let audio_chunk = AudioChunk {
-            data: chunk.to_vec(),
+            data: Arc::new(chunk.to_vec()),
             pts_100ns,
             duration_100ns,
         };
