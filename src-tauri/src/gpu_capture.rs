@@ -1283,16 +1283,17 @@ unsafe fn mux_to_mp4(
     writer.BeginWriting()?;
 
     // Rebase PTS so clip starts at 0.
-    // Use SEQUENTIAL frame indices × fixed duration for video PTS.
-    // This guarantees the output is exactly `fps` regardless of encoder delivery jitter.
-    // Wall-clock PTS varies due to WGC delivery irregularities and encoder throughput,
-    // but the video content is still one-frame-per-interval, so sequential PTS is correct.
-    // Audio uses wall-clock PTS for proper A/V sync (audio is continuous, not frame-based).
+    // Use wall-clock PTS (from session_start.elapsed()) for BOTH video and audio.
+    // This ensures:
+    // 1. A/V sync: both tracks share the same time reference
+    // 2. Correct duration: if 60s of wall-clock time was captured, clip is 60s
+    //    regardless of actual frame count (frame pacing may drop some frames)
+    // 3. Natural frame timing: slight jitter in frame delivery is preserved
+    //    (invisible to viewer, but prevents duration truncation)
     let base_pts = video_frames[0].pts_100ns;
-    let frame_duration_100ns = 10_000_000i64 / fps as i64; // Fixed: 166666 for 60fps
 
-    // Write video frames with sequential PTS (guarantees constant frame rate)
-    for (i, frame) in video_frames.iter().enumerate() {
+    // Write video frames with wall-clock PTS rebased to 0
+    for frame in video_frames {
         let buf: IMFMediaBuffer = MFCreateMemoryBuffer(frame.data.len() as u32)?;
         let mut p: *mut u8 = ptr::null_mut();
         buf.Lock(&mut p, None, None)?;
@@ -1302,8 +1303,8 @@ unsafe fn mux_to_mp4(
 
         let sample: IMFSample = MFCreateSample()?;
         sample.AddBuffer(&buf)?;
-        sample.SetSampleTime(i as i64 * frame_duration_100ns)?;
-        sample.SetSampleDuration(frame_duration_100ns)?;
+        sample.SetSampleTime(frame.pts_100ns - base_pts)?;
+        sample.SetSampleDuration(frame.duration_100ns)?;
 
         if frame.is_keyframe {
             sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
@@ -1312,7 +1313,7 @@ unsafe fn mux_to_mp4(
         writer.WriteSample(video_stream, &sample)?;
     }
 
-    // Write audio chunks with matching PTS
+    // Write audio chunks with wall-clock PTS rebased to 0 (same clock as video)
     if let Some(audio_idx) = audio_stream {
         for chunk in audio_chunks {
             let i16_buf: Vec<i16> = chunk
@@ -2132,8 +2133,11 @@ fn gpu_audio_loop(
     let counter_clone = audio_sample_counter.clone();
 
     let res = WasapiCapture::capture_to_callback(stop, mic_device, loopback, move |chunk: &[f32]| {
-        // PTS from sample counter — matches video's frame-counter approach.
-        // Both start at 0 from session_start, ensuring A/V sync.
+        // PTS from sample counter — audio samples are continuous at 48kHz.
+        // The counter starts at 0 when capture begins (right after session_start is set).
+        // Video PTS also starts near 0 (session_start.elapsed()), so both share the
+        // same time origin. The sample counter is more stable than wall-clock for audio
+        // because it tracks actual delivered samples (immune to thread scheduling jitter).
         let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
         let sample_offset = counter_clone.fetch_add(n_frames, Ordering::Relaxed);
         let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
