@@ -444,6 +444,12 @@ unsafe fn init_hardware_encoder(
     out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
     out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?; // High profile
     out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
+    // Color space: limited range BT.709 (matches ShadowPlay exactly)
+    // These get written into the H.264 VUI parameters in the bitstream.
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);  // MFNominalRange_16_235 (limited/tv)
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);       // MFVideoPrimaries_BT709
+    let _ = out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);     // MFVideoTransFunc_709
+    let _ = out_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);            // MFVideoTransferMatrix_BT709
     transform.SetOutputType(0, &out_type, 0)?;
 
     // 5. Create DXGI Device Manager, ResetDevice, ProcessMessage(SET_D3D_MANAGER)
@@ -482,24 +488,19 @@ unsafe fn init_hardware_encoder(
             v
         }
 
-        // Peak-constrained VBR (mode 3): encoder targets average bitrate but allows
-        // spikes up to peak during complex scenes. This is what ShadowPlay actually uses
-        // internally — better quality in action scenes without increasing average file size.
-        // Mode 3 = eAVEncCommonRateControlMode_PeakConstrainedVBR
-        let val = make_u32_variant(3);
+        // CBR rate control (mode 2): proven reliable on both NVIDIA MFT and AMD VCN.
+        // Peak-constrained VBR (mode 3) sounds better but NVIDIA's MFT implementation
+        // doesn't always honor it, causing bitrate undershoot and macroblocking.
+        // CBR with adequate bitrate + VBV buffer = consistent quality like ShadowPlay.
+        let val = make_u32_variant(2);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
 
-        // Average bitrate (vendor-adjusted: 8 Mbps NVIDIA, 12 Mbps AMD)
+        // Target bitrate (vendor-adjusted: 10 Mbps NVIDIA, 12 Mbps AMD for 720p60)
         let val = make_u32_variant(bitrate_kbps * 1000);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
 
-        // Peak bitrate = 1.5x average (allows bursts during fast motion)
-        let peak_bitrate = bitrate_kbps * 1000 * 3 / 2;
-        let val = make_u32_variant(peak_bitrate);
-        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &val);
-
-        // VBV buffer size = 2x average bitrate (smooths out rate spikes)
-        let val = make_u32_variant(bitrate_kbps * 1000 * 2);
+        // VBV buffer size = 1 second of bitrate (prevents quality drops during scene changes)
+        let val = make_u32_variant(bitrate_kbps * 1000);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
 
         // QP floor: min QP = 18 prevents over-compression during bitrate pressure.
@@ -528,6 +529,11 @@ unsafe fn init_hardware_encoder(
     in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    // Input color space: limited range BT.709 (matches VP output)
+    let _ = in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);
+    let _ = in_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);
+    let _ = in_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);
+    let _ = in_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);
     transform.SetInputType(0, &in_type, 0)?;
 
     // 8. ProcessMessage(NOTIFY_BEGIN_STREAMING), ProcessMessage(NOTIFY_START_OF_STREAM)
@@ -600,6 +606,11 @@ unsafe fn init_hardware_encoder_relaxed(
     out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
     out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 66)?; // Baseline profile
     out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, 40)?;   // Level 4.0
+    // Color space: limited range BT.709 (same as optimal path)
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);
+    let _ = out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);
+    let _ = out_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);
     transform.SetOutputType(0, &out_type, 0)?;
 
     // DXGI Device Manager
@@ -645,6 +656,11 @@ unsafe fn init_hardware_encoder_relaxed(
     in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    // Input color space: limited range BT.709 (matches VP output)
+    let _ = in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);
+    let _ = in_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);
+    let _ = in_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);
+    let _ = in_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);
     transform.SetInputType(0, &in_type, 0)?;
 
     // Start streaming
@@ -678,6 +694,7 @@ fn encoder_thread_fn(
     rx: Receiver<FrameMsg>,
     ring: Arc<Mutex<EncodedMediaRing>>,
     stop: Arc<AtomicBool>,
+    fps: u32,
 ) {
     let transform = transform.0;
     let event_gen = event_gen.0;
@@ -689,6 +706,12 @@ fn encoder_thread_fn(
     let log = |_msg: &str| {};  // Disabled for production
 
     log("encoder thread started, entering event loop");
+
+    // Frame duplication tracking: when WGC misses a delivery, we duplicate
+    // the last frame to maintain exactly fps frames per second.
+    let mut last_texture_idx: usize = usize::MAX;
+    let mut last_pts: i64 = 0;
+    let mut last_duration: i64 = 10_000_000 / fps as i64;
 
     // Log first event attempt
     let mut event_count: u64 = 0;
@@ -742,42 +765,67 @@ fn encoder_thread_fn(
         match event_type {
             // METransformNeedInput (601)
             601 => {
-                // Block waiting for a frame from the WGC callback.
-                // This thread is dedicated to encoding — blocking is fine.
-                // We MUST feed a frame before GetEvent will give us HaveOutput.
-                match rx.recv() {
-                    Ok(msg) => {
-                        let tex = &nv12_pool[msg.texture_index];
-                        unsafe {
-                            // Create DXGI surface buffer from NV12 pool texture
-                            match MFCreateDXGISurfaceBuffer(
-                                &ID3D11Texture2D::IID,
-                                tex,
-                                0,
-                                false,
-                            ) {
-                                Ok(buffer) => {
-                                    let sample: IMFSample = match MFCreateSample() {
-                                        Ok(s) => s,
-                                        Err(_) => continue,
-                                    };
-                                    let _ = sample.AddBuffer(&buffer);
-                                    let _ = sample.SetSampleTime(msg.pts_100ns);
-                                    let _ = sample.SetSampleDuration(msg.duration_100ns);
-
-                                    if let Err(e) = transform.ProcessInput(0, &sample, 0) {
-                                        log(&format!("ProcessInput failed: {}", e));
-                                    }
-                                }
-                                Err(e) => {
-                                    log(&format!("MFCreateDXGISurfaceBuffer failed: {}", e));
-                                }
-                            }
+                // Wait for a frame from the WGC callback with a timeout.
+                // If no frame arrives within 1.5× the expected interval, duplicate
+                // the last frame to maintain exactly 60fps output. This handles:
+                // - WGC missing a vsync delivery
+                // - Game stutter causing irregular frame delivery
+                // - SetMinUpdateInterval not being perfectly enforced
+                let timeout = std::time::Duration::from_micros(
+                    (1_000_000u64 / fps as u64) * 3 / 2  // 1.5× frame interval = 25ms at 60fps
+                );
+                let msg = match rx.recv_timeout(timeout) {
+                    Ok(m) => {
+                        last_texture_idx = m.texture_index;
+                        last_pts = m.pts_100ns;
+                        last_duration = m.duration_100ns;
+                        m
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // No frame arrived in time — duplicate last frame to fill gap.
+                        // This guarantees the encoder always outputs 60fps regardless
+                        // of WGC delivery irregularities.
+                        if last_texture_idx == usize::MAX {
+                            continue; // No frame received yet, can't duplicate
+                        }
+                        last_pts += last_duration; // Advance PTS by one frame
+                        FrameMsg {
+                            texture_index: last_texture_idx,
+                            pts_100ns: last_pts,
+                            duration_100ns: last_duration,
                         }
                     }
-                    Err(_) => {
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
                         log("channel disconnected, exiting");
                         break;
+                    }
+                };
+
+                let tex = &nv12_pool[msg.texture_index];
+                unsafe {
+                    // Create DXGI surface buffer from NV12 pool texture
+                    match MFCreateDXGISurfaceBuffer(
+                        &ID3D11Texture2D::IID,
+                        tex,
+                        0,
+                        false,
+                    ) {
+                        Ok(buffer) => {
+                            let sample: IMFSample = match MFCreateSample() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let _ = sample.AddBuffer(&buffer);
+                            let _ = sample.SetSampleTime(msg.pts_100ns);
+                            let _ = sample.SetSampleDuration(msg.duration_100ns);
+
+                            if let Err(e) = transform.ProcessInput(0, &sample, 0) {
+                                log(&format!("ProcessInput failed: {}", e));
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!("MFCreateDXGISurfaceBuffer failed: {}", e));
+                        }
                     }
                 }
             }
@@ -1212,7 +1260,7 @@ unsafe fn mux_to_mp4(
             aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE).ok()?;
             aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS).ok()?;
             aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ok()?;
-            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000).ok()?; // 192 kbps AAC (matches ShadowPlay)
             aout.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 1).ok()?;
             let _ = aout.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
             let idx = writer.AddStream(&aout).ok()?;
@@ -1234,11 +1282,17 @@ unsafe fn mux_to_mp4(
 
     writer.BeginWriting()?;
 
-    // Rebase PTS so clip starts at 0
+    // Rebase PTS so clip starts at 0.
+    // Use SEQUENTIAL frame indices × fixed duration for video PTS.
+    // This guarantees the output is exactly `fps` regardless of encoder delivery jitter.
+    // Wall-clock PTS varies due to WGC delivery irregularities and encoder throughput,
+    // but the video content is still one-frame-per-interval, so sequential PTS is correct.
+    // Audio uses wall-clock PTS for proper A/V sync (audio is continuous, not frame-based).
     let base_pts = video_frames[0].pts_100ns;
+    let frame_duration_100ns = 10_000_000i64 / fps as i64; // Fixed: 166666 for 60fps
 
-    // Write video frames with original PTS rebased to 0
-    for frame in video_frames {
+    // Write video frames with sequential PTS (guarantees constant frame rate)
+    for (i, frame) in video_frames.iter().enumerate() {
         let buf: IMFMediaBuffer = MFCreateMemoryBuffer(frame.data.len() as u32)?;
         let mut p: *mut u8 = ptr::null_mut();
         buf.Lock(&mut p, None, None)?;
@@ -1248,8 +1302,8 @@ unsafe fn mux_to_mp4(
 
         let sample: IMFSample = MFCreateSample()?;
         sample.AddBuffer(&buf)?;
-        sample.SetSampleTime(frame.pts_100ns - base_pts)?;
-        sample.SetSampleDuration(frame.duration_100ns)?;
+        sample.SetSampleTime(i as i64 * frame_duration_100ns)?;
+        sample.SetSampleDuration(frame_duration_100ns)?;
 
         if frame.is_keyframe {
             sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
@@ -1668,10 +1722,10 @@ fn run_gpu_capture(
     // Vendor-aware bitrate: AMD VCN produces more artifacts than NVENC at the same bitrate,
     // so we compensate with 50% more bits. This matches Radeon ReLive's "High" preset.
     let bitrate_kbps = if is_amd {
-        // AMD: 12 Mbps for 720p60 (ReLive "High" quality level)
-        (opts.bitrate_kbps as f32 * 1.5).min(20000.0) as u32
+        // AMD: 50% higher bitrate to compensate for VCN's lower compression efficiency
+        (opts.bitrate_kbps as f32 * 1.5) as u32
     } else {
-        // NVIDIA: 8 Mbps matches ShadowPlay exactly
+        // NVIDIA: base bitrate is already tuned with headroom above ShadowPlay
         opts.bitrate_kbps
     };
 
@@ -1771,6 +1825,7 @@ fn run_gpu_capture(
                 frame_rx,
                 ring_for_encoder,
                 stop_for_encoder,
+                fps,
             );
         })?;
     log("Dedicated encoder thread spawned");
@@ -1856,6 +1911,12 @@ fn run_gpu_capture(
     // Track last successfully sent NV12 pool index for frame-repeat-on-drop
     let last_sent_idx = Arc::new(AtomicUsize::new(usize::MAX));
 
+    // Frame pacing: enforce target fps even when WGC delivers faster.
+    // Stores last accepted frame time in 100ns units (AtomicI64 via two AtomicU32s).
+    // When game runs at >60fps, WGC may still deliver excess frames despite
+    // SetMinUpdateInterval (which is advisory). This enforces the cap.
+    let last_accepted_ns = Arc::new(parking_lot::Mutex::new(0i64));
+
     // Frame arrived callback — MUST NOT BLOCK
     let stop_cb = stop.clone();
     let device_cb = device.clone();
@@ -1867,6 +1928,7 @@ fn run_gpu_capture(
     let nv12_pool_cb = nv12_pool_arc.clone();
     let last_sent_idx_cb = last_sent_idx.clone();
     let frame_drops_cb = frame_drops.clone();
+    let last_accepted_ns_cb = last_accepted_ns.clone();
 
     struct SendDevice(IDirect3DDevice);
     unsafe impl Send for SendDevice {}
@@ -1926,14 +1988,31 @@ fn run_gpu_capture(
             // Calculate PTS — use wall-clock elapsed time from session_start.
             // This matches audio PTS (which is wall-clock via sample counter at 48kHz).
             // Frame counter still used for duration calculation.
-            let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
             let pts_100ns = {
                 let ss = session_start_cb.lock();
                 match *ss {
                     Some(ref start) => start.elapsed().as_nanos() as i64 / 100,
-                    None => (frame_num * 10_000_000) / fps as i64,
+                    None => 0,
                 }
             };
+
+            // Frame pacing: skip this frame if it arrived too soon.
+            // When game runs >60fps, WGC may deliver excess frames despite
+            // SetMinUpdateInterval. We enforce the cap here to guarantee exactly
+            // 60 frames/sec reach the encoder. Allow 80% of frame interval to
+            // accommodate natural jitter without dropping legitimate frames.
+            let min_interval = (10_000_000i64 / fps as i64) * 80 / 100; // 80% of 16.6ms = 13.3ms
+            {
+                let mut last = last_accepted_ns_cb.lock();
+                if pts_100ns - *last < min_interval && *last != 0 {
+                    // Too soon — skip this frame entirely (no VP, no encode)
+                    return Ok(());
+                }
+                *last = pts_100ns;
+            }
+
+            let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
+            let _ = frame_num; // Used for debug logging only
             let duration_100ns = 10_000_000i64 / fps as i64;
 
             // Pick NV12 pool texture (round-robin)

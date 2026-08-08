@@ -9,6 +9,7 @@ export interface AppSettings {
 	fps: number;
 	aspectRatio: string;
 	encoder: string;
+	quality: string;
 	bitrate: number;
 	audioBitrate: number;
 	captureAudio: boolean;

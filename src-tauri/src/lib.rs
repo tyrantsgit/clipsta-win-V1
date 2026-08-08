@@ -132,6 +132,25 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&app_data);
             let store = SettingsStore::load(&app_data);
 
+            // Migrate output folder: v2.3.0 defaulted to Downloads/Clipsta,
+            // v2.3.1+ uses Videos/Clipsta. Migrate existing users automatically.
+            {
+                let settings = store.get();
+                let downloads_clipsta = dirs::download_dir()
+                    .unwrap_or_default()
+                    .join("Clipsta")
+                    .to_string_lossy()
+                    .to_string();
+                if settings.output_folder == downloads_clipsta {
+                    let videos_clipsta = dirs::video_dir()
+                        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
+                        .join("Clipsta")
+                        .to_string_lossy()
+                        .to_string();
+                    store.set_field("outputFolder", serde_json::Value::String(videos_clipsta));
+                }
+            }
+
             // Ensure output folder exists
             let settings = store.get();
             if !settings.output_folder.is_empty() {
@@ -215,7 +234,34 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            // Show a native error dialog so users see something instead of a silent crash
+            let msg = format!(
+                "Clipsta failed to start:\n{}\n\n\
+                Possible fixes:\n\
+                • Install Microsoft Edge WebView2 Runtime\n\
+                • Update your GPU drivers\n\
+                • Restart your PC",
+                e
+            );
+            eprintln!("{}", msg);
+            // Use Windows MessageBox for fatal errors (no Tauri window available)
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                let wide_msg: Vec<u16> = std::ffi::OsStr::new(&msg).encode_wide().chain(std::iter::once(0)).collect();
+                let wide_title: Vec<u16> = std::ffi::OsStr::new("Clipsta - Startup Error").encode_wide().chain(std::iter::once(0)).collect();
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                        None,
+                        windows::core::PCWSTR(wide_msg.as_ptr()),
+                        windows::core::PCWSTR(wide_title.as_ptr()),
+                        windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                    );
+                }
+            }
+            std::process::exit(1);
+        });
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {

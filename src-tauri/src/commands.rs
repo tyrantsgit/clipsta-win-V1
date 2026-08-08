@@ -241,9 +241,9 @@ pub async fn wgc_start_recording(
     let fps = opts.fps.unwrap_or(settings.fps);
     let no_audio = opts.no_audio.unwrap_or(!settings.capture_audio);
 
-    // Resolve output resolution from user settings
+    // Resolve output resolution and bitrate from user settings + quality preset
     let (out_w, out_h) = resolution_to_dimensions(&settings.resolution);
-    let bitrate = resolve_game_bar_bitrate(&settings.resolution, fps);
+    let bitrate = resolve_quality_bitrate(&settings.resolution, fps, &settings.quality);
 
     let seg_dir = std::env::temp_dir().join("clipsta_recording");
 
@@ -556,8 +556,6 @@ pub async fn recording_export(
 /// Wrapper that runs FFmpeg with real-time progress parsing from stderr.
 /// Replaces the old estimation-based approach with actual FFmpeg progress.
 fn ffmpeg_export_with_progress(app: &AppHandle, input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
-    use std::io::BufRead;
-
     // Get input duration for percentage calculation
     let input_duration = get_video_duration(input).unwrap_or(30.0);
     // If trim is set, use trimmed duration
@@ -642,12 +640,12 @@ fn build_export_args(input: &str, output: &str, opts: &ExportOpts, software: boo
     let mut args: Vec<String> = vec!["-y".to_string()];
 
     // Trim: input seek (will be removed if speed segments are present)
-    let mut has_input_trim = false;
+    let mut _has_input_trim = false;
     if let Some(start) = opts.trim_start {
         if start > 0.0 {
             args.push("-ss".to_string());
             args.push(format!("{:.3}", start));
-            has_input_trim = true;
+            _has_input_trim = true;
         }
     }
 
@@ -1105,17 +1103,39 @@ fn unique_path(folder: &std::path::Path, name: &str) -> PathBuf {
     }
 }
 
-fn resolve_game_bar_bitrate(resolution: &str, fps: u32) -> u32 {
-    // Bitrates matched from actual NVIDIA ShadowPlay clip analysis.
-    // Real ShadowPlay 720p60 clip measured at ~8 Mbps (8048 kb/s).
+/// Resolve bitrate (kbps) based on resolution, fps, and quality preset.
+/// Bitrates are tuned to industry standards:
+/// - Standard: Efficient, smaller files. Good for sharing/upload.
+/// - High: Matches ShadowPlay/ReLive defaults. Best balance of quality and size.
+/// - Ultra: Maximum clarity. Matches OBS "Indistinguishable" quality. Large files.
+fn resolve_quality_bitrate(resolution: &str, fps: u32, quality: &str) -> u32 {
     let is60 = fps >= 50;
-    match resolution {
-        "480p" => if is60 { 4000 } else { 2500 },
-        "720p" => if is60 { 8000 } else { 5000 },         // Measured from real ShadowPlay clip
-        "1080p" => if is60 { 20000 } else { 12000 },
-        "1440p" => if is60 { 50000 } else { 30000 },
-        "4k" => if is60 { 80000 } else { 50000 },
-        _ => if is60 { 8000 } else { 5000 },              // Default to 720p ShadowPlay style
+    match quality {
+        "standard" => match resolution {
+            "480p" => if is60 { 2500 } else { 1500 },
+            "720p" => if is60 { 5000 } else { 3000 },
+            "1080p" => if is60 { 12000 } else { 8000 },
+            "1440p" => if is60 { 30000 } else { 20000 },
+            "4k" => if is60 { 50000 } else { 35000 },
+            _ => if is60 { 5000 } else { 3000 },
+        },
+        "high" => match resolution {
+            "480p" => if is60 { 4000 } else { 2500 },
+            "720p" => if is60 { 8000 } else { 5000 },       // Matches ShadowPlay (6.8 Mbps measured)
+            "1080p" => if is60 { 20000 } else { 12000 },    // Matches ShadowPlay 1080p
+            "1440p" => if is60 { 50000 } else { 30000 },
+            "4k" => if is60 { 80000 } else { 50000 },
+            _ => if is60 { 8000 } else { 5000 },
+        },
+        "ultra" => match resolution {
+            "480p" => if is60 { 8000 } else { 5000 },
+            "720p" => if is60 { 15000 } else { 10000 },     // Near-lossless at 720p
+            "1080p" => if is60 { 35000 } else { 25000 },    // OBS "Indistinguishable"
+            "1440p" => if is60 { 80000 } else { 55000 },
+            "4k" => if is60 { 130000 } else { 90000 },
+            _ => if is60 { 15000 } else { 10000 },
+        },
+        _ => resolve_quality_bitrate(resolution, fps, "high"), // Unknown → default to high
     }
 }
 

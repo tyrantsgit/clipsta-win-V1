@@ -28,7 +28,7 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["$VIDEO/**", "$DOWNLOAD/**", "$APPDATA/**", "$TEMP/**"]
       },
       "csp": "default-src 'self' 'unsafe-inline' asset: http://asset.localhost; connect-src 'self' https://clipsta-api.godson594.workers.dev https://*.cloudflarestream.com https://*.videodelivery.net; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' blob: data: asset: http://asset.localhost; font-src 'self' data:"
     }

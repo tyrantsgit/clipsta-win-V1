@@ -13,6 +13,7 @@ export const DEFAULTS: AppSettings = {
 	fps: 60,
 	aspectRatio: "16:9",
 	encoder: "auto",
+	quality: "high",
 	bitrate: 20000,
 	audioBitrate: 192,
 	captureAudio: true,

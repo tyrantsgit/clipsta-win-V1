@@ -138,8 +138,8 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
 						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
-						<NumberField label="Video Bitrate (kbps)" value={local.bitrate} onChange={(v) => update("bitrate", v)} min={1000} max={100000} step={1000} />
-						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "180", "300"]} display={(v) => v === "60" ? "1 minute" : v === "300" ? "5 minutes" : `${v}s`} />
+						<SelectField label="Clip Quality" value={local.quality} onChange={(v) => update("quality", v)} options={["standard", "high", "ultra"]} display={(v) => v === "standard" ? "Standard (Smaller files)" : v === "high" ? "High (Recommended)" : v === "ultra" ? "Ultra (Maximum clarity)" : v} />
+						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "180", "300"]} display={(v) => v === "60" ? "1 minute" : v === "300" ? "5 minutes" : v === "120" ? "2 minutes" : v === "180" ? "3 minutes" : `${v}s`} />
 					</div>
 				</Section>
 

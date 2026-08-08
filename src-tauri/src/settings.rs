@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Full settings schema matching the Electron version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub output_folder: String,
     pub hotkey_clip30_sec: String,
@@ -20,6 +20,7 @@ pub struct AppSettings {
     pub fps: u32,
     pub aspect_ratio: String,
     pub encoder: String,
+    pub quality: String,
     pub bitrate: u32,
     pub audio_bitrate: u32,
     pub capture_audio: bool,
@@ -44,7 +45,7 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let output = dirs::download_dir()
+        let output = dirs::video_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
             .join("Clipsta");
         Self {
@@ -58,6 +59,7 @@ impl Default for AppSettings {
             fps: 60,
             aspect_ratio: "16:9".to_string(),
             encoder: "auto".to_string(),
+            quality: "high".to_string(),
             bitrate: 8000,
             audio_bitrate: 192,
             capture_audio: true,
@@ -169,6 +171,8 @@ impl SettingsStore {
             // Atomic write: write to temp file then rename (crash-safe)
             let tmp = self.path.with_extension("json.tmp");
             if std::fs::write(&tmp, &json).is_ok() {
+                // On Windows, rename fails if destination exists — remove it first
+                let _ = std::fs::remove_file(&self.path);
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
