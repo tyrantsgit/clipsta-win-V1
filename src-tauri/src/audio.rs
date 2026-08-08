@@ -144,6 +144,10 @@ impl WasapiCapture {
             // Max deficit per 10ms at 48kHz = ~480 frames = 960 stereo samples.
             // Allocate 2x headroom.
             let mut silence_buf: Vec<f32> = vec![0f32; 2048];
+            // Pre-allocated conversion buffers: avoids 100+ heap allocations/sec.
+            // Reused every iteration — only grows, never shrinks (max ~960 stereo samples per packet).
+            let mut conv_buf: Vec<f32> = Vec::with_capacity(2048);
+            let mut mic_conv_buf: Vec<f32> = Vec::with_capacity(2048);
             let mut total_audio_frames_written: u64 = 0;
             let loop_start = std::time::Instant::now();
 
@@ -175,17 +179,20 @@ impl WasapiCapture {
                             let silent = (flags & 0x2) != 0;
                             let raw =
                                 std::slice::from_raw_parts(ptr_raw, frames as usize * bpf);
-                            let mut samples = if silent {
-                                vec![0f32; frames as usize * 2]
+                            // Reuse conv_buf to avoid per-packet heap allocation
+                            conv_buf.clear();
+                            if silent {
+                                conv_buf.resize(frames as usize * 2, 0f32);
                             } else {
-                                to_f32_stereo(
+                                to_f32_stereo_into(
                                     raw,
                                     frames as usize,
                                     fmt.channels,
                                     bps,
                                     fmt.is_float,
-                                )
-                            };
+                                    &mut conv_buf,
+                                );
+                            }
 
                             // Mix mic if available
                             if let (Some(ref mc_cap), Some(mic_f)) = (&mic_capture, mic_fmt) {
@@ -214,28 +221,31 @@ impl WasapiCapture {
                                             mp_raw,
                                             mf as usize * mic_bpf,
                                         );
-                                        let mic_samples = if msilent {
-                                            vec![0f32; mf as usize * 2]
+                                        // Reuse mic_conv_buf to avoid per-packet heap allocation
+                                        mic_conv_buf.clear();
+                                        if msilent {
+                                            mic_conv_buf.resize(mf as usize * 2, 0f32);
                                         } else {
-                                            to_f32_stereo(
+                                            to_f32_stereo_into(
                                                 mraw,
                                                 mf as usize,
                                                 mic_f.channels,
                                                 mic_bps_val,
                                                 mic_f.is_float,
-                                            )
-                                        };
-                                        let mix_len = samples.len().min(mic_samples.len());
+                                                &mut mic_conv_buf,
+                                            );
+                                        }
+                                        let mix_len = conv_buf.len().min(mic_conv_buf.len());
                                         for i in 0..mix_len {
-                                            samples[i] =
-                                                (samples[i] + mic_samples[i]).clamp(-1.0, 1.0);
+                                            conv_buf[i] =
+                                                (conv_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
                                         }
                                     }
                                     let _ = mc_cap.ReleaseBuffer(mf);
                                 }
                             }
 
-                            callback(&samples);
+                            callback(&conv_buf);
                             total_audio_frames_written += frames as u64;
                         }
                         let _ = lb_capture.ReleaseBuffer(frames);
@@ -272,10 +282,11 @@ impl WasapiCapture {
                                     let msilent = (mflags & 0x2) != 0;
                                     if !msilent {
                                         let mraw = std::slice::from_raw_parts(mp_raw, mf as usize * mic_bpf);
-                                        let mic_samples = to_f32_stereo(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float);
-                                        let mix_len = (needed).min(mic_samples.len());
+                                        mic_conv_buf.clear();
+                                        to_f32_stereo_into(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float, &mut mic_conv_buf);
+                                        let mix_len = (needed).min(mic_conv_buf.len());
                                         for i in 0..mix_len {
-                                            silence_buf[i] = (silence_buf[i] + mic_samples[i]).clamp(-1.0, 1.0);
+                                            silence_buf[i] = (silence_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
                                         }
                                     }
                                 }
@@ -467,6 +478,15 @@ impl WasapiCapture {
 
 fn to_f32_stereo(data: &[u8], frames: usize, ch: usize, bps: usize, float: bool) -> Vec<f32> {
     let mut out = Vec::with_capacity(frames * 2);
+    to_f32_stereo_into(data, frames, ch, bps, float, &mut out);
+    out
+}
+
+/// Convert PCM data to f32 stereo, writing into a pre-allocated buffer.
+/// This avoids heap allocation on the hot path (called 100+ times/sec).
+fn to_f32_stereo_into(data: &[u8], frames: usize, ch: usize, bps: usize, float: bool, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(frames * 2);
     let bpf = ch * bps;
     for f in 0..frames {
         let b = f * bpf;
@@ -484,7 +504,6 @@ fn to_f32_stereo(data: &[u8], frames: usize, ch: usize, bps: usize, float: bool)
         out.push(l);
         out.push(r);
     }
-    out
 }
 
 fn read_sample(d: &[u8], bps: usize, float: bool) -> f32 {

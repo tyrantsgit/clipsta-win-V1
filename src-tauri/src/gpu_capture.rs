@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -1913,10 +1913,10 @@ fn run_gpu_capture(
     let last_sent_idx = Arc::new(AtomicUsize::new(usize::MAX));
 
     // Frame pacing: enforce target fps even when WGC delivers faster.
-    // Stores last accepted frame time in 100ns units (AtomicI64 via two AtomicU32s).
+    // AtomicI64 avoids mutex overhead on the hot path (60+ times/sec).
     // When game runs at >60fps, WGC may still deliver excess frames despite
     // SetMinUpdateInterval (which is advisory). This enforces the cap.
-    let last_accepted_ns = Arc::new(parking_lot::Mutex::new(0i64));
+    let last_accepted_ns = Arc::new(AtomicI64::new(0));
 
     // Frame arrived callback — MUST NOT BLOCK
     let stop_cb = stop.clone();
@@ -2004,12 +2004,12 @@ fn run_gpu_capture(
             // accommodate natural jitter without dropping legitimate frames.
             let min_interval = (10_000_000i64 / fps as i64) * 80 / 100; // 80% of 16.6ms = 13.3ms
             {
-                let mut last = last_accepted_ns_cb.lock();
-                if pts_100ns - *last < min_interval && *last != 0 {
+                let last = last_accepted_ns_cb.load(Ordering::Relaxed);
+                if pts_100ns - last < min_interval && last != 0 {
                     // Too soon — skip this frame entirely (no VP, no encode)
                     return Ok(());
                 }
-                *last = pts_100ns;
+                last_accepted_ns_cb.store(pts_100ns, Ordering::Relaxed);
             }
 
             let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
