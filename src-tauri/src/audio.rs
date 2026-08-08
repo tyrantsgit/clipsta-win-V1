@@ -248,6 +248,8 @@ impl WasapiCapture {
                 let expected_frames = elapsed_ms * fmt.sample_rate as u64 / 1000;
                 if expected_frames > total_audio_frames_written {
                     let deficit = (expected_frames - total_audio_frames_written) as usize;
+                    // Cap deficit to 1 second of audio (prevents unbounded allocation after sleep/wake)
+                    let deficit = deficit.min(fmt.sample_rate as usize);
                     if deficit > 0 {
                         let needed = deficit * 2;
                         if silence_buf.len() < needed {

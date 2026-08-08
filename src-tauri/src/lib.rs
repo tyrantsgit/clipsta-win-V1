@@ -84,6 +84,7 @@ pub fn run() {
             commands::clips_import_folder,
             // Recording
             commands::wgc_sources,
+            commands::wgc_capture_diagnostics,
             commands::wgc_start_recording,
             commands::wgc_stop_recording,
             commands::wgc_save_clip,

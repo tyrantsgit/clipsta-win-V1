@@ -164,7 +164,12 @@ pub async fn clips_import(
         .to_string_lossy()
         .to_string();
     let dest = unique_path(&folder, &name);
-    std::fs::copy(&source_path, &dest).map_err(|e| e.to_string())?;
+    let dest_clone = dest.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::copy(&source_path, &dest_clone).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("import task failed: {}", e))??;
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -174,25 +179,29 @@ pub async fn clips_import_folder(
     store: State<'_, SettingsStore>,
 ) -> Result<Vec<String>, String> {
     let folder = ensure_output_folder(&store);
-    let entries = std::fs::read_dir(&source_folder).map_err(|e| e.to_string())?;
-    let mut imported = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
-            continue;
+    tokio::task::spawn_blocking(move || {
+        let entries = std::fs::read_dir(&source_folder).map_err(|e| e.to_string())?;
+        let mut imported = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let dest = unique_path(&folder, &name);
+            if std::fs::copy(&path, &dest).is_ok() {
+                imported.push(dest.to_string_lossy().to_string());
+            }
         }
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let dest = unique_path(&folder, &name);
-        if std::fs::copy(&path, &dest).is_ok() {
-            imported.push(dest.to_string_lossy().to_string());
-        }
-    }
-    Ok(imported)
+        Ok(imported)
+    })
+    .await
+    .map_err(|e| format!("import folder task failed: {}", e))?
 }
 
 
@@ -215,6 +224,12 @@ pub async fn wgc_sources() -> Result<Vec<SourceInfo>, String> {
 }
 
 #[tauri::command]
+pub async fn wgc_capture_diagnostics() -> Result<crate::gpu_capture::CaptureDiagnostics, String> {
+    ensure_com();
+    Ok(crate::gpu_capture::capture_diagnostics())
+}
+
+#[tauri::command]
 pub async fn wgc_start_recording(
     app: AppHandle,
     session: State<'_, CaptureSession>,
@@ -226,10 +241,9 @@ pub async fn wgc_start_recording(
     let fps = opts.fps.unwrap_or(settings.fps);
     let no_audio = opts.no_audio.unwrap_or(!settings.capture_audio);
 
-    let target_w = None; // GPU capture operates at native screen resolution
-    let target_h = None; // Scaling happens at export time if needed
-
-    let bitrate = resolve_game_bar_bitrate("720p", fps); // Capture always outputs 720p
+    // Resolve output resolution from user settings
+    let (out_w, out_h) = resolution_to_dimensions(&settings.resolution);
+    let bitrate = resolve_game_bar_bitrate(&settings.resolution, fps);
 
     let seg_dir = std::env::temp_dir().join("clipsta_recording");
 
@@ -244,8 +258,8 @@ pub async fn wgc_start_recording(
         no_audio,
         mic_device: opts.mic_device,
         loopback_device: opts.loopback_device,
-        target_width: target_w,
-        target_height: target_h,
+        target_width: Some(out_w),
+        target_height: Some(out_h),
         bitrate_kbps: bitrate,
         segment_duration: 3,
         buffer_duration: settings.buffer_duration,
@@ -1102,6 +1116,19 @@ fn resolve_game_bar_bitrate(resolution: &str, fps: u32) -> u32 {
         "1440p" => if is60 { 50000 } else { 30000 },
         "4k" => if is60 { 80000 } else { 50000 },
         _ => if is60 { 8000 } else { 5000 },              // Default to 720p ShadowPlay style
+    }
+}
+
+/// Convert a resolution string to (width, height) dimensions.
+/// All values are 16-pixel aligned for hardware encoder compatibility.
+fn resolution_to_dimensions(resolution: &str) -> (u32, u32) {
+    match resolution {
+        "480p" => (854, 480),     // 16:9, height 16-aligned
+        "720p" => (1280, 720),    // 16:9, both 16-aligned
+        "1080p" => (1920, 1080),  // 16:9, width 16-aligned, height 8-aligned (OK for H.264)
+        "1440p" => (2560, 1440),  // 16:9, both 16-aligned
+        "4k" => (3840, 2160),     // 16:9, both 16-aligned
+        _ => (1280, 720),         // Default to 720p
     }
 }
 

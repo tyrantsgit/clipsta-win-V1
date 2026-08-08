@@ -241,6 +241,11 @@ async fn poll_loop(
                         state.seen_files.insert(path.clone());
                         state.pending_files.remove(&path);
                         state.files_detected += 1;
+
+                        // Evict stale entries when seen_files grows too large
+                        if state.seen_files.len() > 10_000 {
+                            state.seen_files.retain(|p| p.exists());
+                        }
                     }
                 }
             }

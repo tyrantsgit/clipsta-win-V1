@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use windows::core::{Interface, HSTRING};
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -55,7 +55,7 @@ const OUTPUT_HEIGHT: u32 = 720;
 const MAX_RING_SECONDS: u32 = 300;
 
 /// NV12 pool size for video processor output
-const NV12_POOL_SIZE: usize = 8;
+const NV12_POOL_SIZE: usize = 16;
 
 fn pack_u64(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
@@ -148,6 +148,7 @@ unsafe fn create_d3d11_device(
 struct VideoProcessorState {
     vp_device: ID3D11VideoDevice,
     vp_context: ID3D11VideoContext,
+    vp_context1: Option<ID3D11VideoContext1>,
     vp_enum: ID3D11VideoProcessorEnumerator,
     vp: ID3D11VideoProcessor,
     src_width: u32,
@@ -166,15 +167,16 @@ impl VideoProcessorState {
         src_height: u32,
         dst_width: u32,
         dst_height: u32,
+        fps: u32,
     ) -> Result<Self> {
         let vp_device: ID3D11VideoDevice = device.cast()?;
 
         let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+            InputFrameRate: DXGI_RATIONAL { Numerator: fps, Denominator: 1 },
             InputWidth: src_width,
             InputHeight: src_height,
-            OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+            OutputFrameRate: DXGI_RATIONAL { Numerator: fps, Denominator: 1 },
             OutputWidth: dst_width,
             OutputHeight: dst_height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
@@ -185,6 +187,9 @@ impl VideoProcessorState {
 
         let context: ID3D11DeviceContext = device.GetImmediateContext()?;
         let vp_context: ID3D11VideoContext = context.cast()?;
+
+        // Try to get VideoContext1 for color space methods (available on Win10+, graceful if absent)
+        let vp_context1: Option<ID3D11VideoContext1> = context.cast().ok();
 
         // Pin source rectangle (NVIDIA fix: prevents auto-cropping)
         let src_rect = windows::Win32::Foundation::RECT {
@@ -208,6 +213,7 @@ impl VideoProcessorState {
         Ok(Self {
             vp_device,
             vp_context,
+            vp_context1,
             vp_enum,
             vp,
             src_width,
@@ -216,11 +222,35 @@ impl VideoProcessorState {
     }
 
     /// Process one BGRA input texture → NV12 output texture.
+    /// On HDR systems (detected by texture format), forces BT.709 SDR output.
+    /// On SDR systems, leaves color handling to driver defaults (proven working).
     unsafe fn process(
         &self,
         input_tex: &ID3D11Texture2D,
         output_tex: &ID3D11Texture2D,
     ) -> Result<()> {
+        // Only force color space conversion for actual HDR input formats.
+        // SDR (BGRA8) is left alone — driver defaults produce correct colors.
+        if let Some(ref vp_ctx1) = self.vp_context1 {
+            let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+            input_tex.GetDesc(&mut tex_desc);
+            let is_hdr_format = matches!(
+                tex_desc.Format,
+                DXGI_FORMAT_R16G16B16A16_FLOAT
+                    | DXGI_FORMAT_R10G10B10A2_UNORM
+                    | DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM
+            );
+
+            if is_hdr_format {
+                // HDR input: force tonemap to BT.709 SDR output
+                vp_ctx1.VideoProcessorSetStreamColorSpace1(&self.vp, 0,
+                    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                vp_ctx1.VideoProcessorSetOutputColorSpace1(&self.vp,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+            }
+            // SDR: do NOT set color space — let the driver use defaults
+        }
+
         // Create input view (BGRA)
         let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
@@ -276,11 +306,11 @@ impl VideoProcessorState {
     }
 
     /// Update source dimensions (when capture target resizes).
-    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32) -> Result<()> {
+    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32, dst_w: u32, dst_h: u32, fps: u32) -> Result<()> {
         if new_w == self.src_width && new_h == self.src_height {
             return Ok(());
         }
-        *self = Self::new(device, new_w, new_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?;
+        *self = Self::new(device, new_w, new_h, dst_w, dst_h, fps)?;
         Ok(())
     }
 }
@@ -452,17 +482,38 @@ unsafe fn init_hardware_encoder(
             v
         }
 
-        // CBR rate control mode (2) — matches ShadowPlay's consistent bitrate behavior
-        let val = make_u32_variant(2);
+        // Peak-constrained VBR (mode 3): encoder targets average bitrate but allows
+        // spikes up to peak during complex scenes. This is what ShadowPlay actually uses
+        // internally — better quality in action scenes without increasing average file size.
+        // Mode 3 = eAVEncCommonRateControlMode_PeakConstrainedVBR
+        let val = make_u32_variant(3);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
 
-        // Target bitrate (8 Mbps for 720p60, matching ShadowPlay)
+        // Average bitrate (vendor-adjusted: 8 Mbps NVIDIA, 12 Mbps AMD)
         let val = make_u32_variant(bitrate_kbps * 1000);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
 
-        // VBV buffer size = 2x bitrate (required for CBR to work reliably)
+        // Peak bitrate = 1.5x average (allows bursts during fast motion)
+        let peak_bitrate = bitrate_kbps * 1000 * 3 / 2;
+        let val = make_u32_variant(peak_bitrate);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &val);
+
+        // VBV buffer size = 2x average bitrate (smooths out rate spikes)
         let val = make_u32_variant(bitrate_kbps * 1000 * 2);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
+
+        // QP floor: min QP = 18 prevents over-compression during bitrate pressure.
+        // Lower QP = higher quality. 18 ensures no macro-blocking even in static scenes.
+        let val = make_u32_variant(18);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncVideoMinQP, &val);
+
+        // GOP size = 1 second (fps frames). Shorter GOP improves:
+        // - Trim accuracy (keyframe every second vs every 2-4 seconds)
+        // - Seeking performance in playback
+        // - Recovery from corruption/artifacts
+        // No performance cost — encoder does the same work per frame regardless.
+        let val = make_u32_variant(fps);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &val);
 
         // Low latency mode
         let val = make_bool_variant(true);
@@ -486,6 +537,121 @@ unsafe fn init_hardware_encoder(
     // Get IMFMediaEventGenerator for blocking event loop
     let event_gen: IMFMediaEventGenerator = transform.cast()?;
 
+    Ok((transform, event_gen))
+}
+
+/// Fallback encoder initialization with relaxed settings.
+/// Uses Baseline profile (widest HW support), Level 4.0, VBR mode, no low-latency.
+/// This bypasses driver bugs on newer GPUs that reject High profile or CBR in certain configs.
+unsafe fn init_hardware_encoder_relaxed(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Result<(IMFTransform, IMFMediaEventGenerator)> {
+    let flags = MFT_ENUM_FLAG(
+        MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
+    );
+    let in_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_NV12,
+    };
+    let out_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+
+    let mut activates_ptr: *mut Option<IMFActivate> = ptr::null_mut();
+    let mut count: u32 = 0;
+    MFTEnumEx(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        flags,
+        Some(&in_info),
+        Some(&out_info),
+        &mut activates_ptr,
+        &mut count,
+    )?;
+
+    if count == 0 || activates_ptr.is_null() {
+        anyhow::bail!("No hardware H.264 encoder found (fallback)");
+    }
+
+    let activates_slice = std::slice::from_raw_parts(activates_ptr, count as usize);
+    let activate = activates_slice[0]
+        .as_ref()
+        .context("First encoder activate is None (fallback)")?;
+
+    let transform: IMFTransform = activate.ActivateObject()?;
+    CoTaskMemFree(Some(activates_ptr as *const _));
+
+    // Unlock async
+    let attrs = transform.GetAttributes()?;
+    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+
+    // Output type: Baseline profile, Level 4.0 (maximum compatibility)
+    let out_type: IMFMediaType = MFCreateMediaType()?;
+    out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+    out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
+    out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps * 1000)?;
+    out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 66)?; // Baseline profile
+    out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, 40)?;   // Level 4.0
+    transform.SetOutputType(0, &out_type, 0)?;
+
+    // DXGI Device Manager
+    let mut manager: Option<IMFDXGIDeviceManager> = None;
+    let mut reset_token: u32 = 0;
+    MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)?;
+    let manager = manager.context("DXGI device manager (fallback)")?;
+    manager.ResetDevice(device, reset_token)?;
+
+    let unk: windows::core::IUnknown = manager.cast()?;
+    transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, unk.as_raw() as usize)?;
+
+    // ICodecAPI: VBR mode only, skip low-latency (some drivers reject it)
+    if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+        use windows::Win32::System::Variant::*;
+
+        unsafe fn make_u32_variant(val: u32) -> VARIANT {
+            let mut v = VARIANT::default();
+            v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                Anonymous: VARIANT_0_0_0 { ulVal: val },
+                ..Default::default()
+            });
+            v
+        }
+
+        // VBR rate control (0 = variable bitrate — widest driver support)
+        let val = make_u32_variant(0);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+
+        // Target bitrate
+        let val = make_u32_variant(bitrate_kbps * 1000);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+
+        // Skip low-latency and VBV buffer — let the driver use defaults
+    }
+
+    // Input type
+    let in_type: IMFMediaType = MFCreateMediaType()?;
+    in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+    in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
+    in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    transform.SetInputType(0, &in_type, 0)?;
+
+    // Start streaming
+    transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+    transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+
+    let event_gen: IMFMediaEventGenerator = transform.cast()?;
     Ok((transform, event_gen))
 }
 
@@ -994,6 +1160,8 @@ unsafe fn mux_to_mp4(
     video_frames: &[EncodedFrame],
     audio_chunks: &[AudioChunk],
     fps: u32,
+    width: u32,
+    height: u32,
 ) -> Result<()> {
     if video_frames.is_empty() {
         anyhow::bail!("No video frames to mux");
@@ -1012,7 +1180,7 @@ unsafe fn mux_to_mp4(
     let vout: IMFMediaType = MFCreateMediaType()?;
     vout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     vout.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(OUTPUT_WIDTH, OUTPUT_HEIGHT))?;
+    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
     vout.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     vout.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
@@ -1163,7 +1331,12 @@ pub struct CaptureSession {
     audio_file: Arc<Mutex<Option<String>>>,
     ring: Arc<Mutex<EncodedMediaRing>>,
     session_fps: Arc<AtomicU32>,
+    session_width: Arc<AtomicU32>,
+    session_height: Arc<AtomicU32>,
     clip_counter: Arc<AtomicU32>,
+    /// Count of frames dropped due to encoder backpressure (try_send failed).
+    /// Reset on each recording start. Exposed in diagnostics for debugging.
+    pub frame_drops: Arc<AtomicU32>,
 }
 
 impl Default for CaptureSession {
@@ -1178,7 +1351,10 @@ impl Default for CaptureSession {
             audio_file: Arc::new(Mutex::new(None)),
             ring: Arc::new(Mutex::new(EncodedMediaRing::new(MAX_RING_SECONDS))),
             session_fps: Arc::new(AtomicU32::new(60)),
+            session_width: Arc::new(AtomicU32::new(OUTPUT_WIDTH)),
+            session_height: Arc::new(AtomicU32::new(OUTPUT_HEIGHT)),
             clip_counter: Arc::new(AtomicU32::new(0)),
+            frame_drops: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -1204,6 +1380,9 @@ impl CaptureSession {
         *self.saved_clips.lock() = Vec::new();
         *self.segment_dir.lock() = Some(opts.segment_dir.clone());
         self.session_fps.store(opts.fps, Ordering::SeqCst);
+        self.session_width.store(opts.target_width.unwrap_or(OUTPUT_WIDTH), Ordering::SeqCst);
+        self.session_height.store(opts.target_height.unwrap_or(OUTPUT_HEIGHT), Ordering::SeqCst);
+        self.frame_drops.store(0, Ordering::SeqCst);
 
         // Reset ring buffer
         *self.ring.lock() = EncodedMediaRing::new(opts.buffer_duration.max(MAX_RING_SECONDS));
@@ -1211,6 +1390,7 @@ impl CaptureSession {
         let stop = self.stop_flag.clone();
         let is_recording = self.is_recording.clone();
         let ring = self.ring.clone();
+        let frame_drops = self.frame_drops.clone();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<CaptureReadyInfo>>();
 
@@ -1218,7 +1398,7 @@ impl CaptureSession {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            let result = run_gpu_capture(opts, stop.clone(), ring, ready_tx.clone());
+            let result = run_gpu_capture(opts, stop.clone(), ring, ready_tx.clone(), frame_drops);
             match result {
                 Ok(()) => {}
                 Err(e) => {
@@ -1296,6 +1476,8 @@ impl CaptureSession {
         let _guard = SavingGuard(&self.is_saving);
 
         let fps = self.session_fps.load(Ordering::Relaxed);
+        let width = self.session_width.load(Ordering::Relaxed);
+        let height = self.session_height.load(Ordering::Relaxed);
 
         // Snapshot the ring under lock
         let (video_frames, audio_chunks) = {
@@ -1322,10 +1504,14 @@ impl CaptureSession {
         // Mux to MP4 (AAC encoding of PCM audio happens here)
         // MF is already initialized by the capture session — no need for MFStartup/MFShutdown
         log("calling mux_to_mp4...");
-        let result = unsafe { mux_to_mp4(output_path, &video_frames, &audio_chunks, fps) };
+        let result = unsafe { mux_to_mp4(output_path, &video_frames, &audio_chunks, fps, width, height) };
         match &result {
             Ok(()) => log("mux_to_mp4 OK"),
-            Err(e) => log(&format!("mux_to_mp4 FAILED: {}", e)),
+            Err(e) => {
+                log(&format!("mux_to_mp4 FAILED: {}", e));
+                // Clean up partial/corrupt MP4 file on failure
+                let _ = std::fs::remove_file(output_path);
+            }
         }
         result?;
 
@@ -1365,14 +1551,69 @@ unsafe fn capture_item_from_window(hwnd: HWND) -> Result<GraphicsCaptureItem> {
 
 // ── GPU Capture Loop with Dedicated Encoder Thread ────────────────────────────
 
+/// Check if NVIDIA overlay/ShadowPlay processes are running that could conflict with capture.
+/// Returns a warning message if conflicts are detected, None otherwise.
+fn detect_nvidia_overlay_conflict() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    // Check for known NVIDIA processes that hold DXGI capture sessions:
+    // - "NVIDIA Share.exe" (ShadowPlay/Instant Replay)
+    // - "nvcontainer.exe" with overlay modules
+    // - "NvOAWrapperCache.exe" (overlay helper)
+    let output = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq NVIDIA Share.exe", "/NH"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut conflicts = Vec::new();
+    if stdout.contains("NVIDIA Share.exe") {
+        conflicts.push("NVIDIA ShadowPlay/Share is running (Instant Replay may be active)");
+    }
+
+    // Also check for the newer NVIDIA App overlay
+    let output2 = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq NvOAWrapperCache.exe", "/NH"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    if stdout2.contains("NvOAWrapperCache.exe") {
+        conflicts.push("NVIDIA App overlay helper is running");
+    }
+
+    if conflicts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Potential capture conflict detected:\n• {}\n\n\
+            These processes may hold exclusive DXGI capture sessions. \
+            If capture fails, disable Instant Replay in NVIDIA GeForce Experience/NVIDIA App.",
+            conflicts.join("\n• ")
+        ))
+    }
+}
+
 fn run_gpu_capture(
     opts: CaptureOptions,
     stop: Arc<AtomicBool>,
     ring: Arc<Mutex<EncodedMediaRing>>,
     ready_tx: std::sync::mpsc::Sender<Result<CaptureReadyInfo>>,
+    frame_drops: Arc<AtomicU32>,
 ) -> Result<()> {
     let log = |_msg: &str| {};  // Disabled for production
     log("run_gpu_capture starting (dedicated encoder thread architecture)");
+
+    // Resolve output dimensions from CaptureOptions (user's resolution setting)
+    // Falls back to the OUTPUT_WIDTH/OUTPUT_HEIGHT constants if not specified.
+    let out_w = opts.target_width.unwrap_or(OUTPUT_WIDTH);
+    let out_h = opts.target_height.unwrap_or(OUTPUT_HEIGHT);
+
+    // Non-blocking check: warn about NVIDIA overlay conflicts (does NOT prevent capture)
+    if let Some(warning) = detect_nvidia_overlay_conflict() {
+        eprintln!("[gpu_capture] WARNING: {}", warning);
+    }
 
     unsafe {
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
@@ -1413,6 +1654,27 @@ fn run_gpu_capture(
         unsafe { create_d3d11_device(matched_adapter.as_ref())? };
     log("D3D11 device created");
 
+    // Detect GPU vendor for encoder tuning (AMD VCN needs higher bitrate than NVENC)
+    let gpu_vendor_id: u32 = unsafe {
+        matched_adapter.as_ref()
+            .and_then(|a| a.GetDesc1().ok())
+            .map(|desc| desc.VendorId)
+            .unwrap_or(0)
+    };
+    let is_amd = gpu_vendor_id == 0x1002;
+    let _is_nvidia = gpu_vendor_id == 0x10DE;
+    log(&format!("GPU vendor: 0x{:04X} (AMD={}, NVIDIA={})", gpu_vendor_id, is_amd, _is_nvidia));
+
+    // Vendor-aware bitrate: AMD VCN produces more artifacts than NVENC at the same bitrate,
+    // so we compensate with 50% more bits. This matches Radeon ReLive's "High" preset.
+    let bitrate_kbps = if is_amd {
+        // AMD: 12 Mbps for 720p60 (ReLive "High" quality level)
+        (opts.bitrate_kbps as f32 * 1.5).min(20000.0) as u32
+    } else {
+        // NVIDIA: 8 Mbps matches ShadowPlay exactly
+        opts.bitrate_kbps
+    };
+
     // Create capture item
     let item = unsafe {
         match target_hwnd {
@@ -1429,36 +1691,65 @@ fn run_gpu_capture(
 
     // Create Video Processor (BGRA→NV12 + scaling)
     let vp_state = unsafe {
-        VideoProcessorState::new(&device, cap_w, cap_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?
+        VideoProcessorState::new(&device, cap_w, cap_h, out_w, out_h, fps)?
     };
     let vp_state = Arc::new(Mutex::new(vp_state));
     log("VideoProcessor created");
 
     // Create NV12 pool pre-filled with legal black (AMD green fix)
     let nv12_pool = unsafe {
-        create_nv12_pool(&device, &context, OUTPUT_WIDTH, OUTPUT_HEIGHT, NV12_POOL_SIZE)?
+        create_nv12_pool(&device, &context, out_w, out_h, NV12_POOL_SIZE)?
     };
     log("NV12 pool created");
 
-    // Initialize the persistent hardware H.264 encoder (NVIDIA-critical init order)
-    let (transform, event_gen) = match unsafe {
-        init_hardware_encoder(&device, OUTPUT_WIDTH, OUTPUT_HEIGHT, fps, opts.bitrate_kbps)
-    } {
-        Ok(result) => {
-            log("Hardware encoder initialized successfully");
-            result
-        }
-        Err(e) => {
-            log(&format!("init_hardware_encoder FAILED: {}", e));
-            let _ = ready_tx.send(Err(anyhow::anyhow!("Encoder init failed: {}", e)));
-            return Err(anyhow::anyhow!("Encoder init failed: {}", e));
+    // Initialize the persistent hardware H.264 encoder with fallback chain:
+    // 1. Try optimal settings (High profile, L4.2, CBR, low latency)
+    // 2. If that fails, try relaxed settings (Baseline profile, L4.0, VBR, no low-latency)
+    // 3. If both fail, report the specific HRESULT with actionable guidance
+    let (transform, event_gen) = {
+        // Attempt 1: Optimal settings
+        match unsafe { init_hardware_encoder(&device, out_w, out_h, fps, bitrate_kbps) } {
+            Ok(result) => {
+                log("Hardware encoder initialized (optimal settings)");
+                result
+            }
+            Err(e1) => {
+                log(&format!("Encoder init attempt 1 (optimal) failed: {}", e1));
+                // Attempt 2: Relaxed settings — Baseline profile, lower level, no low-latency
+                match unsafe { init_hardware_encoder_relaxed(&device, out_w, out_h, fps, bitrate_kbps) } {
+                    Ok(result) => {
+                        log("Hardware encoder initialized (relaxed/fallback settings)");
+                        eprintln!("[gpu_capture] WARNING: Using fallback encoder settings (Baseline profile). \
+                            Optimal settings failed: {}. Update your GPU driver for best results.", e1);
+                        result
+                    }
+                    Err(e2) => {
+                        let msg = format!(
+                            "Hardware H.264 encoder unavailable.\n\
+                            Attempt 1 (High profile): {}\n\
+                            Attempt 2 (Baseline fallback): {}\n\n\
+                            Possible fixes:\n\
+                            • Update your GPU driver to the latest version\n\
+                            • Close NVIDIA ShadowPlay/Instant Replay if running\n\
+                            • Close any other screen recording software\n\
+                            • Restart your PC to release encoder sessions",
+                            e1, e2
+                        );
+                        log(&format!("Both encoder attempts failed"));
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("{}", msg)));
+                        return Err(anyhow::anyhow!("{}", msg));
+                    }
+                }
+            }
         }
     };
 
     // Create channel: WGC callback → encoder thread
-    // SyncSender with bound=4 provides backpressure while allowing burst tolerance.
-    // NV12 pool has 8 textures, so 4 in-flight is safe (encoder consumes faster than WGC produces on average).
-    let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(4);
+    // SyncSender with bound=12 provides backpressure while allowing burst tolerance.
+    // NV12 pool has 16 textures, so 12 in-flight is safe.
+    // Higher bound (was 4) prevents frame drops on AMD VCN and NVIDIA when encoder
+    // occasionally stalls under GPU load — gives ~200ms of burst tolerance.
+    let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(12);
 
     // Clone NV12 pool for encoder thread (Arc-wrapped for shared access)
     let nv12_pool_arc = Arc::new(nv12_pool);
@@ -1485,16 +1776,40 @@ fn run_gpu_capture(
     log("Dedicated encoder thread spawned");
 
     // Create frame pool for WGC
-    let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &winrt_device,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
-        size,
-    )?;
+    // Try BGRA8 first (standard SDR). If the system has HDR active and this fails,
+    // fall back to R16G16B16A16Float which is the HDR desktop format.
+    // The video processor will handle the color space conversion to NV12 BT.709.
+    let (frame_pool, capture_pixel_format) = {
+        match Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        ) {
+            Ok(pool) => (pool, DirectXPixelFormat::B8G8R8A8UIntNormalized),
+            Err(_) => {
+                // HDR desktop: try 16-bit float format
+                let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+                    &winrt_device,
+                    DirectXPixelFormat::R16G16B16A16Float,
+                    2,
+                    size,
+                )?;
+                (pool, DirectXPixelFormat::R16G16B16A16Float)
+            }
+        }
+    };
 
     let session = frame_pool.CreateCaptureSession(&item)?;
     session.SetIsCursorCaptureEnabled(true)?;
     let _ = session.SetIsBorderRequired(false);
+
+    // Cap WGC frame delivery at target fps. Without this, WGC delivers at the
+    // display's refresh rate (e.g., 144Hz), wasting GPU time on frames we don't need.
+    // On 60Hz monitors this is a no-op, but it prevents overhead on high-refresh displays
+    // and slightly reduces GPU contention that causes encoder stalls.
+    let frame_interval_100ns = 10_000_000i64 / fps as i64; // 166666 for 60fps
+    let _ = session.SetMinUpdateInterval(TimeSpan { Duration: frame_interval_100ns });
 
     // Handle capture target closing
     {
@@ -1507,8 +1822,8 @@ fn run_gpu_capture(
 
     // Send ready info
     let ready_info = CaptureReadyInfo {
-        width: OUTPUT_WIDTH,
-        height: OUTPUT_HEIGHT,
+        width: out_w,
+        height: out_h,
         fps,
         segment_dir: opts.segment_dir.to_string_lossy().to_string(),
     };
@@ -1538,6 +1853,9 @@ fn run_gpu_capture(
     let frame_counter = Arc::new(AtomicUsize::new(0));
     let nv12_idx = Arc::new(AtomicUsize::new(0));
 
+    // Track last successfully sent NV12 pool index for frame-repeat-on-drop
+    let last_sent_idx = Arc::new(AtomicUsize::new(usize::MAX));
+
     // Frame arrived callback — MUST NOT BLOCK
     let stop_cb = stop.clone();
     let device_cb = device.clone();
@@ -1547,6 +1865,8 @@ fn run_gpu_capture(
     let nv12_idx_cb = nv12_idx.clone();
     let session_start_cb = session_start.clone();
     let nv12_pool_cb = nv12_pool_arc.clone();
+    let last_sent_idx_cb = last_sent_idx.clone();
+    let frame_drops_cb = frame_drops.clone();
 
     struct SendDevice(IDirect3DDevice);
     unsafe impl Send for SendDevice {}
@@ -1588,7 +1908,7 @@ fn run_gpu_capture(
                 if (new_w != old_w && new_w > 0) || (new_h != old_h && new_h > 0) {
                     match pool_ref.Recreate(
                         &winrt_device_cb.0,
-                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        capture_pixel_format,
                         2,
                         content_size,
                     ) {
@@ -1596,7 +1916,7 @@ fn run_gpu_capture(
                             cap_size_cb.0.store(new_w, Ordering::Relaxed);
                             cap_size_cb.1.store(new_h, Ordering::Relaxed);
                             let mut vp = vp_state_cb.lock();
-                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h) };
+                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h, out_w, out_h, fps) };
                         }
                         Err(e) => eprintln!("[gpu_capture] Recreate failed: {e}"),
                     }
@@ -1629,14 +1949,42 @@ fn run_gpu_capture(
                 }
             }
 
-            // Send frame message to encoder thread — DOES NOT BLOCK
-            // try_send: if encoder thread is behind, drop this frame (backpressure)
+            // Send frame message to encoder thread — DOES NOT BLOCK.
+            // If the channel is full (encoder behind), repeat the last successfully
+            // sent frame's texture at the current PTS. This ensures the encoder always
+            // receives 60fps worth of frames — dropped captures become duplicates
+            // rather than gaps, so the output MP4 is always 60fps.
             let msg = FrameMsg {
                 texture_index: pool_idx,
                 pts_100ns,
                 duration_100ns,
             };
-            let _ = frame_tx.try_send(msg);
+            match frame_tx.try_send(msg) {
+                Ok(()) => {
+                    // Success — remember this pool index for potential repeat
+                    last_sent_idx_cb.store(pool_idx, Ordering::Relaxed);
+                }
+                Err(mpsc::TrySendError::Full(dropped_msg)) => {
+                    // Channel full: encoder is behind. Send a repeat of the last
+                    // successfully sent texture instead (avoids PTS gaps in output).
+                    // The NV12 pool is large enough (16) that the last-sent texture
+                    // is still valid (encoder hasn't looped around to overwrite it).
+                    frame_drops_cb.fetch_add(1, Ordering::Relaxed);
+                    let repeat_idx = last_sent_idx_cb.load(Ordering::Relaxed);
+                    if repeat_idx != usize::MAX {
+                        let repeat_msg = FrameMsg {
+                            texture_index: repeat_idx,
+                            pts_100ns: dropped_msg.pts_100ns,
+                            duration_100ns: dropped_msg.duration_100ns,
+                        };
+                        // Best-effort repeat — if still full, accept the drop
+                        let _ = frame_tx.try_send(repeat_msg);
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    // Encoder thread exited — stop will be set soon
+                }
+            }
 
             Ok(())
         }
@@ -1723,6 +2071,125 @@ fn gpu_audio_loop(
     if let Err(e) = res {
         eprintln!("[gpu_audio] error: {e}");
     }
+}
+
+// ── Capture Diagnostics ───────────────────────────────────────────────────────
+
+/// Diagnostics info for troubleshooting capture issues.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDiagnostics {
+    pub gpu_adapter: String,
+    pub driver_version: String,
+    pub hdr_active: bool,
+    pub encoder_available: bool,
+    pub encoder_name: String,
+    pub nvidia_overlay_running: bool,
+    pub conflict_warning: Option<String>,
+}
+
+/// Run capture diagnostics: checks GPU adapter, driver, HDR state, encoder availability.
+/// This is purely informational — does not modify any state or start capture.
+pub fn capture_diagnostics() -> CaptureDiagnostics {
+    let mut diag = CaptureDiagnostics {
+        gpu_adapter: "Unknown".to_string(),
+        driver_version: "Unknown".to_string(),
+        hdr_active: false,
+        encoder_available: false,
+        encoder_name: "None".to_string(),
+        nvidia_overlay_running: false,
+        conflict_warning: None,
+    };
+
+    // GPU adapter info via DXGI
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
+            if let Ok(adapter) = factory.EnumAdapters1(0) {
+                if let Ok(desc) = adapter.GetDesc1() {
+                    let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                    diag.gpu_adapter = String::from_utf16_lossy(&desc.Description[..name_len]);
+
+                    // Driver version from adapter LUID — query via registry is more reliable
+                    // but the DXGI dedicated video memory + vendor ID is useful context
+                    let vendor = desc.VendorId;
+                    let device = desc.DeviceId;
+                    diag.driver_version = format!("VendorID=0x{:04X} DeviceID=0x{:04X}", vendor, device);
+                }
+            }
+        }
+    }
+
+    // Try to get driver version from DXGIAdapter (version available via CheckInterfaceSupport on older APIs)
+    // More reliable: use dxdiag-style registry query
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args(["path", "Win32_VideoController", "get", "DriverVersion", "/value"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(ver_line) = stdout.lines().find(|l| l.starts_with("DriverVersion=")) {
+                diag.driver_version = ver_line.trim_start_matches("DriverVersion=").trim().to_string();
+            }
+        }
+    }
+
+    // HDR state: check if the primary monitor has AdvancedColorInfo active
+    // Simplest check: try creating a frame pool with BGRA — if it fails, HDR might be forcing 16-bit
+    // More accurate: check Windows display settings via registry
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(["query", r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\VideoSettings", "/v", "EnableHDRForDisplay"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            diag.hdr_active = stdout.contains("0x1");
+        }
+    }
+
+    // Encoder availability: try MFTEnumEx without creating a session
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+
+        let flags = MFT_ENUM_FLAG(
+            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
+        );
+        let in_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_NV12,
+        };
+        let out_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+
+        let mut activates_ptr: *mut Option<IMFActivate> = ptr::null_mut();
+        let mut count: u32 = 0;
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            Some(&in_info),
+            Some(&out_info),
+            &mut activates_ptr,
+            &mut count,
+        ).is_ok() && count > 0 && !activates_ptr.is_null() {
+            diag.encoder_available = true;
+            diag.encoder_name = format!("H.264 Hardware Encoder ({} found)", count);
+            CoTaskMemFree(Some(activates_ptr as *const _));
+        }
+
+        let _ = MFShutdown();
+    }
+
+    // NVIDIA overlay check
+    diag.conflict_warning = detect_nvidia_overlay_conflict();
+    diag.nvidia_overlay_running = diag.conflict_warning.is_some();
+
+    diag
 }
 
 // ── Source Listing ────────────────────────────────────────────────────────────

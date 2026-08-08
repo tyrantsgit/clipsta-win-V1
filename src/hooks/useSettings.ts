@@ -30,7 +30,6 @@ export const DEFAULTS: AppSettings = {
 	deleteAfterUpload: false,
 	desktopDeviceId: "",
 	desktopAudioDeviceId: "",
-	orientation: "landscape",
 	watchFolderPath: "",
 	watchFolderEnabled: false,
 	theme: "dark" as const,

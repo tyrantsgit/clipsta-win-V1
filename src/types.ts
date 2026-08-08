@@ -26,7 +26,6 @@ export interface AppSettings {
 	deleteAfterUpload: boolean;
 	desktopDeviceId: string;
 	desktopAudioDeviceId: string;
-	orientation: string;
 	watchFolderPath: string;
 	watchFolderEnabled: boolean;
 	theme: "dark" | "oled";

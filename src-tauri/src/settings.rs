@@ -37,8 +37,6 @@ pub struct AppSettings {
     pub delete_after_upload: bool,
     pub desktop_device_id: String,
     pub desktop_audio_device_id: String,
-    /// Output orientation: "landscape" (1920x1088) or "portrait" (1088x1920)
-    pub orientation: String,
     pub watch_folder_path: String,
     pub watch_folder_enabled: bool,
     pub theme: String,
@@ -46,7 +44,7 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let output = dirs::video_dir()
+        let output = dirs::download_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
             .join("Clipsta");
         Self {
@@ -77,7 +75,6 @@ impl Default for AppSettings {
             delete_after_upload: false,
             desktop_device_id: String::new(),
             desktop_audio_device_id: String::new(),
-            orientation: "landscape".to_string(),
             watch_folder_path: String::new(),
             watch_folder_enabled: false,
             theme: "dark".to_string(),
