@@ -153,9 +153,6 @@ struct VideoProcessorState {
     vp: ID3D11VideoProcessor,
     src_width: u32,
     src_height: u32,
-    /// Pre-cached output views for NV12 pool textures (eliminates 60 D3D11 kernel calls/sec).
-    /// Indexed by pool_idx. Empty until `cache_output_views` is called.
-    cached_output_views: Vec<ID3D11VideoProcessorOutputView>,
 }
 
 unsafe impl Send for VideoProcessorState {}
@@ -221,43 +218,16 @@ impl VideoProcessorState {
             vp,
             src_width,
             src_height,
-            cached_output_views: Vec::new(),
         })
     }
 
-    /// Pre-cache output views for the NV12 pool textures.
-    /// Called once after pool creation. Eliminates CreateVideoProcessorOutputView
-    /// from the per-frame hot path (was 60 D3D11 kernel calls/sec).
-    unsafe fn cache_output_views(&mut self, nv12_pool: &[ID3D11Texture2D]) -> Result<()> {
-        self.cached_output_views.clear();
-        let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
-        };
-        for tex in nv12_pool {
-            let mut view: Option<ID3D11VideoProcessorOutputView> = None;
-            self.vp_device.CreateVideoProcessorOutputView(
-                tex,
-                &self.vp_enum,
-                &output_view_desc,
-                Some(&mut view),
-            )?;
-            self.cached_output_views.push(view.context("VP cached output view")?);
-        }
-        Ok(())
-    }
-
     /// Process one BGRA input texture → NV12 output texture.
-    /// Uses pre-cached output view when available (pool_idx provided).
     /// On HDR systems (detected by texture format), forces BT.709 SDR output.
     /// On SDR systems, leaves color handling to driver defaults (proven working).
     unsafe fn process(
         &self,
         input_tex: &ID3D11Texture2D,
         output_tex: &ID3D11Texture2D,
-        pool_idx: usize,
     ) -> Result<()> {
         // Only force color space conversion for actual HDR input formats.
         // SDR (BGRA8) is left alone — driver defaults produce correct colors.
@@ -298,27 +268,21 @@ impl VideoProcessorState {
         )?;
         let input_view = input_view.context("VP input view")?;
 
-        // Use pre-cached output view if available (avoids D3D11 kernel call per frame).
-        // Falls back to creating a fresh view if cache is empty (e.g., after resize).
-        let output_view = if pool_idx < self.cached_output_views.len() {
-            self.cached_output_views[pool_idx].clone()
-        } else {
-            // Fallback: create view on the fly (only happens before cache is populated)
-            let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                },
-            };
-            let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
-            self.vp_device.CreateVideoProcessorOutputView(
-                output_tex,
-                &self.vp_enum,
-                &output_view_desc,
-                Some(&mut output_view),
-            )?;
-            output_view.context("VP output view")?
+        // Create output view (NV12)
+        let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
         };
+        let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
+        self.vp_device.CreateVideoProcessorOutputView(
+            output_tex,
+            &self.vp_enum,
+            &output_view_desc,
+            Some(&mut output_view),
+        )?;
+        let output_view = output_view.context("VP output view")?;
 
         // Build stream data
         let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
@@ -867,10 +831,7 @@ fn encoder_thread_fn(
             }
             // METransformHaveOutput (602)
             602 => {
-                // Acquire a recycled buffer from the video pool (avoids fresh heap alloc per frame).
-                // The pool lock is brief — just pops a Vec off the free list.
-                let reuse_buf = ring.lock().video_pool.acquire();
-                if let Some(frame) = unsafe { extract_output_reuse(&transform, Some(reuse_buf)) } {
+                if let Some(frame) = unsafe { extract_output(&transform) } {
                     let is_kf = frame.is_keyframe;
                     let data_len = frame.data.len();
                     ring.lock().push_video(frame);
@@ -893,13 +854,6 @@ fn encoder_thread_fn(
 /// Extract one encoded output from the MFT (called on METransformHaveOutput).
 /// The async MFT provides its own output sample.
 unsafe fn extract_output(transform: &IMFTransform) -> Option<EncodedFrame> {
-    extract_output_reuse(transform, None)
-}
-
-/// Extract one encoded output, optionally reusing a pre-allocated buffer.
-/// When `reuse_buf` is Some, the encoded data is written into it (avoids heap alloc).
-/// When None, a fresh Vec is allocated (fallback for drain path).
-unsafe fn extract_output_reuse(transform: &IMFTransform, reuse_buf: Option<Vec<u8>>) -> Option<EncodedFrame> {
     let mut output_buffer = MFT_OUTPUT_DATA_BUFFER {
         dwStreamID: 0,
         pSample: std::mem::ManuallyDrop::new(None), // MFT provides its own sample
@@ -931,15 +885,8 @@ unsafe fn extract_output_reuse(transform: &IMFTransform, reuse_buf: Option<Vec<u
     let mut p: *mut u8 = ptr::null_mut();
     let mut len: u32 = 0;
     buf.Lock(&mut p, None, Some(&mut len)).ok()?;
-
     let data = if len > 0 && !p.is_null() {
-        let slice = std::slice::from_raw_parts(p, len as usize);
-        let mut vec = match reuse_buf {
-            Some(mut v) => { v.clear(); v }
-            None => Vec::with_capacity(len as usize),
-        };
-        vec.extend_from_slice(slice);
-        vec
+        std::slice::from_raw_parts(p, len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -1030,6 +977,7 @@ impl FrameBufferPool {
     }
 
     /// Get a buffer from the pool (reuses existing capacity) or allocate a new one.
+    #[allow(dead_code)]
     fn acquire(&mut self) -> Vec<u8> {
         self.free.pop().unwrap_or_else(|| Vec::with_capacity(4096))
     }
@@ -1058,6 +1006,7 @@ impl AudioBufferPool {
         }
     }
 
+    #[allow(dead_code)]
     fn acquire(&mut self) -> Vec<f32> {
         self.free.pop().unwrap_or_else(|| Vec::with_capacity(960))
     }
@@ -1808,12 +1757,6 @@ fn run_gpu_capture(
     };
     log("NV12 pool created");
 
-    // Pre-cache VP output views for all NV12 pool textures (eliminates 60 kernel calls/sec)
-    unsafe {
-        vp_state.lock().cache_output_views(&nv12_pool)?;
-    }
-    log("VP output views cached");
-
     // Initialize the persistent hardware H.264 encoder with fallback chain:
     // 1. Try optimal settings (High profile, L4.2, CBR, low latency)
     // 2. If that fails, try relaxed settings (Baseline profile, L4.0, VBR, no low-latency)
@@ -2037,8 +1980,6 @@ fn run_gpu_capture(
                             cap_size_cb.1.store(new_h, Ordering::Relaxed);
                             let mut vp = vp_state_cb.lock();
                             let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h, out_w, out_h, fps) };
-                            // Re-cache output views after resize (VP was recreated)
-                            let _ = unsafe { vp.cache_output_views(&nv12_pool_cb) };
                         }
                         Err(e) => eprintln!("[gpu_capture] Recreate failed: {e}"),
                     }
@@ -2082,7 +2023,7 @@ fn run_gpu_capture(
             // VideoProcessor: BGRA→NV12 + scale to 1280x720 (GPU, fast)
             {
                 let vp = vp_state_cb.lock();
-                if let Err(e) = unsafe { vp.process(&frame_texture, nv12_tex, pool_idx) } {
+                if let Err(e) = unsafe { vp.process(&frame_texture, nv12_tex) } {
                     eprintln!("[gpu_capture] VP process failed: {e}");
                     return Ok(());
                 }
@@ -2202,18 +2143,12 @@ fn gpu_audio_loop(
         let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
         let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
 
-        // Acquire a recycled buffer from the ring's audio pool (avoids fresh heap alloc).
-        // Single lock covers both pool acquire and push — no extra contention.
-        let mut ring = ring_clone.lock();
-        let mut buf = ring.audio_pool.acquire();
-        buf.clear();
-        buf.extend_from_slice(chunk);
         let audio_chunk = AudioChunk {
-            data: Arc::new(buf),
+            data: Arc::new(chunk.to_vec()),
             pts_100ns,
             duration_100ns,
         };
-        ring.push_audio(audio_chunk);
+        ring_clone.lock().push_audio(audio_chunk);
     });
 
     if let Err(e) = res {
