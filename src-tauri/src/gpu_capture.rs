@@ -1999,10 +1999,13 @@ fn run_gpu_capture(
 
             // Frame pacing: skip this frame if it arrived too soon.
             // When game runs >60fps, WGC may deliver excess frames despite
-            // SetMinUpdateInterval. We enforce the cap here to guarantee exactly
-            // 60 frames/sec reach the encoder. Allow 80% of frame interval to
-            // accommodate natural jitter without dropping legitimate frames.
-            let min_interval = (10_000_000i64 / fps as i64) * 80 / 100; // 80% of 16.6ms = 13.3ms
+            // SetMinUpdateInterval. We enforce the cap here to reject only genuine
+            // duplicates (arriving faster than 2× target fps). The 50% threshold
+            // allows natural scheduling jitter (±8ms) without dropping legitimate
+            // frames. SetMinUpdateInterval handles the primary rate limiting;
+            // this is a safety net for edge cases only.
+            // Works identically on NVIDIA and AMD — both use the same WGC path.
+            let min_interval = (10_000_000i64 / fps as i64) * 50 / 100; // 50% of 16.6ms = 8.3ms
             {
                 let last = last_accepted_ns_cb.load(Ordering::Relaxed);
                 if pts_100ns - last < min_interval && last != 0 {
