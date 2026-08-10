@@ -516,6 +516,13 @@ unsafe fn init_hardware_encoder(
         let val = make_u32_variant(fps);
         let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &val);
 
+        // Max reference frames = 3 (matches ShadowPlay). More ref frames = better
+        // motion prediction = higher quality at same bitrate. Both NVENC and AMD VCN
+        // support up to 4 ref frames in High profile. Using 3 matches ShadowPlay exactly.
+        // Silently ignored if the driver doesn't support this parameter.
+        let val = make_u32_variant(3);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncVideoMaxNumRefFrame, &val);
+
         // Low latency mode
         let val = make_bool_variant(true);
         let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &val);
