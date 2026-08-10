@@ -708,6 +708,12 @@ fn encoder_thread_fn(
     let nv12_pool = nv12_pool.0;
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // Set 1ms timer resolution for accurate recv_timeout.
+        // Windows default is 15.6ms which makes 16.67ms timeouts unreliable
+        // (may wait 31ms). With 1ms resolution, the timeout fires precisely,
+        // enabling frame duplication to maintain constant 60fps output.
+        // Both NVIDIA and AMD systems benefit — this is a Windows scheduler setting.
+        windows::Win32::Media::timeBeginPeriod(1);
     }
 
     let log = |_msg: &str| {};  // Disabled for production
@@ -857,6 +863,9 @@ fn encoder_thread_fn(
             }
         }
     }
+
+    // Restore default timer resolution
+    unsafe { windows::Win32::Media::timeEndPeriod(1); }
 }
 
 /// Extract one encoded output from the MFT (called on METransformHaveOutput).
