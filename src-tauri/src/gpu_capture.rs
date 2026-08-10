@@ -773,14 +773,13 @@ fn encoder_thread_fn(
             // METransformNeedInput (601)
             601 => {
                 // Wait for a frame from the WGC callback with a timeout.
-                // If no frame arrives within exactly one frame interval, duplicate
-                // the last frame. This guarantees constant 60fps output matching
-                // ShadowPlay, even when WGC delivers at irregular ~55fps.
-                // WGC's delivery varies due to DWM compositor scheduling — frames
-                // may arrive 14-20ms apart instead of exactly 16.67ms.
-                // Duplication fills the gaps so the output is always constant fps.
+                // If no frame arrives within 1.5× the expected interval, duplicate
+                // the last frame to maintain exactly 60fps output. This handles:
+                // - WGC missing a vsync delivery
+                // - Game stutter causing irregular frame delivery
+                // - SetMinUpdateInterval not being perfectly enforced
                 let timeout = std::time::Duration::from_micros(
-                    1_000_000u64 / fps as u64  // Exactly one frame interval = 16.67ms at 60fps
+                    (1_000_000u64 / fps as u64) * 3 / 2  // 1.5× frame interval = 25ms at 60fps
                 );
                 let msg = match rx.recv_timeout(timeout) {
                     Ok(m) => {
