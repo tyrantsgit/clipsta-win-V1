@@ -273,7 +273,13 @@ pub async fn wgc_start_recording(
         let _ = app_handle.emit("wgc:segment", &seg);
     });
 
-    let info = session.start(capture_opts, on_segment).map_err(|e| {
+    // Notify frontend if capture dies unexpectedly (GPU reset, mode switch, etc)
+    let app_died = app.clone();
+    let on_died = Some(Box::new(move |reason: String| {
+        let _ = app_died.emit("wgc:capture-lost", &reason);
+    }) as Box<dyn FnOnce(String) + Send + 'static>);
+
+    let info = session.start(capture_opts, on_segment, on_died).map_err(|e| {
         let msg = format!("Capture start failed: {}", e);
         let _ = app.emit("wgc:error", &msg);
         msg

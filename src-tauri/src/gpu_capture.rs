@@ -1430,6 +1430,7 @@ impl CaptureSession {
         &self,
         opts: CaptureOptions,
         _on_segment: Box<dyn Fn(CompletedSegment) + Send + 'static>,
+        on_died: Option<Box<dyn FnOnce(String) + Send + 'static>>,
     ) -> Result<CaptureReadyInfo> {
         if self.is_recording.load(Ordering::Relaxed) {
             anyhow::bail!("Already recording");
@@ -1461,14 +1462,23 @@ impl CaptureSession {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
             let result = run_gpu_capture(opts, stop.clone(), ring, ready_tx.clone(), frame_drops);
-            match result {
-                Ok(()) => {}
+            let error_msg = match &result {
+                Ok(()) => None,
                 Err(e) => {
                     eprintln!("[gpu_capture] pipeline error: {}", e);
                     let _ = ready_tx.send(Err(anyhow::anyhow!("{}", e)));
+                    Some(format!("{}", e))
+                }
+            };
+            // If stop was NOT requested by user, this is an unexpected death — notify frontend
+            let user_stopped = stop.load(Ordering::SeqCst);
+            is_recording.store(false, Ordering::SeqCst);
+            if !user_stopped {
+                if let Some(cb) = on_died {
+                    let reason = error_msg.unwrap_or_else(|| "Capture session ended unexpectedly".to_string());
+                    cb(reason);
                 }
             }
-            is_recording.store(false, Ordering::SeqCst);
         });
 
         let ready = ready_rx

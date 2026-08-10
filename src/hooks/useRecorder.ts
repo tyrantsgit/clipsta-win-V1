@@ -221,6 +221,37 @@ export function useRecorder(settings: AppSettings | null) {
 		};
 	}, []);
 
+	// Auto-recovery: if capture dies unexpectedly (GPU reset, mode switch, alt-tab in
+	// fullscreen exclusive), automatically restart. Caps at 3 restarts per mount to
+	// avoid crash loops. User sees brief "Restarting..." then recording resumes.
+	const autoRestartCountRef = useRef(0);
+	useEffect(() => {
+		let cancelled = false;
+		const unlistenPromise = import("@tauri-apps/api/event").then(({ listen }) =>
+			listen<string>("wgc:capture-lost", (event) => {
+				if (cancelled) return;
+				if (autoRestartCountRef.current >= 3) {
+					setState((s) => ({ ...s, status: "idle", error: "Recording stopped: " + (event.payload || "capture lost") }));
+					wgcActiveRef.current = false;
+					stopTimer();
+					return;
+				}
+				autoRestartCountRef.current++;
+				wgcActiveRef.current = false;
+				// Brief pause then restart
+				setTimeout(() => {
+					if (!cancelled && !wgcActiveRef.current) {
+						startCaptureRef.current();
+					}
+				}, 1500);
+			})
+		);
+		return () => {
+			cancelled = true;
+			unlistenPromise.then((u) => u()).catch(() => {});
+		};
+	}, []);
+
 	// Clip sound — realistic DSLR camera shutter (pooled AudioContext for performance)
 	const audioCtxRef = useRef<AudioContext | null>(null);
 	useEffect(() => {
