@@ -74,12 +74,14 @@ pub async fn clips_list(store: State<'_, SettingsStore>) -> Result<Vec<ClipFile>
     // Run the recursive filesystem scan off the async executor thread
     tokio::task::spawn_blocking(move || {
         let mut clips = Vec::new();
-        fn scan_dir(dir: &std::path::Path, clips: &mut Vec<ClipFile>) {
+        fn scan_dir(dir: &std::path::Path, clips: &mut Vec<ClipFile>, depth: u32) {
+            // Max depth of 3 prevents runaway scanning if output folder is misconfigured
+            if depth > 3 { return; }
             let Ok(entries) = std::fs::read_dir(dir) else { return };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    scan_dir(&path, clips);
+                    scan_dir(&path, clips, depth + 1);
                     continue;
                 }
                 let ext = path
@@ -108,7 +110,7 @@ pub async fn clips_list(store: State<'_, SettingsStore>) -> Result<Vec<ClipFile>
                 }
             }
         }
-        scan_dir(&folder, &mut clips);
+        scan_dir(&folder, &mut clips, 0);
         clips.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         clips
     })
@@ -1100,6 +1102,10 @@ fn unique_path(folder: &std::path::Path, name: &str) -> PathBuf {
             return candidate;
         }
         i += 1;
+        // Safety cap: prevent infinite loop if folder is unwritable/full
+        if i > 9999 {
+            return candidate;
+        }
     }
 }
 
@@ -1330,11 +1336,16 @@ pub async fn mp4_keyframes(file_path: String) -> Result<Vec<f64>, String> {
 
 #[tauri::command]
 pub async fn lossless_trim_clip(
+    store: State<'_, SettingsStore>,
     input_path: String,
     output_path: String,
     start: f64,
     end: f64,
 ) -> Result<crate::lossless_trim::TrimResult, String> {
+    // Validate both paths are within allowed directories (prevents path traversal)
+    validate_accessible_path(&input_path, &store)?;
+    validate_accessible_path(&output_path, &store)?;
+
     // First get keyframes for the input file
     let info = crate::mp4_inspect::inspect_mp4(&input_path)
         .await

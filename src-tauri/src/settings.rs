@@ -168,12 +168,21 @@ impl SettingsStore {
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            // Atomic write: write to temp file then rename (crash-safe)
+            // Safe write: write to temp, move old to .bak, rename temp to target.
+            // If crash occurs: either .bak or target will exist (never lost).
             let tmp = self.path.with_extension("json.tmp");
+            let bak = self.path.with_extension("json.bak");
             if std::fs::write(&tmp, &json).is_ok() {
-                // On Windows, rename fails if destination exists — remove it first
-                let _ = std::fs::remove_file(&self.path);
-                let _ = std::fs::rename(&tmp, &self.path);
+                // Move existing settings to .bak (preserves them until rename succeeds)
+                let _ = std::fs::rename(&self.path, &bak);
+                // Rename temp to target — if this fails, .bak still has the old data
+                if std::fs::rename(&tmp, &self.path).is_err() {
+                    // Restore from backup
+                    let _ = std::fs::rename(&bak, &self.path);
+                } else {
+                    // Success — remove backup
+                    let _ = std::fs::remove_file(&bak);
+                }
             }
         }
     }

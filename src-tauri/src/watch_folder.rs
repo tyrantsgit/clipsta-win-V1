@@ -13,7 +13,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 /// Video file extensions we monitor for.
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv"];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm"];
 
 /// How often to poll the directory (seconds).
 const POLL_INTERVAL_SECS: u64 = 5;
