@@ -21,7 +21,7 @@ use windows::Win32::Media::Audio::{
     WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -62,6 +62,23 @@ impl WasapiCapture {
     ) -> Result<()>
     where
         F: Fn(&[f32]) + Send + 'static,
+    {
+        Self::capture_to_callback_multi(stop, mic_device, loopback_device, callback, None::<Box<dyn Fn(&[f32]) + Send>>)
+    }
+
+    /// Capture audio with optional separate mic callback (for multi-track mode).
+    /// `callback` receives mixed (or desktop-only when mic_callback is Some) audio.
+    /// `mic_callback` (if Some) receives mic-only audio — and desktop callback gets desktop-only.
+    pub fn capture_to_callback_multi<F, M>(
+        stop: Arc<AtomicBool>,
+        mic_device: Option<String>,
+        loopback_device: Option<String>,
+        callback: F,
+        mic_callback: Option<M>,
+    ) -> Result<()>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+        M: Fn(&[f32]) + Send + 'static,
     {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -106,6 +123,8 @@ impl WasapiCapture {
                 lb_client.GetService().context("GetService loopback")?;
 
             let fmt = parse_format(lb_fmt);
+            // Free CoTaskMem-allocated WAVEFORMATEX (GetMixFormat allocates via CoTaskMemAlloc)
+            CoTaskMemFree(Some(lb_fmt as *const _));
             let bpf = fmt.channels * (fmt.bps / 8);
             let bps = fmt.bps / 8;
 
@@ -116,6 +135,8 @@ impl WasapiCapture {
                         match Self::init_mic(&enumerator, id) {
                             Ok((c, cap, ptr)) => {
                                 let mfmt = parse_format(ptr);
+                                // Free CoTaskMem-allocated WAVEFORMATEX from mic GetMixFormat
+                                CoTaskMemFree(Some(ptr as *const _));
                                 (Some(c), Some(cap), Some(mfmt), mfmt.channels * (mfmt.bps / 8))
                             }
                             Err(_) => (None, None, None, 0),
@@ -194,7 +215,7 @@ impl WasapiCapture {
                                 );
                             }
 
-                            // Mix mic if available
+                            // Mix mic if available (or deliver separately for multi-track)
                             if let (Some(ref mc_cap), Some(mic_f)) = (&mic_capture, mic_fmt) {
                                 let mic_bps_val = mic_f.bps / 8;
                                 loop {
@@ -235,10 +256,16 @@ impl WasapiCapture {
                                                 &mut mic_conv_buf,
                                             );
                                         }
-                                        let mix_len = conv_buf.len().min(mic_conv_buf.len());
-                                        for i in 0..mix_len {
-                                            conv_buf[i] =
-                                                (conv_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                        if let Some(ref mic_cb) = mic_callback {
+                                            // Multi-track: deliver mic separately, don't mix
+                                            mic_cb(&mic_conv_buf);
+                                        } else {
+                                            // Single-track: mix mic into desktop
+                                            let mix_len = conv_buf.len().min(mic_conv_buf.len());
+                                            for i in 0..mix_len {
+                                                conv_buf[i] =
+                                                    (conv_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                            }
                                         }
                                     }
                                     let _ = mc_cap.ReleaseBuffer(mf);
@@ -284,9 +311,15 @@ impl WasapiCapture {
                                         let mraw = std::slice::from_raw_parts(mp_raw, mf as usize * mic_bpf);
                                         mic_conv_buf.clear();
                                         to_f32_stereo_into(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float, &mut mic_conv_buf);
-                                        let mix_len = (needed).min(mic_conv_buf.len());
-                                        for i in 0..mix_len {
-                                            silence_buf[i] = (silence_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                        if let Some(ref mic_cb) = mic_callback {
+                                            // Multi-track: deliver mic separately
+                                            mic_cb(&mic_conv_buf);
+                                        } else {
+                                            // Single-track: mix into silence buffer
+                                            let mix_len = (needed).min(mic_conv_buf.len());
+                                            for i in 0..mix_len {
+                                                silence_buf[i] = (silence_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                            }
                                         }
                                     }
                                 }

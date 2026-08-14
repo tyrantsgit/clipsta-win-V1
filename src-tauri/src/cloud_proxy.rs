@@ -25,8 +25,8 @@ impl HttpClient {
 
 /// The cloud API base URL and key. The key stays here in the backend binary,
 /// which is much harder to extract than a plain JS string in a webview bundle.
-const CLOUD_API_BASE: &str = "https://clipsta-api.godson594.workers.dev";
-const CLOUD_API_KEY: &str = "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96";
+pub(crate) const CLOUD_API_BASE: &str = "https://clipsta-api.godson594.workers.dev";
+pub(crate) const CLOUD_API_KEY: &str = "32b28eac803a1b24c19e20665919eaeb7f1493d2b5e3f68be7944db6d9f01b96";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

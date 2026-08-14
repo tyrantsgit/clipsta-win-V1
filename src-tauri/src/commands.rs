@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-use crate::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment, SourceInfo};
+use crate::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment, SourceInfo, save_clip_standalone};
 use crate::settings::{AppSettings, SettingsStore};
 
 /// Initialize COM MTA on the current thread (for async command threads).
@@ -244,7 +244,11 @@ pub async fn wgc_start_recording(
     let no_audio = opts.no_audio.unwrap_or(!settings.capture_audio);
 
     // Resolve output resolution and bitrate from user settings + quality preset
-    let (out_w, out_h) = resolution_to_dimensions(&settings.resolution);
+    let dims = resolution_to_dimensions(&settings.resolution);
+    let (target_w, target_h) = match dims {
+        Some((w, h)) => (Some(w), Some(h)),
+        None => (None, None), // "native" — use source dimensions
+    };
     let bitrate = resolve_quality_bitrate(&settings.resolution, fps, &settings.quality);
 
     let seg_dir = std::env::temp_dir().join("clipsta_recording");
@@ -260,12 +264,14 @@ pub async fn wgc_start_recording(
         no_audio,
         mic_device: opts.mic_device,
         loopback_device: opts.loopback_device,
-        target_width: Some(out_w),
-        target_height: Some(out_h),
+        target_width: target_w,
+        target_height: target_h,
         bitrate_kbps: bitrate,
         segment_duration: 3,
         buffer_duration: settings.buffer_duration,
         segment_dir: seg_dir,
+        multi_track_audio: settings.multi_track_audio,
+        warm_cache: Some(session.warm_cache.clone()),
     };
 
     let app_handle = app.clone();
@@ -316,7 +322,6 @@ pub async fn wgc_save_clip(
     }
 
     let output_folder = ensure_output_folder(&store);
-    // ShadowPlay-style: save clips in a game-specific subfolder
     let game_name = file_name
         .split(|c: char| c.is_ascii_digit())
         .next()
@@ -333,20 +338,46 @@ pub async fn wgc_save_clip(
     let output_path = game_folder.join(&file_name);
     let output_str = output_path.to_string_lossy().to_string();
 
-    // Use the new persistent-encoder pipeline: keyframe-aligned slice from
-    // the in-memory encoded ring → MF Sink Writer → MP4.
-    match session.save_clip(seconds, &output_str) {
+    // Clone Arc fields needed for spawn_blocking
+    let is_saving = session.is_saving.clone();
+    let is_recording_flag = session.is_recording.clone();
+    let ring = session.ring.clone();
+    let session_fps_val = session.session_fps.load(std::sync::atomic::Ordering::Relaxed);
+    let session_width_val = session.session_width.load(std::sync::atomic::Ordering::Relaxed);
+    let session_height_val = session.session_height.load(std::sync::atomic::Ordering::Relaxed);
+    let clip_counter = session.clip_counter.clone();
+    let saved_clips = session.saved_clips.clone();
+    let multi_track_audio = session.multi_track_audio.clone();
+
+    // Run save on a blocking thread so we don't block the async runtime,
+    // but still wait for the result to return to the frontend.
+    let save_result = tokio::task::spawn_blocking(move || {
+        unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        save_clip_standalone(
+            &ring, &is_saving, &is_recording_flag, &clip_counter, &saved_clips,
+            &multi_track_audio,
+            session_fps_val, session_width_val, session_height_val,
+            seconds, &output_str,
+        )
+    })
+    .await
+    .map_err(|e| format!("Save task panicked: {}", e))?;
+
+    match save_result {
         Ok(path) => {
-            let _ = app.emit("wgc:clipSaved", &path);
-            let settings = store.get();
-            if settings.clip_sound_enabled {
-                let _ = app.emit("play-clip-sound", ());
-            }
+            // Do NOT emit events to WebView (wgc:clipSaved, play-clip-sound).
+            // Emitting forces WebView2 to execute JavaScript, which wakes its GPU
+            // renderer, which crashes under game GPU pressure. The frontend already
+            // gets the path from the return value of this command.
+            // Clipsta Lite uses the same approach: no UI feedback during gameplay.
+            eprintln!("[clipsta] Clip saved: {}", path);
             Ok(Some(path))
         }
         Err(e) => {
             let msg = format!("{}", e);
-            // If the ring doesn't have enough data yet, return None (not an error)
             if msg.contains("Not enough") || msg.contains("No keyframe") {
                 Ok(None)
             } else {
@@ -534,12 +565,26 @@ pub struct CutRange {
 /// with MF Sink Writer + hardware H.264 encoder at 720p.
 #[tauri::command]
 pub async fn compress_for_upload(file_path: String) -> Result<Option<String>, String> {
-    // v2.3: Direct upload of original quality. The capture pipeline already
-    // encodes at the user's chosen resolution (typically 720p-1080p) with
-    // hardware H.264, so re-compression adds latency without meaningful
-    // size reduction for most clips.
     let _ = file_path;
     Ok(None)
+}
+
+/// Upload a clip entirely in Rust (avoids WebView2 memory crash from 100MB+ fetch).
+/// The frontend calls this instead of reading the file + doing fetch() in JavaScript.
+#[tauri::command]
+pub async fn native_upload_clip(
+    store: State<'_, SettingsStore>,
+    file_path: String,
+) -> Result<String, String> {
+    let settings = store.get();
+    let device_id = settings.desktop_device_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        crate::do_rust_upload(&file_path, &device_id)
+    })
+    .await
+    .map_err(|e| format!("Upload task failed: {}", e))?
+    .map(|_| "Upload complete".to_string())
 }
 
 #[tauri::command]
@@ -1129,7 +1174,7 @@ fn resolve_quality_bitrate(resolution: &str, fps: u32, quality: &str) -> u32 {
             "1080p" => if is60 { 12000 } else { 8000 },
             "1440p" => if is60 { 30000 } else { 20000 },
             "4k" => if is60 { 50000 } else { 35000 },
-            _ => if is60 { 5000 } else { 3000 },
+            _ => if is60 { 12000 } else { 8000 }, // "native" and unknown → default to 1080p level
         },
         "high" => match resolution {
             "480p" => if is60 { 4000 } else { 2500 },
@@ -1137,7 +1182,7 @@ fn resolve_quality_bitrate(resolution: &str, fps: u32, quality: &str) -> u32 {
             "1080p" => if is60 { 20000 } else { 12000 },    // Matches ShadowPlay 1080p
             "1440p" => if is60 { 50000 } else { 30000 },
             "4k" => if is60 { 80000 } else { 50000 },
-            _ => if is60 { 8000 } else { 5000 },
+            _ => if is60 { 20000 } else { 12000 }, // "native" and unknown → default to 1080p level
         },
         "ultra" => match resolution {
             "480p" => if is60 { 8000 } else { 5000 },
@@ -1145,7 +1190,7 @@ fn resolve_quality_bitrate(resolution: &str, fps: u32, quality: &str) -> u32 {
             "1080p" => if is60 { 35000 } else { 25000 },    // OBS "Indistinguishable"
             "1440p" => if is60 { 80000 } else { 55000 },
             "4k" => if is60 { 130000 } else { 90000 },
-            _ => if is60 { 15000 } else { 10000 },
+            _ => if is60 { 35000 } else { 25000 }, // "native" and unknown → default to 1080p level
         },
         _ => resolve_quality_bitrate(resolution, fps, "high"), // Unknown → default to high
     }
@@ -1153,14 +1198,19 @@ fn resolve_quality_bitrate(resolution: &str, fps: u32, quality: &str) -> u32 {
 
 /// Convert a resolution string to (width, height) dimensions.
 /// All values are 16-pixel aligned for hardware encoder compatibility.
-fn resolution_to_dimensions(resolution: &str) -> (u32, u32) {
+/// Returns None for "native" — capture uses the source's native dimensions.
+fn resolution_to_dimensions(resolution: &str) -> Option<(u32, u32)> {
+    // All dimensions MUST be 16-pixel aligned (Clipsta Lite guardrail #2).
+    // 1080 → 1088: the extra 8 rows are cropped by players but prevent AMD green
+    // macroblock rows and encoder rejection on both NVIDIA and AMD.
     match resolution {
-        "480p" => (854, 480),     // 16:9, height 16-aligned
-        "720p" => (1280, 720),    // 16:9, both 16-aligned
-        "1080p" => (1920, 1080),  // 16:9, width 16-aligned, height 8-aligned (OK for H.264)
-        "1440p" => (2560, 1440),  // 16:9, both 16-aligned
-        "4k" => (3840, 2160),     // 16:9, both 16-aligned
-        _ => (1280, 720),         // Default to 720p
+        "native" => None,              // Use captured source dimensions (aligned below)
+        "480p" => Some((864, 480)),    // 16-aligned (854 → 864)
+        "720p" => Some((1280, 720)),   // Both 16-aligned
+        "1080p" => Some((1920, 1088)), // Height 16-aligned (1080 → 1088)
+        "1440p" => Some((2560, 1440)), // Both 16-aligned
+        "4k" => Some((3840, 2160)),    // Both 16-aligned
+        _ => Some((1280, 720)),        // Default to 720p
     }
 }
 
@@ -1402,4 +1452,36 @@ pub async fn watch_folder_status(
         active: service.is_active(),
         files_detected: service.files_detected(),
     })
+}
+
+// ── Start at Login ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_start_at_login(enabled: bool) -> Result<bool, String> {
+    use std::os::windows::process::CommandExt;
+
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get exe path: {}", e))?;
+    let exe_str = exe_path.to_string_lossy().to_string();
+
+    if enabled {
+        // Add to HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+        let status = std::process::Command::new("reg")
+            .args(["add", r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                   "/v", "Clipsta", "/t", "REG_SZ", "/d", &format!("\"{}\"", exe_str), "/f"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .map_err(|e| format!("Registry write failed: {}", e))?;
+        if !status.status.success() {
+            return Err("Failed to add startup entry".to_string());
+        }
+    } else {
+        // Remove from Run key
+        let _ = std::process::Command::new("reg")
+            .args(["delete", r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                   "/v", "Clipsta", "/f"])
+            .creation_flags(0x08000000)
+            .output();
+    }
+    Ok(enabled)
 }

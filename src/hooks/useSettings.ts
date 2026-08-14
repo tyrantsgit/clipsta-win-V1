@@ -34,6 +34,8 @@ export const DEFAULTS: AppSettings = {
 	watchFolderPath: "",
 	watchFolderEnabled: false,
 	theme: "dark" as const,
+	multiTrackAudio: false,
+	startAtLogin: false,
 };
 
 export function useSettings() {

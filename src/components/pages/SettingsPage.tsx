@@ -96,7 +96,11 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 
 	useEffect(() => { if (cloud.pairingConfirmed) { setJustPaired(true); const t = setTimeout(() => setJustPaired(false), 4000); return () => clearTimeout(t); } }, [cloud.pairingConfirmed]);
 
-	const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => { setLocal((prev) => ({ ...prev, [key]: value })); };
+	const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
+		setLocal((prev) => ({ ...prev, [key]: value }));
+		// Auto-save: updateSetting already debounces at 500ms
+		updateSetting(key, value);
+	};
 	const handleSave = async () => { await saveAll(local); setSaved(true); setTimeout(() => setSaved(false), 2500); };
 	const browseFolder = async () => { const folder = await bridge.browseFolder(); if (folder) update("outputFolder", folder); };
 
@@ -116,7 +120,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						className="input py-1.5 px-3 text-sm w-44"
 					/>
 					<button onClick={() => setLocal({ ...DEFAULTS })} className="btn-ghost"><RotateCcw size={14} /> Reset Defaults</button>
-					<button onClick={handleSave} className="btn-y"><Save size={14} />{saved ? "Saved ✓" : "Save Settings"}</button>
+					<span className="text-xs text-text-dim opacity-70">Auto-saved</span>
 				</div>
 			</div>
 
@@ -134,7 +138,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				{/* Video */}
 				<Section icon={<Monitor size={16} />} title="Video" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
-						<SelectField label="Resolution" value={local.resolution} onChange={(v) => update("resolution", v)} options={["480p", "720p", "1080p", "1440p", "4k"]} />
+						<SelectField label="Resolution" value={local.resolution} onChange={(v) => update("resolution", v)} options={["native", "480p", "720p", "1080p", "1440p", "4k"]} display={(v) => v === "native" ? "Native (Monitor Resolution)" : v} />
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
 						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
@@ -172,6 +176,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					<div className="grid grid-cols-2 gap-4">
 						<Toggle label="Auto Game Detection" checked={local.gameDetect} onChange={(v) => update("gameDetect", v)} description="Automatically capture the active fullscreen game" />
 						<Toggle label="Minimize to System Tray" checked={local.minimizeToTray} onChange={(v) => update("minimizeToTray", v)} description="Keep running in tray when window is closed" />
+						<Toggle label="Start with Windows" checked={local.startAtLogin} onChange={(v) => { update("startAtLogin", v); import("@tauri-apps/api/core").then(({invoke}) => invoke("set_start_at_login", { enabled: v })).catch(() => {}); }} description="Launch Clipsta automatically when you log in" />
 						<Toggle label="Show Overlay" checked={local.overlayEnabled} onChange={(v) => update("overlayEnabled", v)} description="Show notification on clip save" />
 						<Toggle label="Clip Sound" checked={local.clipSoundEnabled ?? true} onChange={(v) => update("clipSoundEnabled", v)} description="Play a sound when a clip is saved" />
 					</div>
@@ -259,7 +264,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 
 			{/* Save bar */}
 			<div className="sticky bottom-0 pt-6 pb-2 bg-gradient-to-t from-bg to-transparent">
-				<button onClick={handleSave} className="btn-y w-full justify-center py-3 text-base"><Save size={18} />{saved ? "Settings Saved ✓" : "Save All Settings"}</button>
+				<p className="text-sm text-text-dim text-center py-3">Settings are saved automatically</p>
 			</div>
 
 			{/* Pairing QR modal */}
@@ -305,8 +310,8 @@ function Section({ icon, title, children, search }: { icon: React.ReactNode; tit
 		// Check common keywords per section
 		const keywords: Record<string, string> = {
 			"Hotkeys": "shortcut key bind clip save record",
-			"Video": "resolution fps frame rate bitrate quality",
-			"Audio": "microphone mic sound device desktop game",
+			"Video": "resolution fps frame rate bitrate quality native 1080p 720p 4k",
+			"Audio": "microphone mic sound device desktop game multi-track separate",
 			"Capture": "buffer duration output folder path",
 			"Appearance": "theme dark oled minimize tray",
 			"Cloud": "upload pair device sync mobile",

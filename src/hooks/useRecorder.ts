@@ -103,13 +103,9 @@ export function useRecorder(settings: AppSettings | null) {
 
 	const savingRef = useRef(false);
 	const saveClip = useCallback(async (seconds: number): Promise<string | null> => {
-		if (!wgcActiveRef.current) {
-			setState((s) => ({
-				...s,
-				error: "Recording starting — try again in a moment.",
-			}));
-			return null;
-		}
+		// Don't gate on wgcActiveRef — the backend's is_recording flag is the
+		// source of truth. If WebView2 recovered from a crash, the frontend state
+		// may be stale but the capture thread is still running in the background.
 		// Prevent duplicate saves (hotkey repeat, double-click, etc)
 		if (savingRef.current) return null;
 		savingRef.current = true;
@@ -145,11 +141,11 @@ export function useRecorder(settings: AppSettings | null) {
 				...s,
 				status: "recording",
 				savedPath,
-				error: savedPath ? null : "Recording — clip will be available in a few seconds.",
+				error: savedPath ? null : "Buffering — wait a few seconds for the first keyframe.",
 			}));
-			// Auto-dismiss the "available in a few seconds" message
+			// Auto-dismiss the message
 			if (!savedPath) {
-				setTimeout(() => setState((s) => ({ ...s, error: s.error?.includes("available") ? null : s.error })), 3000);
+				setTimeout(() => setState((s) => ({ ...s, error: s.error?.includes("Buffering") ? null : s.error })), 3000);
 			}
 			return savedPath;
 		} catch (err: any) {
@@ -184,13 +180,35 @@ export function useRecorder(settings: AppSettings | null) {
 		};
 	}, []);
 
-	// Auto-start capture
+	// Auto-start capture, and restart when resolution/fps changes
 	const startCaptureRef = useRef(startCapture);
 	startCaptureRef.current = startCapture;
 
 	useEffect(() => {
 		if (!settings) return;
-		if (wgcActiveRef.current) return;
+
+		// If capture is already running and a key setting changed, restart it
+		if (wgcActiveRef.current) {
+			// Stop current capture, then restart with new settings
+			wgcActiveRef.current = false;
+			stopTimer();
+			bridge.wgcStopRecording().then(() => {
+				bridge.setRecordingState(false).then(() => {
+					setTimeout(() => {
+						if (!wgcActiveRef.current) {
+							startCaptureRef.current();
+						}
+					}, 500); // Brief delay for GPU resources to release
+				});
+			}).catch(() => {
+				setTimeout(() => {
+					if (!wgcActiveRef.current) {
+						startCaptureRef.current();
+					}
+				}, 1000);
+			});
+			return;
+		}
 
 		const timer = setTimeout(() => {
 			if (!wgcActiveRef.current) {
@@ -198,7 +216,7 @@ export function useRecorder(settings: AppSettings | null) {
 			}
 		}, 0);
 		return () => clearTimeout(timer);
-	}, [settings?.fps]);
+	}, [settings?.fps, settings?.resolution]);
 
 	// ShadowPlay-style game detection: query active window only at save time.
 	// No constant polling — getActiveWindowTitle() is called in makeFileName().

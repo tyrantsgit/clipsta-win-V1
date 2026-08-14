@@ -30,6 +30,8 @@ export interface AppSettings {
 	watchFolderPath: string;
 	watchFolderEnabled: boolean;
 	theme: "dark" | "oled";
+	multiTrackAudio: boolean;
+	startAtLogin: boolean;
 }
 
 export interface UploadJob {

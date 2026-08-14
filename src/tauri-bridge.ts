@@ -263,41 +263,12 @@ export async function uploadClip(opts: UploadClipOpts): Promise<UploadClipRespon
 		throw new Error(`File too large for upload (${Math.round(opts.bytes / 1024 / 1024)}MB). Max 200MB.`);
 	}
 
-	// Step 1: Request upload URL via backend proxy (API key stays server-side)
-	const clipData = await invoke<UploadClipResponse & { uploadUrl: string }>("cloud_request_upload", {
-		req: {
-			desktopDeviceId: opts.desktopDeviceId,
-			fileName: opts.fileName,
-			durationSeconds: opts.durationSeconds,
-			bytes: opts.bytes,
-			capturedAt: opts.capturedAt,
-		},
-	});
+	// Use native Rust upload — avoids reading 100MB+ files into WebView memory
+	// which caused WebView2 crashes under GPU pressure.
+	await invoke<string>("native_upload_clip", { filePath: opts.filePath });
 
-	// Step 2: Read file and upload directly to the pre-signed upload URL
-	// (The upload URL is pre-signed and doesn't need our API key)
-	const { readFile } = await import("@tauri-apps/plugin-fs");
-	let fileBytes: Uint8Array;
-	try {
-		fileBytes = await readFile(opts.filePath);
-	} catch (e: any) {
-		throw new Error(`Failed to read clip file: ${e?.message ?? e}`);
-	}
-
-	const mime = opts.fileName.endsWith(".webm") ? "video/webm"
-		: opts.fileName.endsWith(".mkv") ? "video/x-matroska"
-		: opts.fileName.endsWith(".mov") ? "video/quicktime"
-		: "video/mp4";
-	const blob = new Blob([fileBytes], { type: mime });
-	const formData = new FormData();
-	formData.append("file", blob, opts.fileName);
-
-	const uploadRes = await fetch(clipData.uploadUrl, { method: "POST", body: formData });
-	if (!uploadRes.ok) {
-		throw new Error(`Upload failed: HTTP ${uploadRes.status}`);
-	}
-
-	return clipData;
+	// Return minimal response (the actual stream info isn't needed for the queue)
+	return { streamUid: undefined, shareUrl: undefined } as any;
 }
 
 export async function notifyUploadStatus(body: UploadStatusBody): Promise<void> {

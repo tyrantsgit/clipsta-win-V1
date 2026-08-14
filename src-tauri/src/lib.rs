@@ -16,7 +16,10 @@ pub mod watch_folder;
 
 
 use std::sync::atomic::Ordering;
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
@@ -25,6 +28,10 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use gpu_capture::CaptureSession;
 use settings::SettingsStore;
 use watch_folder::WatchFolderService;
+
+/// Channel sender for hotkey-triggered clip saves.
+/// Lives as a global so the hotkey closure (which can't access Tauri state) can send save requests.
+static SAVE_TX: std::sync::OnceLock<std_mpsc::SyncSender<u32>> = std::sync::OnceLock::new();
 
 /// Register global hotkeys based on current settings.
 pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings) {
@@ -37,9 +44,16 @@ pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings
             return;
         }
         if let Ok(shortcut) = accel.parse::<Shortcut>() {
-            let app_h = app_clone.clone();
-            let _ = gs.on_shortcut(shortcut, move |_app, _shortcut, _event| {
-                let _ = app_h.emit("hotkey:clip", seconds);
+            let _ = gs.on_shortcut(shortcut, move |_app, _shortcut, event| {
+                // Only fire on key-down (Pressed), not key-up (Released).
+                // Without this check, each hotkey press creates 2 clips.
+                if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    return;
+                }
+                // Send save request through the global channel.
+                if let Some(tx) = SAVE_TX.get() {
+                    let _ = tx.try_send(seconds);
+                }
             });
         }
     };
@@ -48,7 +62,7 @@ pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings
     try_register(&settings.hotkey_clip1_min, 60);
     try_register(&settings.hotkey_clip5_min, 300);
 
-    // Record toggle
+    // Record toggle (still emits to WebView — only used when app is in foreground for UI)
     if !settings.hotkey_record.is_empty() {
         if let Ok(shortcut) = settings.hotkey_record.parse::<Shortcut>() {
             let app_h = app_clone.clone();
@@ -64,6 +78,16 @@ pub fn run() {
     // NOTE: Do NOT call CoInitializeEx here. Tauri's window library (tao) requires
     // OleInitialize (STA) on the main thread. COM MTA is initialized on capture/audio
     // threads instead (see capture.rs and audio.rs).
+
+    // Disable WebView2 GPU compositing to prevent D3D11/Dawn crashes during gameplay.
+    // The crash was specifically in Dawn's BeginRenderPassCmd (the compositing step).
+    // This keeps GPU rasterization for the UI but uses software for final frame assembly.
+    // Disable ALL WebView2 GPU usage to prevent crashes during gameplay.
+    // WebView2's renderer (both Dawn compositor and Skia rasterizer) crashes under
+    // heavy GPU load from games + capture encoder. CPU rendering for the HTML UI is
+    // fast enough — it's just buttons, text, and thumbnails.
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--disable-gpu --disk-cache-size=52428800");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -92,6 +116,7 @@ pub fn run() {
             // Export
             commands::recording_export,
             commands::compress_for_upload,
+            commands::native_upload_clip,
             // File ops
             commands::shell_open_folder,
             commands::shell_open_file,
@@ -117,6 +142,7 @@ pub fn run() {
             commands::watch_folder_start,
             commands::watch_folder_stop,
             commands::watch_folder_status,
+            commands::set_start_at_login,
             // Cloud Proxy (API key stays backend-side)
             cloud_proxy::cloud_get_config,
             cloud_proxy::cloud_generate_pairing,
@@ -185,6 +211,113 @@ pub fn run() {
             app.manage(session);
             app.manage(cloud_proxy::HttpClient::new());
 
+            // Pre-warm GPU resources in the background (saves ~100-200ms on first recording)
+            let session_ref = app.state::<CaptureSession>();
+            session_ref.warm_start();
+
+            // Spawn the save-worker thread: receives hotkey save requests via channel,
+            // saves clips directly in Rust without any WebView involvement.
+            // This is the Clipsta Lite architecture — hotkeys never touch the UI.
+            {
+                let (tx, rx) = std_mpsc::sync_channel::<u32>(4);
+                let _ = SAVE_TX.set(tx);
+
+                let app_for_worker = app.handle().clone();
+                let session_for_worker = app.state::<CaptureSession>();
+                let ring = session_for_worker.ring.clone();
+                let is_saving = session_for_worker.is_saving.clone();
+                let is_recording = session_for_worker.is_recording.clone();
+                let clip_counter = session_for_worker.clip_counter.clone();
+                let saved_clips = session_for_worker.saved_clips.clone();
+                let multi_track_audio = session_for_worker.multi_track_audio.clone();
+                let session_fps = session_for_worker.session_fps.clone();
+                let session_width = session_for_worker.session_width.clone();
+                let session_height = session_for_worker.session_height.clone();
+                let store_for_worker = store.clone();
+
+                std::thread::Builder::new()
+                    .name("clipsta-save-worker".into())
+                    .spawn(move || {
+                        unsafe {
+                            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+                            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                        }
+                        eprintln!("[clipsta] Save-worker thread started");
+
+                        while let Ok(seconds) = rx.recv() {
+                            if !is_recording.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            if is_saving.load(Ordering::Relaxed) {
+                                continue;
+                            }
+
+                            let settings = store_for_worker.get();
+                            let fps = session_fps.load(Ordering::Relaxed);
+                            let width = session_width.load(Ordering::Relaxed);
+                            let height = session_height.load(Ordering::Relaxed);
+
+                            // Generate filename (ShadowPlay style)
+                            let now = chrono::Local::now();
+                            let cs = now.format("%f").to_string();
+                            let centiseconds = &cs[..2.min(cs.len())];
+                            let stamp = format!("{}.{}", now.format("%Y.%m.%d - %H.%M.%S"), centiseconds);
+                            let game_name = unsafe {
+                                use windows::Win32::UI::WindowsAndMessaging::*;
+                                let hwnd = GetForegroundWindow();
+                                let mut buf = [0u16; 256];
+                                let len = GetWindowTextW(hwnd, &mut buf);
+                                if len > 0 {
+                                    let title = String::from_utf16_lossy(&buf[..len as usize]);
+                                    title.chars()
+                                        .map(|c| match c { '<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*' => '_', _ => c })
+                                        .collect::<String>()
+                                } else {
+                                    "Desktop".to_string()
+                                }
+                            };
+
+                            let file_name = format!("{} {}.DVR.mp4", game_name, stamp);
+                            let output_folder = std::path::PathBuf::from(&settings.output_folder);
+                            let _ = std::fs::create_dir_all(&output_folder);
+                            let game_folder = output_folder.join(&game_name);
+                            let _ = std::fs::create_dir_all(&game_folder);
+                            let output_path = game_folder.join(&file_name);
+                            let output_str = output_path.to_string_lossy().to_string();
+
+                            let result = gpu_capture::save_clip_standalone(
+                                &ring, &is_saving, &is_recording, &clip_counter, &saved_clips,
+                                &multi_track_audio, fps, width, height, seconds, &output_str,
+                            );
+                            match result {
+                                Ok(ref path) => {
+                                    eprintln!("[clipsta] Clip saved: {}", path);
+
+                                    // Auto-upload in Rust (no WebView involvement).
+                                    // Check if auto-upload is enabled in settings.
+                                    let upload_settings = store_for_worker.get();
+                                    if upload_settings.auto_upload && upload_settings.cloud_enabled && !upload_settings.cloud_pair_code.is_empty() {
+                                        let path_clone = path.clone();
+                                        let device_id = upload_settings.desktop_device_id.clone();
+                                        std::thread::spawn(move || {
+                                            if let Err(e) = do_rust_upload(&path_clone, &device_id) {
+                                                eprintln!("[clipsta] Auto-upload failed: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    let msg = format!("{}", e);
+                                    if !msg.contains("No keyframe") && !msg.contains("Not recording") && !msg.contains("Save already") {
+                                        eprintln!("[clipsta] Clip save error: {}", msg);
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .expect("Failed to spawn save-worker thread");
+            }
+
             // Create and manage watch folder service
             let watch_service = WatchFolderService::new();
             app.manage(watch_service.clone());
@@ -218,16 +351,14 @@ pub fn run() {
                 let app = window.app_handle();
                 let store = app.state::<SettingsStore>();
                 if store.get().minimize_to_tray {
-                    // Hide to tray instead of closing
+                    // Hide to tray instead of closing — recording continues
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
-                    // Actually quit the app
                     let session = app.state::<CaptureSession>();
                     if session.is_recording.load(Ordering::Relaxed) {
                         session.stop();
                     }
-                    // Clean up temp recording files
                     session.cleanup();
                     app.exit(0);
                 }
@@ -296,13 +427,13 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "clip30" => {
-                let _ = app.emit("hotkey:clip", 30u32);
+                if let Some(tx) = SAVE_TX.get() { let _ = tx.try_send(30); }
             }
             "clip1m" => {
-                let _ = app.emit("hotkey:clip", 60u32);
+                if let Some(tx) = SAVE_TX.get() { let _ = tx.try_send(60); }
             }
             "clip5m" => {
-                let _ = app.emit("hotkey:clip", 300u32);
+                if let Some(tx) = SAVE_TX.get() { let _ = tx.try_send(300); }
             }
             "folder" => {
                 let store = app.state::<SettingsStore>();
@@ -333,5 +464,84 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build(app)?;
 
+    Ok(())
+}
+
+/// Upload a clip directly from Rust (no WebView involvement).
+/// Uses blocking reqwest since this runs on a dedicated upload thread.
+fn do_rust_upload(file_path: &str, device_id: &str) -> Result<(), String> {
+    use crate::cloud_proxy::{CLOUD_API_BASE, CLOUD_API_KEY};
+
+    let path = std::path::Path::new(file_path);
+    let file_name = path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let file_size = std::fs::metadata(file_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if file_size == 0 {
+        return Err("File is empty or doesn't exist".to_string());
+    }
+
+    eprintln!("[clipsta] Auto-uploading: {} ({} MB)", file_name, file_size / (1024 * 1024));
+
+    // Step 1: Request upload URL from cloud API
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let upload_req = serde_json::json!({
+        "desktopDeviceId": device_id,
+        "fileName": file_name,
+        "durationSeconds": 30,
+        "bytes": file_size,
+        "capturedAt": chrono::Local::now().to_rfc3339(),
+    });
+
+    let res = client
+        .post(format!("{}/clip-uploads", CLOUD_API_BASE))
+        .header("Content-Type", "application/json")
+        .header("X-Clipsta-Test-Key", CLOUD_API_KEY)
+        .json(&upload_req)
+        .send()
+        .map_err(|e| format!("Upload request failed: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Cloud API error: HTTP {}", res.status().as_u16()));
+    }
+
+    let data: serde_json::Value = res.json()
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    let upload_url = data["uploadUrl"].as_str()
+        .ok_or("No uploadUrl in response")?
+        .to_string();
+
+    // Step 2: Read file and upload as multipart form (matches frontend behavior)
+    let file_bytes = std::fs::read(file_path)
+        .map_err(|e| format!("Read file failed: {}", e))?;
+
+    let part = reqwest::blocking::multipart::Part::bytes(file_bytes)
+        .file_name(file_name.clone())
+        .mime_str("video/mp4")
+        .map_err(|e| format!("Multipart error: {}", e))?;
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .part("file", part);
+
+    let upload_res = client
+        .post(&upload_url)
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("Upload failed: {}", e))?;
+
+    if !upload_res.status().is_success() {
+        return Err(format!("Upload HTTP {}", upload_res.status().as_u16()));
+    }
+
+    eprintln!("[clipsta] Auto-upload complete: {}", file_name);
     Ok(())
 }

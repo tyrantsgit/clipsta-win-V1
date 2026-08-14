@@ -41,6 +41,8 @@ pub struct AppSettings {
     pub watch_folder_path: String,
     pub watch_folder_enabled: bool,
     pub theme: String,
+    pub multi_track_audio: bool,
+    pub start_at_login: bool,
 }
 
 impl Default for AppSettings {
@@ -80,6 +82,8 @@ impl Default for AppSettings {
             watch_folder_path: String::new(),
             watch_folder_enabled: false,
             theme: "dark".to_string(),
+            multi_track_audio: false,
+            start_at_login: false,
         }
     }
 }
