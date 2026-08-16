@@ -1702,6 +1702,48 @@ impl EncodedMediaRing {
     }
 }
 
+/// Separate audio ring buffer — completely decoupled from the video EncodedMediaRing.
+pub(crate) struct AudioRingBuffer {
+    chunks: std::collections::VecDeque<AudioChunk>,
+    max_duration_100ns: i64,
+}
+
+unsafe impl Send for AudioRingBuffer {}
+unsafe impl Sync for AudioRingBuffer {}
+
+impl AudioRingBuffer {
+    pub fn new(max_seconds: u32) -> Self {
+        Self {
+            chunks: std::collections::VecDeque::with_capacity(max_seconds as usize * 50),
+            max_duration_100ns: max_seconds as i64 * 10_000_000,
+        }
+    }
+
+    pub fn push(&mut self, chunk: AudioChunk) {
+        self.chunks.push_back(chunk);
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        if self.chunks.len() < 2 { return; }
+        let newest_pts = self.chunks.back().map(|c| c.pts_100ns).unwrap_or(0);
+        while let Some(front) = self.chunks.front() {
+            if newest_pts - front.pts_100ns > self.max_duration_100ns {
+                self.chunks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn slice(&self, start_pts: i64, end_pts: i64) -> Vec<AudioChunk> {
+        self.chunks.iter()
+            .filter(|c| c.pts_100ns + c.duration_100ns > start_pts && c.pts_100ns < end_pts)
+            .cloned()
+            .collect()
+    }
+}
+
 
 // ── MP4 Muxer: MF Sink Writer for save operation ──────────────────────────────
 
@@ -2072,6 +2114,7 @@ pub struct CaptureSession {
     recording_start: Arc<Mutex<Option<std::time::Instant>>>,
     audio_file: Arc<Mutex<Option<String>>>,
     pub(crate) ring: Arc<Mutex<EncodedMediaRing>>,
+    pub(crate) audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     pub(crate) session_fps: Arc<AtomicU32>,
     pub(crate) session_width: Arc<AtomicU32>,
     pub(crate) session_height: Arc<AtomicU32>,
@@ -2098,6 +2141,7 @@ impl Default for CaptureSession {
             recording_start: Arc::new(Mutex::new(None)),
             audio_file: Arc::new(Mutex::new(None)),
             ring: Arc::new(Mutex::new(EncodedMediaRing::new(MAX_RING_SECONDS))),
+            audio_buffer: Arc::new(Mutex::new(AudioRingBuffer::new(MAX_RING_SECONDS))),
             session_fps: Arc::new(AtomicU32::new(60)),
             session_width: Arc::new(AtomicU32::new(OUTPUT_WIDTH)),
             session_height: Arc::new(AtomicU32::new(OUTPUT_HEIGHT)),
@@ -2215,10 +2259,12 @@ impl CaptureSession {
 
         // Reset ring buffer
         *self.ring.lock() = EncodedMediaRing::new(opts.buffer_duration.max(MAX_RING_SECONDS));
+        *self.audio_buffer.lock() = AudioRingBuffer::new(opts.buffer_duration.max(MAX_RING_SECONDS));
 
         let stop = self.stop_flag.clone();
         let is_recording = self.is_recording.clone();
         let ring = self.ring.clone();
+        let audio_buffer = self.audio_buffer.clone();
         let frame_drops = self.frame_drops.clone();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<CaptureReadyInfo>>();
@@ -2227,7 +2273,7 @@ impl CaptureSession {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            let result = run_gpu_capture(opts, stop.clone(), ring, ready_tx.clone(), frame_drops);
+            let result = run_gpu_capture(opts, stop.clone(), ring, audio_buffer, ready_tx.clone(), frame_drops);
             let error_msg = match &result {
                 Ok(()) => None,
                 Err(e) => {
@@ -2326,7 +2372,7 @@ impl CaptureSession {
         // Split into two brief lock acquisitions so the encoder thread can push_video
         // between them — prevents the ~100-300ms stall that caused game hitches on save.
         let multi_track = false; // Multi-track disabled (was causing Discord interference)
-        let (video_frames, audio_chunks, encoded_audio_chunks, mic_audio_chunks) = {
+        let (video_frames, audio_chunks, mic_audio_chunks) = {
             // Phase 1: grab video frames (brief lock — Arc clones are cheap refcount bumps)
             let (video, start_pts, end_pts) = {
                 let ring = self.ring.lock();
@@ -2343,26 +2389,21 @@ impl CaptureSession {
             };
             // Lock released here — encoder can push frames while we grab audio
 
-            // Phase 2: grab audio chunks (separate lock acquisition)
-            let (audio, encoded_audio, mic_audio) = {
-                let ring = self.ring.lock();
-                let pcm = ring.slice_audio(start_pts, end_pts);
-                let aac = ring.slice_encoded_audio(start_pts, end_pts);
-                let mic = if multi_track {
-                    ring.slice_mic_audio(start_pts, end_pts)
-                } else {
-                    Vec::new()
-                };
-                (pcm, aac, mic)
+            // Phase 2: grab audio from separate audio buffer (zero contention with encoder)
+            let audio = {
+                let abuf = self.audio_buffer.lock();
+                abuf.slice(start_pts, end_pts)
             };
 
-            (video, audio, encoded_audio, mic_audio)
+            let mic_audio: Vec<AudioChunk> = Vec::new();
+
+            (video, audio, mic_audio)
         };
 
         eprintln!("[gpu_capture] save_clip: {} video frames, {} audio chunks, {}x{} @ {}fps → {}",
             video_frames.len(), audio_chunks.len(), width, height, fps, output_path);
-        log(&format!("ring slice: {} video frames, {} audio chunks, {} encoded audio chunks, {} mic chunks",
-            video_frames.len(), audio_chunks.len(), encoded_audio_chunks.len(), mic_audio_chunks.len()));
+        log(&format!("ring slice: {} video frames, {} audio chunks, {} mic chunks",
+            video_frames.len(), audio_chunks.len(), mic_audio_chunks.len()));
 
         // Mux to MP4: prefer pre-encoded AAC (fast passthrough) over PCM (requires re-encoding)
         // Each mux function calls MFStartup/MFShutdown internally (save thread != capture thread).
@@ -2418,6 +2459,7 @@ impl CaptureSession {
 /// without holding a borrow on Tauri State (which would block the async runtime).
 pub(crate) fn save_clip_standalone(
     ring: &Arc<Mutex<EncodedMediaRing>>,
+    audio_buffer: &Arc<Mutex<AudioRingBuffer>>,
     is_saving: &Arc<AtomicBool>,
     is_recording: &Arc<AtomicBool>,
     clip_counter: &Arc<AtomicU32>,
@@ -2443,7 +2485,7 @@ pub(crate) fn save_clip_standalone(
     let _guard = SavingGuard(is_saving);
 
     let multi_track = false; // Multi-track disabled
-    let (video_frames, audio_chunks, _encoded_audio_chunks, mic_audio_chunks) = {
+    let (video_frames, audio_chunks, mic_audio_chunks) = {
         let (video, start_pts, end_pts) = {
             let ring = ring.lock();
             let start_idx = ring
@@ -2457,18 +2499,14 @@ pub(crate) fn save_clip_standalone(
             let e_pts = video.last().map(|f| f.pts_100ns + f.duration_100ns).unwrap_or(s_pts);
             (video, s_pts, e_pts)
         };
-        let (audio, encoded_audio, mic_audio) = {
-            let ring = ring.lock();
-            let pcm = ring.slice_audio(start_pts, end_pts);
-            let aac = ring.slice_encoded_audio(start_pts, end_pts);
-            let mic = if multi_track {
-                ring.slice_mic_audio(start_pts, end_pts)
-            } else {
-                Vec::new()
-            };
-            (pcm, aac, mic)
+        // Grab audio from separate audio buffer (zero contention with encoder)
+        let audio = {
+            let abuf = audio_buffer.lock();
+            abuf.slice(start_pts, end_pts)
         };
-        (video, audio, encoded_audio, mic_audio)
+        let mic_audio: Vec<AudioChunk> = Vec::new();
+
+        (video, audio, mic_audio)
     };
 
     eprintln!("[gpu_capture] save_clip_standalone: {} video frames, {} audio chunks, {}x{} @ {}fps → {}",
@@ -2578,6 +2616,7 @@ fn run_gpu_capture(
     opts: CaptureOptions,
     stop: Arc<AtomicBool>,
     ring: Arc<Mutex<EncodedMediaRing>>,
+    audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     ready_tx: std::sync::mpsc::Sender<Result<CaptureReadyInfo>>,
     frame_drops: Arc<AtomicU32>,
 ) -> Result<()> {
@@ -2863,16 +2902,14 @@ fn run_gpu_capture(
     // Both video PTS and audio use (now - session_start) ensuring perfect sync.
     let session_start: Arc<std::sync::OnceLock<std::time::Instant>> = Arc::new(std::sync::OnceLock::new());
     let audio_thread = if !opts.no_audio {
-        let ring_audio = ring.clone();
+        let audio_buf = audio_buffer.clone();
         let s = stop.clone();
         let ss = session_start.clone();
         let mic = opts.mic_device.clone();
         let lb = opts.loopback_device.clone();
-        // Multi-track disabled: always mix mic into desktop audio.
-        // Separate mic routing was causing interference with Discord/other audio apps.
         let multi_track = false;
         Some(thread::spawn(move || {
-            gpu_audio_loop(s, mic, lb, ring_audio, ss, multi_track);
+            gpu_audio_loop(s, mic, lb, audio_buf, ss, multi_track);
         }))
     } else {
         None
@@ -3289,110 +3326,35 @@ fn gpu_audio_loop(
     stop: Arc<AtomicBool>,
     mic_device: Option<String>,
     loopback: Option<String>,
-    ring: Arc<Mutex<EncodedMediaRing>>,
+    audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     session_start: Arc<std::sync::OnceLock<std::time::Instant>>,
-    multi_track_audio: bool,
+    _multi_track_audio: bool,
 ) {
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
-
-    // Wait for first video frame to set the session start time
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if session_start.get().is_some() {
-            break;
-        }
+        if stop.load(Ordering::Relaxed) { return; }
+        if session_start.get().is_some() { break; }
         thread::sleep(std::time::Duration::from_millis(1));
     }
-
-    // Initialize AAC encoder for real-time encoding (optional — falls back to PCM if it fails)
-    let aac_encoder: Option<IMFTransform> = unsafe { init_aac_encoder_mft() };
-    if aac_encoder.is_some() {
-        eprintln!("[gpu_audio] AAC real-time encoder initialized (fast save enabled)");
-    } else {
-        eprintln!("[gpu_audio] AAC encoder init failed — will encode at save time (slower)");
-    }
-
-    let _start_instant = session_start.get().unwrap();
-    let ring_clone = ring.clone();
+    eprintln!("[gpu_audio] Separate audio buffer — no encoder mutex contention");
+    let audio_buf_clone = audio_buffer.clone();
     let audio_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = audio_sample_counter.clone();
-    // AAC encoder wrapped in Arc for Send (closure requirement) but no Mutex —
-    // only the audio callback thread accesses it (single-threaded, no contention).
-    let aac_enc_owned = Arc::new(SendAacEncoder(aac_encoder));
-
-    // Mic sample counter (independent from desktop for multi-track PTS)
-    let mic_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mic_counter_clone = mic_sample_counter.clone();
-    let ring_for_mic = ring.clone();
-
-    // Build mic callback for multi-track mode
-    let mic_cb: Option<Box<dyn Fn(&[f32]) + Send + 'static>> = if multi_track_audio {
-        Some(Box::new(move |mic_chunk: &[f32]| {
-            let n_frames = mic_chunk.len() / AUDIO_CHANNELS as usize;
-            let sample_offset = mic_counter_clone.fetch_add(n_frames, Ordering::Relaxed);
-            let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-            let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-
-            let mut ring = ring_for_mic.lock();
-            let mut buf = ring.acquire_audio_buffer(mic_chunk.len());
-            buf.extend_from_slice(mic_chunk);
-            let chunk = AudioChunk {
-                data: Arc::new(buf),
-                pts_100ns,
-                duration_100ns,
-            };
-            ring.push_mic_audio(chunk);
-        }))
-    } else {
-        None
-    };
-
-    // Pre-allocated buffer for f32→i16 conversion (avoids 100 heap allocs/sec on audio thread).
-    let pcm_i16_buf: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::with_capacity(2048));
-
-    let res = WasapiCapture::capture_to_callback_multi(stop, mic_device, loopback, move |chunk: &[f32]| {
-        // PTS from sample counter — audio samples are continuous at 48kHz.
-        // The counter starts at 0 when capture begins (right after session_start is set).
-        // Video PTS also starts near 0 (session_start.elapsed()), so both share the
-        // same time origin. The sample counter is more stable than wall-clock for audio
-        // because it tracks actual delivered samples (immune to thread scheduling jitter).
+    let res = WasapiCapture::capture_to_callback(stop, mic_device, loopback, move |chunk: &[f32]| {
         let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
         let sample_offset = counter_clone.fetch_add(n_frames, Ordering::Relaxed);
         let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
         let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-
-        // Acquire a recycled buffer from the pool (avoids heap alloc per chunk).
-        // Single lock scope: acquire buffer + push chunk atomically.
-        let mut ring = ring_clone.lock();
-        let mut buf = ring.acquire_audio_buffer(chunk.len());
-        buf.extend_from_slice(chunk);
         let audio_chunk = AudioChunk {
-            data: Arc::new(buf),
+            data: Arc::new(chunk.to_vec()),
             pts_100ns,
             duration_100ns,
         };
-        ring.push_audio(audio_chunk);
-
-        // Feed AAC encoder directly (no lock — owned by this closure, single-threaded)
-        if let Some(ref encoder) = aac_enc_owned.0 {
-            // Convert f32 → i16 using pre-allocated buffer (avoids heap alloc per chunk)
-            let mut i16_buf = pcm_i16_buf.borrow_mut();
-            i16_buf.clear();
-            i16_buf.extend(chunk.iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
-            let encoded_chunks = unsafe {
-                feed_aac_encoder(encoder, &i16_buf, pts_100ns, duration_100ns)
-            };
-            for ec in encoded_chunks {
-                ring.push_encoded_audio(ec);
-            }
-        }
-    }, mic_cb);
-
+        audio_buf_clone.lock().push(audio_chunk);
+    });
     if let Err(e) = res {
         eprintln!("[gpu_audio] error: {e}");
     }

@@ -225,6 +225,7 @@ pub fn run() {
                 let app_for_worker = app.handle().clone();
                 let session_for_worker = app.state::<CaptureSession>();
                 let ring = session_for_worker.ring.clone();
+                let audio_buffer = session_for_worker.audio_buffer.clone();
                 let is_saving = session_for_worker.is_saving.clone();
                 let is_recording = session_for_worker.is_recording.clone();
                 let clip_counter = session_for_worker.clip_counter.clone();
@@ -286,7 +287,7 @@ pub fn run() {
                             let output_str = output_path.to_string_lossy().to_string();
 
                             let result = gpu_capture::save_clip_standalone(
-                                &ring, &is_saving, &is_recording, &clip_counter, &saved_clips,
+                                &ring, &audio_buffer, &is_saving, &is_recording, &clip_counter, &saved_clips,
                                 &multi_track_audio, fps, width, height, seconds, &output_str,
                             );
                             match result {

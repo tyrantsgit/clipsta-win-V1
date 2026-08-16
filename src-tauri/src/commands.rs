@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-use crate::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment, SourceInfo, save_clip_standalone};
+use crate::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment, SourceInfo, save_clip_standalone, AudioRingBuffer};
 use crate::settings::{AppSettings, SettingsStore};
 
 /// Initialize COM MTA on the current thread (for async command threads).
@@ -342,6 +342,7 @@ pub async fn wgc_save_clip(
     let is_saving = session.is_saving.clone();
     let is_recording_flag = session.is_recording.clone();
     let ring = session.ring.clone();
+    let audio_buffer = session.audio_buffer.clone();
     let session_fps_val = session.session_fps.load(std::sync::atomic::Ordering::Relaxed);
     let session_width_val = session.session_width.load(std::sync::atomic::Ordering::Relaxed);
     let session_height_val = session.session_height.load(std::sync::atomic::Ordering::Relaxed);
@@ -357,7 +358,7 @@ pub async fn wgc_save_clip(
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         save_clip_standalone(
-            &ring, &is_saving, &is_recording_flag, &clip_counter, &saved_clips,
+            &ring, &audio_buffer, &is_saving, &is_recording_flag, &clip_counter, &saved_clips,
             &multi_track_audio,
             session_fps_val, session_width_val, session_height_val,
             seconds, &output_str,
