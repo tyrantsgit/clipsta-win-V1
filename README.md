@@ -1,39 +1,40 @@
-# Clipsta v2.3.1
+# Clipsta v2.3.2
 
-**The gaming clip recorder that just works.** Always recording, always ready. Save the last 30 seconds, 1 minute, or 5 minutes of gameplay with a single hotkey — just like NVIDIA ShadowPlay, but open and customizable.
+**The gaming clip recorder that just works.** Always recording, always ready. Save the last 30 seconds or 1 minute of gameplay with a single hotkey — just like NVIDIA ShadowPlay, but open and customizable.
 
-Built with Tauri v2 + React + Windows Graphics Capture + Hardware H.264 encoding.
+Built with Tauri v2 + React + Windows Graphics Capture + Hardware H.264 encoding.  
+**Split process architecture** — capture runs in an isolated process for clean USB mic audio.
 
 ---
 
-## What's New in v2.3.1
+## What's New in v2.3.2
 
-### 🚀 All Resolutions (480p → 4K)
-- **480p** (864×480), **720p** (1280×720), **1080p** (1920×1088), **1440p** (2560×1440), **4K** (3840×2160), **Native**
-- All dimensions 16-pixel aligned (prevents AMD green macroblock artifacts)
-- Rate control configured before encoder output type (Clipsta Lite guardrail #5)
-- 3-tier encoder fallback: High profile → Baseline → Bare minimum
+### 🔀 Split Process Architecture
+- **Moved capture engine to `clipsta-capture.exe`** — eliminates WebView2 mic audio interference
+- **Named pipe IPC** (`\\.\pipe\clipsta-capture`) — JSON request/response protocol
+- **179 MB RAM steady-state** — was 1,530 MB in v2.3.1 (competitive with ShadowPlay)
+- **Clean USB mic audio at 1080p** — no WebView2 thread contention with USB audio scheduling
 
-### ⚡ Zero-Crash Gameplay Architecture
-- **Hotkey saves bypass WebView entirely** — Rust channel (mpsc) → dedicated save-worker thread
-- **No WebView events during gameplay** — prevents WebView2 GPU renderer crashes
-- **Auto-upload in Rust** — reqwest multipart upload, no JavaScript fetch() with 100MB+ bodies
-- **Window starts hidden to tray** — WebView2 never renders during gameplay
-- **Warm-start** — D3D11 device pre-created at app launch (saves ~100ms on first recording)
-- **Thread join on restart** — prevents encoder session conflicts during resolution changes
+### ⚡ Performance Fixes
+- **Wall-clock PTS** — both video and audio use `session_start.elapsed()` for perfect A/V sync
+- **Fixed frame pacer** — was aggressively rejecting frames (55fps → now locked 60fps)
+- **60s default buffer** — matches ShadowPlay/Clipsta Lite (was 300s, wasted 860 MB RAM)
+- **Memory-mapped ring buffer** — video frames stored on disk, only hot pages in RAM
+- **Mic device from settings** — properly reads `audioInputDeviceId` when frontend doesn't specify
 
-### 🎯 Production Stability
-- **Single clip per hotkey** — filters key-down only (was double-firing on press+release)
-- **spawn_blocking saves** — doesn't block Tauri async runtime
-- **catch_unwind on mux** — MF SinkWriter crashes don't kill the app
-- **NV12 pool leak fixes** — VP-skip and channel-full paths properly return textures
-- **16-pixel alignment on all paths** — including native resolution (rounds up)
-
-### 🔧 Performance
-- **Audio buffer pre-allocation** — eliminates 100 heap allocations/sec on audio thread
-- **WebView2 cache capped at 50MB** — prevents unbounded disk growth
-- **Settings auto-save** — 500ms debounce, no explicit Save button needed
-- **Start with Windows** — toggle in settings, uses Windows Registry Run key
+### 🏗️ Architecture
+```
+clipsta-tauri.exe (34 MB RAM)          clipsta-capture.exe (179 MB RAM)
+┌─────────────────────┐                ┌──────────────────────────────┐
+│ React UI            │                │ WGC Screen Capture           │
+│ Tray Icon           │  named pipe    │ WASAPI Audio (desktop + mic) │
+│ Hotkeys             │◄──────────────►│ H.264 Hardware Encoder       │
+│ Cloud Upload        │  JSON IPC      │ Ring Buffer (mmap)           │
+│ Settings            │                │ MP4 Mux (passthrough)        │
+│ Watch Folder        │                │ Chime                        │
+└─────────────────────┘                └──────────────────────────────┘
+     No WebView2 in capture process = clean USB audio scheduling
+```
 
 ---
 
@@ -191,7 +192,7 @@ Built with Tauri v2 + React + Windows Graphics Capture + Hardware H.264 encoding
 - **OS:** Windows 10 1903+ / Windows 11
 - **GPU:** Any GPU with D3D11 + Video Processor support (NVIDIA, AMD, Intel)
 - **Encoder:** NVENC, AMF, QuickSync, or software fallback (libx264)
-- **RAM:** 4GB minimum, 8GB+ recommended (ring buffer uses ~865 MB at 1080p/5min)
+- **RAM:** 4GB minimum, 8GB+ recommended (ring buffer uses ~150 MB at 1080p/60s)
 - **Disk:** SSD recommended for clip saves
 
 ---
@@ -228,7 +229,7 @@ npm run tauri dev
 npx tauri build
 ```
 
-Output: `src-tauri/target/release/bundle/nsis/Clipsta_2.3.1_x64-setup.exe`
+Output: `src-tauri/target/release/bundle/nsis/Clipsta_2.3.2_x64-setup.exe`
 
 Requires:
 - Node.js 18+
