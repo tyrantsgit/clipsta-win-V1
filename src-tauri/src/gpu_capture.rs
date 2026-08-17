@@ -922,37 +922,20 @@ fn encoder_thread_fn(
                     let _ = nv12_free_tx.try_send(idx);
                 }
 
-                // Wait for a frame from the WGC callback with a timeout.
-                // If no frame arrives within 1.5× the expected interval, duplicate
-                // the last frame to maintain exactly 60fps output. This handles:
-                // - WGC missing a vsync delivery
-                // - Game stutter causing irregular frame delivery
-                // - SetMinUpdateInterval not being perfectly enforced
-                let timeout = std::time::Duration::from_micros(
-                    (1_000_000u64 / fps as u64) * 3 / 2  // 1.5× frame interval = 25ms at 60fps
-                );
-                let msg = match rx.recv_timeout(timeout) {
+                // Wait for a real frame from WGC (Clipsta Lite approach).
+                // No frame duplication — only encode actual delivered frames.
+                // This produces slightly variable fps (58-60) but enables:
+                // - Clean grid PTS (perfect audio sync)
+                // - Less encoder work (no duplicate frames)
+                // - Lower RAM (no duplicate H.264 in ring)
+                let msg = match rx.recv() {
                     Ok(m) => {
                         last_texture_idx = m.texture_index;
                         last_pts = m.pts_100ns;
                         last_duration = m.duration_100ns;
                         m
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // No frame arrived in time — duplicate last frame to fill gap.
-                        // This guarantees the encoder always outputs 60fps regardless
-                        // of WGC delivery irregularities.
-                        if last_texture_idx == usize::MAX {
-                            continue; // No frame received yet, can't duplicate
-                        }
-                        last_pts += last_duration; // Advance PTS by one frame
-                        FrameMsg {
-                            texture_index: last_texture_idx,
-                            pts_100ns: last_pts,
-                            duration_100ns: last_duration,
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(_) => {
                         log("channel disconnected, exiting");
                         break;
                     }
@@ -1449,11 +1432,22 @@ impl EncodedMediaRing {
     }
 
     fn new_with_bitrate(max_seconds: u32, bitrate_kbps: u32) -> Self {
-        // Memory-mapped video ring disabled for now — causes WebView2 crashes under
-        // heavy GPU load due to page fault pressure during save operations.
-        // Using in-memory ring (higher RAM but proven stable).
-        let video_mmap: Option<MmapVideoRing> = None;
-        let use_mmap = false;
+        // Memory-mapped video ring: stores H.264 frames in a temp file instead of heap.
+        // Previously disabled because WebView2's page fault pressure caused crashes during saves.
+        // Now SAFE: capture runs in clipsta-capture.exe which has NO WebView2.
+        let video_mmap = match MmapVideoRing::new(max_seconds, bitrate_kbps) {
+            Ok(ring) => {
+                eprintln!("[gpu_capture] Mmap ring enabled: ~{} MB file at {}",
+                    ring.capacity / (1024 * 1024),
+                    ring.file_path.display());
+                Some(ring)
+            }
+            Err(e) => {
+                eprintln!("[gpu_capture] Mmap ring failed (falling back to in-memory): {}", e);
+                None
+            }
+        };
+        let use_mmap = video_mmap.is_some();
 
         Self {
             video_mmap,
@@ -1703,9 +1697,13 @@ impl EncodedMediaRing {
 }
 
 /// Separate audio ring buffer — completely decoupled from the video EncodedMediaRing.
+/// Uses pre-allocated buffer pool (Clipsta Lite approach): after the initial fill,
+/// the audio callback NEVER allocates heap memory. Pruned buffers are recycled.
 pub(crate) struct AudioRingBuffer {
     chunks: std::collections::VecDeque<AudioChunk>,
     max_duration_100ns: i64,
+    /// Pool of reusable Vec<f32> buffers recycled from pruned chunks.
+    pool: Vec<Vec<f32>>,
 }
 
 unsafe impl Send for AudioRingBuffer {}
@@ -1716,6 +1714,21 @@ impl AudioRingBuffer {
         Self {
             chunks: std::collections::VecDeque::with_capacity(max_seconds as usize * 50),
             max_duration_100ns: max_seconds as i64 * 10_000_000,
+            pool: Vec::with_capacity(64),
+        }
+    }
+
+    /// Get a buffer from the pool (reuses existing allocation) or create a new one.
+    /// Called from the audio callback to avoid heap allocation in steady state.
+    pub fn acquire_buffer(&mut self, min_capacity: usize) -> Vec<f32> {
+        if let Some(mut buf) = self.pool.pop() {
+            buf.clear();
+            if buf.capacity() < min_capacity {
+                buf.reserve(min_capacity - buf.capacity());
+            }
+            buf
+        } else {
+            Vec::with_capacity(min_capacity)
         }
     }
 
@@ -1729,7 +1742,14 @@ impl AudioRingBuffer {
         let newest_pts = self.chunks.back().map(|c| c.pts_100ns).unwrap_or(0);
         while let Some(front) = self.chunks.front() {
             if newest_pts - front.pts_100ns > self.max_duration_100ns {
-                self.chunks.pop_front();
+                if let Some(old) = self.chunks.pop_front() {
+                    // Recycle the buffer back to the pool if we're the sole owner
+                    if let Ok(buf) = Arc::try_unwrap(old.data) {
+                        if self.pool.len() < 64 {
+                            self.pool.push(buf);
+                        }
+                    }
+                }
             } else {
                 break;
             }
@@ -2096,7 +2116,7 @@ pub struct CaptureOptions {
 
 /// Pre-warmed GPU resources created at app launch for fast recording start.
 /// Stored in an Option — consumed on first `start()` call, None afterwards.
-pub(crate) struct WarmCache {
+pub struct WarmCache {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     pub winrt_device: IDirect3DDevice,
@@ -2127,7 +2147,7 @@ pub struct CaptureSession {
     /// Handle to the capture thread for proper join on restart.
     capture_thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Pre-warmed D3D11 device + context created at app launch (saves ~100-200ms on first start).
-    pub(crate) warm_cache: Arc<Mutex<Option<WarmCache>>>,
+    pub warm_cache: Arc<Mutex<Option<WarmCache>>>,
 }
 
 impl Default for CaptureSession {
@@ -2639,6 +2659,15 @@ fn run_gpu_capture(
     }
     log("MFStartup OK");
 
+    // Set system timer resolution to 1ms (same as games do).
+    // Without this, Windows uses 15.6ms default which causes USB audio scheduling jitter
+    // and mic distortion when no game is running (games set this themselves).
+    unsafe {
+        extern "system" { fn timeBeginPeriod(uPeriod: u32) -> u32; }
+        timeBeginPeriod(1);
+    }
+    eprintln!("[gpu_capture] timeBeginPeriod(1) — 1ms timer resolution for USB audio");
+
     // Resolve target window/monitor
     let target_hwnd: Option<HWND> = match opts.source_id.as_deref() {
         Some(id) if id.starts_with("hwnd:") => {
@@ -2705,6 +2734,15 @@ fn run_gpu_capture(
         // NVIDIA: base bitrate is already tuned with headroom above ShadowPlay
         opts.bitrate_kbps
     };
+
+    // Request capture access for protected content (CoD/RICOCHET anti-cheat).
+    {
+        use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
+        let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+            .and_then(|op| op.SetCompleted(None));
+        let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Programmatic)
+            .and_then(|op| op.SetCompleted(None));
+    }
 
     // Create capture item
     let item = unsafe {
@@ -3005,35 +3043,32 @@ fn run_gpu_capture(
                 }
             }
 
-            // Calculate PTS — use wall-clock elapsed time from session_start.
-            // This matches audio PTS (which is wall-clock via sample counter at 48kHz).
-            // Frame counter still used for duration calculation.
+            // Calculate PTS — wall-clock elapsed (Clipsta Lite approach).
+            // Both video and audio use session_start.elapsed() ensuring perfect A/V sync.
+            let duration_100ns = 10_000_000i64 / fps as i64;
+            let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
             let pts_100ns = match session_start_cb.get() {
+                Some(start) => start.elapsed().as_nanos() as i64 / 100,
+                None => frame_num * duration_100ns, // fallback before first frame
+            };
+
+            // Frame pacing: only reject true duplicate frames (< 2ms apart).
+            // Since PTS is wall-clock based, we don't need grid-based pacing.
+            // WGC sometimes delivers the same frame twice in quick succession.
+            let pacing_now = match session_start_cb.get() {
                 Some(start) => start.elapsed().as_nanos() as i64 / 100,
                 None => 0,
             };
-
-            // Frame pacing: skip this frame if it arrived too soon.
-            // When game runs >60fps, WGC may deliver excess frames despite
-            // SetMinUpdateInterval. We enforce the cap here to reject only genuine
-            // duplicates (arriving faster than 2× target fps). The 50% threshold
-            // allows natural scheduling jitter (±8ms) without dropping legitimate
-            // frames. SetMinUpdateInterval handles the primary rate limiting;
-            // this is a safety net for edge cases only.
-            // Works identically on NVIDIA and AMD — both use the same WGC path.
-            let min_interval = (10_000_000i64 / fps as i64) * 50 / 100; // 50% of 16.6ms = 8.3ms
+            let min_interval = 20_000i64; // 2ms — only reject true duplicates
             {
                 let last = last_accepted_ns_cb.load(Ordering::Relaxed);
-                if pts_100ns - last < min_interval && last != 0 {
-                    // Too soon — skip this frame entirely (no VP, no encode)
+                if pacing_now - last < min_interval && last != 0 {
+                    // Undo frame counter since we're rejecting this frame
+                    frame_counter_cb.fetch_sub(1, Ordering::Relaxed);
                     return Ok(());
                 }
-                last_accepted_ns_cb.store(pts_100ns, Ordering::Relaxed);
+                last_accepted_ns_cb.store(pacing_now, Ordering::Relaxed);
             }
-
-            let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
-            let _ = frame_num; // Used for debug logging only
-            let duration_100ns = 10_000_000i64 / fps as i64;
 
             // Acquire a free NV12 texture from the pool.
             // If none available, encoder hasn't released any — skip this frame
@@ -3159,6 +3194,12 @@ fn run_gpu_capture(
     // Wait for audio thread
     if let Some(t) = audio_thread {
         let _ = t.join();
+    }
+
+    // Restore default timer resolution
+    unsafe {
+        extern "system" { fn timeEndPeriod(uPeriod: u32) -> u32; }
+        timeEndPeriod(1);
     }
 
     unsafe {
@@ -3332,32 +3373,86 @@ fn gpu_audio_loop(
 ) {
     unsafe {
         use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        // Set thread to TIME_CRITICAL — highest non-realtime priority.
+        // This ensures the audio thread gets scheduled even when WebView2's
+        // background threads are consuming CPU.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
     loop {
         if stop.load(Ordering::Relaxed) { return; }
         if session_start.get().is_some() { break; }
         thread::sleep(std::time::Duration::from_millis(1));
     }
-    eprintln!("[gpu_audio] Separate audio buffer — no encoder mutex contention");
-    let audio_buf_clone = audio_buffer.clone();
+    eprintln!("[gpu_audio] Lock-free audio: callback → channel → buffer (Medal approach)");
+
     let audio_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = audio_sample_counter.clone();
-    let res = WasapiCapture::capture_to_callback(stop, mic_device, loopback, move |chunk: &[f32]| {
-        let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
-        let sample_offset = counter_clone.fetch_add(n_frames, Ordering::Relaxed);
-        let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-        let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-        let audio_chunk = AudioChunk {
-            data: Arc::new(chunk.to_vec()),
-            pts_100ns,
-            duration_100ns,
-        };
-        audio_buf_clone.lock().push(audio_chunk);
+
+    // Lock-free channel: callback sends raw samples, this thread receives and pushes to buffer.
+    // The callback NEVER locks any mutex — it only does try_send which is non-blocking.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, i64, i64)>(200);
+
+    let stop_clone = stop.clone();
+    let session_start_clone = session_start.clone();
+
+    // Spawn WASAPI capture on a dedicated thread with TIME_CRITICAL priority
+    let capture_handle = thread::spawn(move || {
+        unsafe {
+            use windows::Win32::System::Threading::*;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+        let res = WasapiCapture::capture_to_callback(stop_clone, mic_device, loopback, move |chunk: &[f32]| {
+            let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
+            let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
+
+            // Clipsta Lite approach: wall-clock PTS from session_start.
+            // This ensures audio PTS matches video PTS (both use elapsed time),
+            // preventing A/V drift regardless of USB audio scheduling jitter.
+            let pts_100ns = match session_start_clone.get() {
+                Some(start) => start.elapsed().as_nanos() as i64 / 100,
+                None => 0,
+            };
+
+            // ZERO BLOCKING: try_send returns immediately.
+            // If channel is full (consumer is slow), drop this chunk — better than blocking.
+            let _ = tx.try_send((chunk.to_vec(), pts_100ns, duration_100ns));
+        });
+        if let Err(e) = res {
+            eprintln!("[gpu_audio] WASAPI error: {e}");
+        }
     });
-    if let Err(e) = res {
-        eprintln!("[gpu_audio] error: {e}");
+
+    // Consumer loop: pull audio from channel and push to ring buffer.
+    // This thread can safely lock the AudioRingBuffer because it's NOT
+    // the WASAPI callback thread — USB audio scheduling is not affected.
+    while !stop.load(Ordering::Relaxed) {
+        match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok((samples, pts, dur)) => {
+                let mut abuf = audio_buffer.lock();
+                let mut buf = abuf.acquire_buffer(samples.len());
+                buf.extend_from_slice(&samples);
+                abuf.push(AudioChunk {
+                    data: Arc::new(buf),
+                    pts_100ns: pts,
+                    duration_100ns: dur,
+                });
+                // Drain any additional pending chunks
+                while let Ok((samples, pts, dur)) = rx.try_recv() {
+                    let mut buf = abuf.acquire_buffer(samples.len());
+                    buf.extend_from_slice(&samples);
+                    abuf.push(AudioChunk {
+                        data: Arc::new(buf),
+                        pts_100ns: pts,
+                        duration_100ns: dur,
+                    });
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
+
+    let _ = capture_handle.join();
 }
 
 // ── Capture Diagnostics ───────────────────────────────────────────────────────

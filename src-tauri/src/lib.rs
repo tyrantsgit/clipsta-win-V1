@@ -6,9 +6,12 @@
 //! - In-process WGC + WASAPI capture (no separate process)
 
 pub mod audio;
+pub mod capture_proxy;
+pub mod chime;
 pub mod cloud_proxy;
 pub mod commands;
 pub mod gpu_capture;
+pub mod ipc;
 pub mod lossless_trim;
 pub mod mp4_inspect;
 pub mod settings;
@@ -19,13 +22,11 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
-use gpu_capture::CaptureSession;
 use settings::SettingsStore;
 use watch_folder::WatchFolderService;
 
@@ -87,7 +88,7 @@ pub fn run() {
     // heavy GPU load from games + capture encoder. CPU rendering for the HTML UI is
     // fast enough — it's just buttons, text, and thumbnails.
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--disable-gpu --disk-cache-size=52428800");
+        "--disable-gpu --disk-cache-size=52428800 --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -184,7 +185,17 @@ pub fn run() {
             }
 
             // Create capture session
-            let session = CaptureSession::new();
+            let proxy = match capture_proxy::CaptureProxy::spawn_and_connect() {
+                Ok(p) => {
+                    eprintln!("[clipsta] Capture process connected successfully");
+                    Arc::new(p)
+                }
+                Err(e) => {
+                    eprintln!("[clipsta] FATAL: Failed to spawn capture process: {}", e);
+                    // Fall back to showing error — can't function without capture
+                    panic!("Cannot start without capture process: {}", e);
+                }
+            };
 
             // Clean up old temp recording directories and orphaned temp files from previous sessions
             let temp_dir = std::env::temp_dir();
@@ -208,42 +219,25 @@ pub fn run() {
 
             // Manage state
             app.manage(store.clone());
-            app.manage(session);
+            app.manage(proxy.clone());
             app.manage(cloud_proxy::HttpClient::new());
 
-            // Pre-warm GPU resources in the background (saves ~100-200ms on first recording)
-            let session_ref = app.state::<CaptureSession>();
-            session_ref.warm_start();
-
             // Spawn the save-worker thread: receives hotkey save requests via channel,
-            // saves clips directly in Rust without any WebView involvement.
+            // sends SAVE commands to the capture process via IPC.
             // This is the Clipsta Lite architecture — hotkeys never touch the UI.
             {
                 let (tx, rx) = std_mpsc::sync_channel::<u32>(4);
                 let _ = SAVE_TX.set(tx);
 
-                let app_for_worker = app.handle().clone();
-                let session_for_worker = app.state::<CaptureSession>();
-                let ring = session_for_worker.ring.clone();
-                let audio_buffer = session_for_worker.audio_buffer.clone();
-                let is_saving = session_for_worker.is_saving.clone();
-                let is_recording = session_for_worker.is_recording.clone();
-                let clip_counter = session_for_worker.clip_counter.clone();
-                let saved_clips = session_for_worker.saved_clips.clone();
-                let multi_track_audio = session_for_worker.multi_track_audio.clone();
-                let session_fps = session_for_worker.session_fps.clone();
-                let session_width = session_for_worker.session_width.clone();
-                let session_height = session_for_worker.session_height.clone();
+                let is_recording = proxy.is_recording.clone();
+                let is_saving = proxy.is_saving.clone();
                 let store_for_worker = store.clone();
+                let proxy_for_save = proxy.clone();
 
                 std::thread::Builder::new()
                     .name("clipsta-save-worker".into())
                     .spawn(move || {
-                        unsafe {
-                            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-                            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                        }
-                        eprintln!("[clipsta] Save-worker thread started");
+                        eprintln!("[clipsta] Save-worker thread started (IPC mode)");
 
                         while let Ok(seconds) = rx.recv() {
                             if !is_recording.load(Ordering::Relaxed) {
@@ -254,9 +248,6 @@ pub fn run() {
                             }
 
                             let settings = store_for_worker.get();
-                            let fps = session_fps.load(Ordering::Relaxed);
-                            let width = session_width.load(Ordering::Relaxed);
-                            let height = session_height.load(Ordering::Relaxed);
 
                             // Generate filename (ShadowPlay style)
                             let now = chrono::Local::now();
@@ -286,16 +277,14 @@ pub fn run() {
                             let output_path = game_folder.join(&file_name);
                             let output_str = output_path.to_string_lossy().to_string();
 
-                            let result = gpu_capture::save_clip_standalone(
-                                &ring, &audio_buffer, &is_saving, &is_recording, &clip_counter, &saved_clips,
-                                &multi_track_audio, fps, width, height, seconds, &output_str,
-                            );
+                            // Send save command to capture process via IPC
+                            let result = proxy_for_save.save_clip(seconds, &output_str);
                             match result {
                                 Ok(ref path) => {
                                     eprintln!("[clipsta] Clip saved: {}", path);
+                                    // Chime is played by the capture process now
 
                                     // Auto-upload in Rust (no WebView involvement).
-                                    // Check if auto-upload is enabled in settings.
                                     let upload_settings = store_for_worker.get();
                                     if upload_settings.auto_upload && upload_settings.cloud_enabled && !upload_settings.cloud_pair_code.is_empty() {
                                         let path_clone = path.clone();
@@ -308,9 +297,8 @@ pub fn run() {
                                     }
                                 }
                                 Err(e) => {
-                                    let msg = format!("{}", e);
-                                    if !msg.contains("No keyframe") && !msg.contains("Not recording") && !msg.contains("Save already") {
-                                        eprintln!("[clipsta] Clip save error: {}", msg);
+                                    if !e.contains("No keyframe") && !e.contains("Not recording") && !e.contains("Save already") {
+                                        eprintln!("[clipsta] Clip save error: {}", e);
                                     }
                                 }
                             }
@@ -352,15 +340,16 @@ pub fn run() {
                 let app = window.app_handle();
                 let store = app.state::<SettingsStore>();
                 if store.get().minimize_to_tray {
-                    // Hide to tray instead of closing — recording continues
+                    // Hide to tray — recording continues in background.
+                    // WebView2 renderer is suspended when window is hidden.
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
-                    let session = app.state::<CaptureSession>();
-                    if session.is_recording.load(Ordering::Relaxed) {
-                        session.stop();
+                    let proxy = app.state::<Arc<capture_proxy::CaptureProxy>>();
+                    if proxy.is_recording.load(Ordering::Relaxed) {
+                        let _ = proxy.stop();
                     }
-                    session.cleanup();
+                    proxy.shutdown();
                     app.exit(0);
                 }
             }
@@ -445,11 +434,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             "quit" => {
                 // Stop recording if active
-                let session = app.state::<CaptureSession>();
-                if session.is_recording.load(Ordering::Relaxed) {
-                    session.stop();
+                let proxy = app.state::<Arc<capture_proxy::CaptureProxy>>();
+                if proxy.is_recording.load(Ordering::Relaxed) {
+                    let _ = proxy.stop();
                 }
-                session.cleanup();
+                proxy.shutdown();
                 app.exit(0);
             }
             _ => {}

@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-use crate::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment, SourceInfo, save_clip_standalone, AudioRingBuffer};
+use crate::capture_proxy::CaptureProxy;
+use crate::gpu_capture::{SourceInfo};
+use crate::ipc::StartPayload;
 use crate::settings::{AppSettings, SettingsStore};
+use std::sync::Arc;
 
 /// Initialize COM MTA on the current thread (for async command threads).
 /// Safe to call multiple times — returns S_FALSE if already initialized.
@@ -234,11 +237,10 @@ pub async fn wgc_capture_diagnostics() -> Result<crate::gpu_capture::CaptureDiag
 #[tauri::command]
 pub async fn wgc_start_recording(
     app: AppHandle,
-    session: State<'_, CaptureSession>,
+    proxy: State<'_, Arc<CaptureProxy>>,
     store: State<'_, SettingsStore>,
     opts: StartRecordingOpts,
 ) -> Result<serde_json::Value, String> {
-    ensure_com();
     let settings = store.get();
     let fps = opts.fps.unwrap_or(settings.fps);
     let no_audio = opts.no_audio.unwrap_or(!settings.capture_audio);
@@ -251,41 +253,30 @@ pub async fn wgc_start_recording(
     };
     let bitrate = resolve_quality_bitrate(&settings.resolution, fps, &settings.quality);
 
-    let seg_dir = std::env::temp_dir().join("clipsta_recording");
-
-    // Clean up any old recording files from previous sessions
-    if seg_dir.exists() {
-        let _ = std::fs::remove_dir_all(&seg_dir);
-    }
-
-    let capture_opts = CaptureOptions {
+    let payload = StartPayload {
         source_id: opts.source_id,
         fps,
         no_audio,
-        mic_device: opts.mic_device,
-        loopback_device: opts.loopback_device,
+        mic_device: if settings.capture_mic {
+            opts.mic_device.or_else(|| {
+                if settings.audio_input_device_id.is_empty() { Some("default".to_string()) }
+                else { Some(settings.audio_input_device_id.clone()) }
+            })
+        } else {
+            None
+        },
+        loopback_device: opts.loopback_device.or_else(|| {
+            if settings.desktop_audio_device_id.is_empty() { None }
+            else { Some(settings.desktop_audio_device_id.clone()) }
+        }),
         target_width: target_w,
         target_height: target_h,
         bitrate_kbps: bitrate,
-        segment_duration: 3,
         buffer_duration: settings.buffer_duration,
-        segment_dir: seg_dir,
         multi_track_audio: settings.multi_track_audio,
-        warm_cache: Some(session.warm_cache.clone()),
     };
 
-    let app_handle = app.clone();
-    let on_segment = Box::new(move |seg: CompletedSegment| {
-        let _ = app_handle.emit("wgc:segment", &seg);
-    });
-
-    // Notify frontend if capture dies unexpectedly (GPU reset, mode switch, etc)
-    let app_died = app.clone();
-    let on_died = Some(Box::new(move |reason: String| {
-        let _ = app_died.emit("wgc:capture-lost", &reason);
-    }) as Box<dyn FnOnce(String) + Send + 'static>);
-
-    let info = session.start(capture_opts, on_segment, on_died).map_err(|e| {
+    let info = proxy.start(payload).map_err(|e| {
         let msg = format!("Capture start failed: {}", e);
         let _ = app.emit("wgc:error", &msg);
         msg
@@ -295,29 +286,28 @@ pub async fn wgc_start_recording(
         "width": info.width,
         "height": info.height,
         "fps": info.fps,
-        "segmentDir": info.segment_dir,
+        "segmentDir": "",
     }))
 }
 
 #[tauri::command]
-pub async fn wgc_stop_recording(session: State<'_, CaptureSession>) -> Result<(), String> {
-    session.stop();
-    Ok(())
+pub async fn wgc_stop_recording(proxy: State<'_, Arc<CaptureProxy>>) -> Result<(), String> {
+    proxy.stop().map_err(|e| e)
 }
 
 #[tauri::command]
 pub async fn wgc_save_clip(
-    app: AppHandle,
-    session: State<'_, CaptureSession>,
+    _app: AppHandle,
+    proxy: State<'_, Arc<CaptureProxy>>,
     store: State<'_, SettingsStore>,
     seconds: u32,
     file_name: String,
 ) -> Result<Option<String>, String> {
-    if session.is_saving.load(std::sync::atomic::Ordering::Relaxed) {
+    if proxy.is_saving.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Another save is in progress".to_string());
     }
 
-    if !session.is_recording.load(std::sync::atomic::Ordering::Relaxed) {
+    if !proxy.is_recording.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(None);
     }
 
@@ -338,51 +328,18 @@ pub async fn wgc_save_clip(
     let output_path = game_folder.join(&file_name);
     let output_str = output_path.to_string_lossy().to_string();
 
-    // Clone Arc fields needed for spawn_blocking
-    let is_saving = session.is_saving.clone();
-    let is_recording_flag = session.is_recording.clone();
-    let ring = session.ring.clone();
-    let audio_buffer = session.audio_buffer.clone();
-    let session_fps_val = session.session_fps.load(std::sync::atomic::Ordering::Relaxed);
-    let session_width_val = session.session_width.load(std::sync::atomic::Ordering::Relaxed);
-    let session_height_val = session.session_height.load(std::sync::atomic::Ordering::Relaxed);
-    let clip_counter = session.clip_counter.clone();
-    let saved_clips = session.saved_clips.clone();
-    let multi_track_audio = session.multi_track_audio.clone();
-
-    // Run save on a blocking thread so we don't block the async runtime,
-    // but still wait for the result to return to the frontend.
-    let save_result = tokio::task::spawn_blocking(move || {
-        unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
-        save_clip_standalone(
-            &ring, &audio_buffer, &is_saving, &is_recording_flag, &clip_counter, &saved_clips,
-            &multi_track_audio,
-            session_fps_val, session_width_val, session_height_val,
-            seconds, &output_str,
-        )
-    })
-    .await
-    .map_err(|e| format!("Save task panicked: {}", e))?;
-
-    match save_result {
+    // Send save command to capture process via IPC
+    match proxy.save_clip(seconds, &output_str) {
         Ok(path) => {
-            // Do NOT emit events to WebView (wgc:clipSaved, play-clip-sound).
-            // Emitting forces WebView2 to execute JavaScript, which wakes its GPU
-            // renderer, which crashes under game GPU pressure. The frontend already
-            // gets the path from the return value of this command.
-            // Clipsta Lite uses the same approach: no UI feedback during gameplay.
             eprintln!("[clipsta] Clip saved: {}", path);
+            // Chime is played by the capture process
             Ok(Some(path))
         }
         Err(e) => {
-            let msg = format!("{}", e);
-            if msg.contains("Not enough") || msg.contains("No keyframe") {
+            if e.contains("Not enough") || e.contains("No keyframe") {
                 Ok(None)
             } else {
-                Err(msg)
+                Err(e)
             }
         }
     }
@@ -391,7 +348,7 @@ pub async fn wgc_save_clip(
 #[tauri::command]
 pub async fn wgc_save_full_recording(
     app: AppHandle,
-    session: State<'_, CaptureSession>,
+    proxy: State<'_, Arc<CaptureProxy>>,
     store: State<'_, SettingsStore>,
 ) -> Result<Option<String>, String> {
     // Save the entire buffer content (up to buffer_duration seconds)
@@ -402,17 +359,16 @@ pub async fn wgc_save_full_recording(
     let output_str = output_path.to_string_lossy().to_string();
 
     // Save the maximum buffer duration
-    match session.save_clip(settings.buffer_duration, &output_str) {
+    match proxy.save_clip(settings.buffer_duration, &output_str) {
         Ok(path) => {
             let _ = app.emit("wgc:clipSaved", &path);
             Ok(Some(path))
         }
         Err(e) => {
-            let msg = format!("{}", e);
-            if msg.contains("Not enough") || msg.contains("No keyframe") {
+            if e.contains("Not enough") || e.contains("No keyframe") {
                 Ok(None)
             } else {
-                Err(msg)
+                Err(e)
             }
         }
     }

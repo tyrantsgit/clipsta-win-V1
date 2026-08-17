@@ -139,7 +139,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				<Section icon={<Monitor size={16} />} title="Video" search={settingsSearch}>
 					<div className="grid grid-cols-2 gap-4">
 						<SelectField label="Resolution" value={local.resolution} onChange={(v) => update("resolution", v)} options={["native", "480p", "720p", "1080p", "1440p", "4k"]} display={(v) => v === "native" ? "Native (Monitor Resolution)" : v} />
-						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
+						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60"]} />
 						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
 						<SelectField label="Clip Quality" value={local.quality} onChange={(v) => update("quality", v)} options={["standard", "high", "ultra"]} display={(v) => v === "standard" ? "Standard (Smaller files)" : v === "high" ? "High (Recommended)" : v === "ultra" ? "Ultra (Maximum clarity)" : v} />

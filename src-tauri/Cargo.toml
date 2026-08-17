@@ -1,9 +1,10 @@
 [package]
 name = "clipsta-tauri"
-version = "2.3.1"
+version = "2.3.2"
 description = "Clipsta - Gaming clip recorder powered by Windows Capture"
 authors = ["Clipsta"]
 edition = "2021"
+default-run = "clipsta-tauri"
 
 [lib]
 name = "clipsta_tauri_lib"
@@ -41,6 +42,7 @@ features = [
   "Graphics_Capture",
   "Graphics_DirectX",
   "Graphics_DirectX_Direct3D11",
+  "Security_Authorization_AppCapabilityAccess",
   # D3D11 / DXGI
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
@@ -59,6 +61,7 @@ features = [
   "Win32_System_Threading",
   "Win32_System_Performance",
   "Win32_System_Pipes",
+  "Win32_System_IO",
   "Win32_System_WinRT",
   "Win32_System_WinRT_Direct3D11",
   "Win32_System_WinRT_Graphics_Capture",
@@ -70,6 +73,10 @@ features = [
   "Win32_Security",
   "Win32_Storage_FileSystem",
 ]
+
+[[bin]]
+name = "clipsta-capture"
+path = "src/bin/clipsta-capture.rs"
 
 [profile.release]
 opt-level = 3

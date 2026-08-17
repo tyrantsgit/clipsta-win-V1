@@ -56,7 +56,7 @@ impl Default for AppSettings {
             hotkey_clip1_min: "Alt+F9".to_string(),
             hotkey_clip5_min: "Alt+F10".to_string(),
             hotkey_record: "F9".to_string(),
-            buffer_duration: 300,
+            buffer_duration: 60,
             resolution: "1080p".to_string(),
             fps: 60,
             aspect_ratio: "16:9".to_string(),
