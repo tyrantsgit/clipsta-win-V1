@@ -93,11 +93,12 @@ impl WasapiCapture {
                         .GetDefaultAudioEndpoint(eRender, eConsole)
                         .context("GetDefaultAudioEndpoint")?
                 } else {
-                    Self::find_render_device(&enumerator, id).unwrap_or_else(|_| {
-                        enumerator
+                    match Self::find_render_device(&enumerator, id) {
+                        Ok(dev) => dev,
+                        Err(_) => enumerator
                             .GetDefaultAudioEndpoint(eRender, eConsole)
-                            .unwrap()
-                    })
+                            .context("GetDefaultAudioEndpoint (render fallback)")?,
+                    }
                 }
             } else {
                 enumerator
@@ -263,8 +264,7 @@ impl WasapiCapture {
                                             // Single-track: mix mic into desktop
                                             let mix_len = conv_buf.len().min(mic_conv_buf.len());
                                             for i in 0..mix_len {
-                                                conv_buf[i] =
-                                                    (conv_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                                conv_buf[i] = mix_samples(conv_buf[i], mic_conv_buf[i]);
                                             }
                                         }
                                     }
@@ -318,7 +318,7 @@ impl WasapiCapture {
                                             // Single-track: mix into silence buffer
                                             let mix_len = (needed).min(mic_conv_buf.len());
                                             for i in 0..mix_len {
-                                                silence_buf[i] = (silence_buf[i] + mic_conv_buf[i]).clamp(-1.0, 1.0);
+                                                silence_buf[i] = mix_samples(silence_buf[i], mic_conv_buf[i]);
                                             }
                                         }
                                     }
@@ -485,11 +485,12 @@ impl WasapiCapture {
                     break;
                 }
             }
-            found.unwrap_or_else(|| {
-                enumerator
+            match found {
+                Some(dev) => dev,
+                None => enumerator
                     .GetDefaultAudioEndpoint(eCapture, eConsole)
-                    .unwrap()
-            })
+                    .context("GetDefaultAudioEndpoint (mic fallback)")?,
+            }
         };
         let c: IAudioClient = device.Activate(CLSCTX_ALL, None).context("Mic Activate")?;
         let fmt = c.GetMixFormat().context("Mic GetMixFormat")? as *const WAVEFORMATEX;
@@ -561,4 +562,39 @@ fn read_sample(d: &[u8], bps: usize, float: bool) -> f32 {
             _ => 0.0,
         }
     }
+}
+
+/// Soft-knee saturation for the region beyond `THRESHOLD`. Below the
+/// threshold, samples pass through unchanged (no coloration of normal-level
+/// audio). Above it, excursions are compressed smoothly toward the ±1.0
+/// asymptote instead of being flat-topped, which removes the harsh crackle
+/// a hard clamp produces.
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    const THRESHOLD: f32 = 0.9;
+    let ax = x.abs();
+    if ax <= THRESHOLD {
+        return x;
+    }
+    const KNEE: f32 = 1.0 - THRESHOLD;
+    let over = ax - THRESHOLD;
+    x.signum() * (THRESHOLD + KNEE * (1.0 - (-over / KNEE).exp()))
+}
+
+/// Mix a desktop sample and a mic sample for single-track recording.
+///
+/// Root cause of the mic distortion: the previous code summed both sources
+/// at full unity gain and then hard-clamped to [-1.0, 1.0]. Two live audio
+/// sources (game audio + mic) routinely both carry meaningful energy at the
+/// same instant, so the raw sum regularly exceeds full scale — and a hard
+/// clamp on that overflow is audible as crackly, flat-topped distortion.
+///
+/// Fix: apply -3dB (1/sqrt(2)) headroom to each source before summing, which
+/// is standard practice for linear-sum mixers and removes the vast majority
+/// of overs, then run any remaining excursion through a soft-knee limiter
+/// instead of a hard clamp so what little clipping remains is inaudible.
+#[inline]
+fn mix_samples(desktop: f32, mic: f32) -> f32 {
+    const HEADROOM: f32 = 0.7071; // 1/sqrt(2), -3dB per source
+    soft_clip(desktop * HEADROOM + mic * HEADROOM)
 }

@@ -67,7 +67,12 @@ pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings
     if !settings.hotkey_record.is_empty() {
         if let Ok(shortcut) = settings.hotkey_record.parse::<Shortcut>() {
             let app_h = app_clone.clone();
-            let _ = gs.on_shortcut(shortcut, move |_app, _shortcut, _event| {
+            let _ = gs.on_shortcut(shortcut, move |_app, _shortcut, event| {
+                // Same guardrail as the clip-save hotkeys above: fire once per
+                // press, not once per press AND once per release.
+                if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    return;
+                }
                 let _ = app_h.emit("hotkey:record", ());
             });
         }

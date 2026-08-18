@@ -623,26 +623,10 @@ unsafe fn init_hardware_encoder_relaxed(
     let unk: windows::core::IUnknown = manager.cast()?;
     transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, unk.as_raw() as usize)?;
 
-    // Output type: Baseline profile, adaptive level (maximum compatibility)
-    let level: u32 = if height > 720 { 51 } else { 40 };
-    let out_type: IMFMediaType = MFCreateMediaType()?;
-    out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-    out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
-    out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps * 1000)?;
-    out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-    out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
-    out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 66)?; // Baseline profile
-    out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level)?;
-    // Color space: limited range BT.709 (same as optimal path)
-    let _ = out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);
-    let _ = out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);
-    let _ = out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);
-    let _ = out_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);
-    transform.SetOutputType(0, &out_type, 0)?;
-
-    // ICodecAPI: VBR mode only, skip low-latency (some drivers reject it)
+    // ICodecAPI: rate control BEFORE SetOutputType (Clipsta Lite guardrail #5).
+    // This tier exists specifically to work around AMD driver quirks, so it must
+    // follow the same ordering as the primary path — AMD encoders return success
+    // for ICodecAPI changes made after SetOutputType but silently ignore them.
     if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
         use windows::Win32::System::Variant::*;
 
@@ -666,6 +650,26 @@ unsafe fn init_hardware_encoder_relaxed(
 
         // Skip low-latency and VBV buffer — let the driver use defaults
     }
+
+    // Output type: Baseline profile, adaptive level (maximum compatibility)
+    // AFTER rate control is configured (guardrail #5).
+    let level: u32 = if height > 720 { 51 } else { 40 };
+    let out_type: IMFMediaType = MFCreateMediaType()?;
+    out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+    out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
+    out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps * 1000)?;
+    out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 66)?; // Baseline profile
+    out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level)?;
+    // Color space: limited range BT.709 (same as optimal path)
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1);
+    let _ = out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, 2);
+    let _ = out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, 2);
+    let _ = out_type.SetUINT32(&MF_MT_YUV_MATRIX, 2);
+    transform.SetOutputType(0, &out_type, 0)?;
 
     // Input type
     let in_type: IMFMediaType = MFCreateMediaType()?;
