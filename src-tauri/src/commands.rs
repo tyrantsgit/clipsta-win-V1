@@ -257,14 +257,14 @@ pub async fn wgc_start_recording(
         source_id: opts.source_id,
         fps,
         no_audio,
-        mic_device: if settings.capture_mic {
-            opts.mic_device.or_else(|| {
+        mic_device: opts.mic_device.or_else(|| {
+            if settings.capture_mic {
                 if settings.audio_input_device_id.is_empty() { Some("default".to_string()) }
                 else { Some(settings.audio_input_device_id.clone()) }
-            })
-        } else {
-            None
-        },
+            } else {
+                None
+            }
+        }),
         loopback_device: opts.loopback_device.or_else(|| {
             if settings.desktop_audio_device_id.is_empty() { None }
             else { Some(settings.desktop_audio_device_id.clone()) }
@@ -297,7 +297,7 @@ pub async fn wgc_stop_recording(proxy: State<'_, Arc<CaptureProxy>>) -> Result<(
 
 #[tauri::command]
 pub async fn wgc_save_clip(
-    _app: AppHandle,
+    app: AppHandle,
     proxy: State<'_, Arc<CaptureProxy>>,
     store: State<'_, SettingsStore>,
     seconds: u32,
@@ -332,7 +332,9 @@ pub async fn wgc_save_clip(
     match proxy.save_clip(seconds, &output_str) {
         Ok(path) => {
             eprintln!("[clipsta] Clip saved: {}", path);
-            // Chime is played by the capture process
+            // Emit clipSaved event so the library auto-refreshes.
+            // The capture process handles the chime; this just notifies the UI.
+            let _ = app.emit("wgc:clipSaved", &path);
             Ok(Some(path))
         }
         Err(e) => {

@@ -15,11 +15,15 @@ use anyhow::{Context, Result};
 
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE,
-    WAVEFORMATEX,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioClient2,
+    IAudioSessionControl2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AudioClientProperties, DEVICE_STATE, WAVEFORMATEX,
 };
+use windows::Win32::Media::Audio::{
+    AUDCLNT_STREAMOPTIONS_RAW, AUDIO_STREAM_CATEGORY,
+};
+use windows_core::Interface;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
@@ -109,6 +113,20 @@ impl WasapiCapture {
             let lb_client: IAudioClient = render_device
                 .Activate(CLSCTX_ALL, None)
                 .context("Activate loopback")?;
+
+            // ── Anti-ducking: declare loopback as Media category ──
+            // Prevents Windows from ducking our audio capture when WebView2's
+            // Chromium process registers a communications session.
+            if let Ok(client2) = lb_client.cast::<IAudioClient2>() {
+                let props = AudioClientProperties {
+                    cbSize: std::mem::size_of::<AudioClientProperties>() as u32,
+                    bIsOffload: false.into(),
+                    eCategory: AUDIO_STREAM_CATEGORY(1), // AudioCategory_Media
+                    Options: windows::Win32::Media::Audio::AUDCLNT_STREAMOPTIONS(0),
+                };
+                let _ = client2.SetClientProperties(&props);
+            }
+
             let lb_fmt = lb_client.GetMixFormat().context("GetMixFormat")? as *const WAVEFORMATEX;
             lb_client
                 .Initialize(
@@ -120,6 +138,15 @@ impl WasapiCapture {
                     None,
                 )
                 .context("Initialize loopback")?;
+
+            // ── Disable audio ducking on our session ──
+            // When WebView2 triggers communications mode, Windows ducks other
+            // sessions by -12dB. Opt out so our captured audio isn't attenuated.
+            if let Ok(session_ctl) = lb_client.GetService::<IAudioSessionControl2>() {
+                // SetDuckingPreference(TRUE) = "don't duck me"
+                let _ = session_ctl.SetDuckingPreference(true);
+            }
+
             let lb_capture: IAudioCaptureClient =
                 lb_client.GetService().context("GetService loopback")?;
 
@@ -493,16 +520,86 @@ impl WasapiCapture {
             }
         };
         let c: IAudioClient = device.Activate(CLSCTX_ALL, None).context("Mic Activate")?;
+
+        // ── Anti-distortion: declare as Media category ──
+        // WebView2's Chromium renderer registers as a "communications" audio session,
+        // which triggers Windows to apply AEC (Acoustic Echo Cancellation) and noise
+        // suppression system-wide on the mic. By declaring our capture client as
+        // AudioCategory_Media, we tell Windows this is NOT a communications stream.
+        //
+        // We try RAW mode first (bypasses all APO DSP effects) but fall back to
+        // category-only if the driver rejects it — many USB mics don't support RAW.
+        let mut raw_mode_active = false;
+        if let Ok(client2) = c.cast::<IAudioClient2>() {
+            // First try: Media category + RAW (maximum quality, no DSP)
+            let props_raw = AudioClientProperties {
+                cbSize: std::mem::size_of::<AudioClientProperties>() as u32,
+                bIsOffload: false.into(),
+                eCategory: AUDIO_STREAM_CATEGORY(1), // AudioCategory_Media
+                Options: AUDCLNT_STREAMOPTIONS_RAW,
+            };
+            if client2.SetClientProperties(&props_raw).is_ok() {
+                raw_mode_active = true;
+            } else {
+                // Fallback: Media category only (no RAW) — still avoids AEC
+                let props_compat = AudioClientProperties {
+                    cbSize: std::mem::size_of::<AudioClientProperties>() as u32,
+                    bIsOffload: false.into(),
+                    eCategory: AUDIO_STREAM_CATEGORY(1), // AudioCategory_Media
+                    Options: windows::Win32::Media::Audio::AUDCLNT_STREAMOPTIONS(0),
+                };
+                let _ = client2.SetClientProperties(&props_compat);
+            }
+        }
+
         let fmt = c.GetMixFormat().context("Mic GetMixFormat")? as *const WAVEFORMATEX;
-        c.Initialize(
+
+        // Try Initialize — if RAW mode was set and it fails, retry without RAW
+        let init_result = c.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
             2_000_000,
             0,
             fmt,
             None,
-        )
-        .context("Mic Initialize")?;
+        );
+
+        if let Err(e) = init_result {
+            if raw_mode_active {
+                // RAW mode rejected by driver — re-create client without RAW
+                eprintln!("[audio] Mic RAW mode rejected, falling back to standard mode");
+                CoTaskMemFree(Some(fmt as *const _));
+                // Re-activate to get a fresh IAudioClient (can't re-initialize)
+                let c2: IAudioClient = device.Activate(CLSCTX_ALL, None)
+                    .context("Mic Activate (retry)")?;
+                if let Ok(client2) = c2.cast::<IAudioClient2>() {
+                    let props = AudioClientProperties {
+                        cbSize: std::mem::size_of::<AudioClientProperties>() as u32,
+                        bIsOffload: false.into(),
+                        eCategory: AUDIO_STREAM_CATEGORY(1),
+                        Options: windows::Win32::Media::Audio::AUDCLNT_STREAMOPTIONS(0),
+                    };
+                    let _ = client2.SetClientProperties(&props);
+                }
+                let fmt2 = c2.GetMixFormat().context("Mic GetMixFormat (retry)")? as *const WAVEFORMATEX;
+                c2.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    2_000_000,
+                    0,
+                    fmt2,
+                    None,
+                ).context("Mic Initialize (retry)")?;
+                let cap: IAudioCaptureClient = c2.GetService().context("Mic GetService")?;
+                eprintln!("[audio] Mic: using AudioCategory_Media (standard mode)");
+                return Ok((c2, cap, fmt2));
+            } else {
+                return Err(e).context("Mic Initialize");
+            }
+        }
+
+        eprintln!("[audio] Mic: AudioCategory_Media + {} mode active",
+            if raw_mode_active { "RAW" } else { "standard" });
         let cap: IAudioCaptureClient = c.GetService().context("Mic GetService")?;
         Ok((c, cap, fmt))
     }
