@@ -8,3 +8,7 @@
 
 # Large bundled binaries (download separately)
 /resources/ffmpeg.exe
+
+
+# Staged sidecar binaries (built by npm run build:capture)
+/binaries/

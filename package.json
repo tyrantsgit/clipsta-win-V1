@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:capture": "cargo build -p clipsta-capture --release && powershell -Command \"New-Item -ItemType Directory -Path src-tauri/binaries -Force | Out-Null; Copy-Item target/release/clipsta-capture.exe src-tauri/binaries/clipsta-capture-x86_64-pc-windows-msvc.exe -Force\"",
     "preview": "vite preview",
     "tauri": "tauri"
   },

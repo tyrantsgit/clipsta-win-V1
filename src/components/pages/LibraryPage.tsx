@@ -38,9 +38,20 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 
 	useEffect(() => { load(); }, [load]);
 
-	// Tauri 2 native drag-drop: provides full file paths from OS
+	// Auto-refresh library when a clip is saved (hotkey or button)
 	const loadRef = useRef(load);
 	loadRef.current = load;
+	useEffect(() => {
+		const unlistenPromise = bridge.onWgcClipSaved(() => {
+			// Brief delay to ensure file is fully written before scanning
+			setTimeout(() => loadRef.current(), 500);
+		});
+		return () => {
+			if (unlistenPromise && typeof unlistenPromise === "object" && "then" in unlistenPromise) {
+				(unlistenPromise as Promise<() => void>).then((u) => u()).catch(() => {});
+			}
+		};
+	}, []);
 	const [dropAnimation, setDropAnimation] = useState(false);
 	useEffect(() => {
 		const unlisten = getCurrentWindow().onDragDropEvent(async (event) => {

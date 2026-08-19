@@ -8,8 +8,8 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use crate::capture_proxy::CaptureProxy;
-use crate::gpu_capture::{SourceInfo};
-use crate::ipc::StartPayload;
+use clipsta_capture::gpu_capture::SourceInfo;
+use clipsta_capture::ipc::StartPayload;
 use crate::settings::{AppSettings, SettingsStore};
 use std::sync::Arc;
 
@@ -225,13 +225,13 @@ pub struct StartRecordingOpts {
 #[tauri::command]
 pub async fn wgc_sources() -> Result<Vec<SourceInfo>, String> {
     ensure_com();
-    Ok(crate::gpu_capture::list_sources())
+    Ok(clipsta_capture::gpu_capture::list_sources())
 }
 
 #[tauri::command]
-pub async fn wgc_capture_diagnostics() -> Result<crate::gpu_capture::CaptureDiagnostics, String> {
+pub async fn wgc_capture_diagnostics() -> Result<clipsta_capture::gpu_capture::CaptureDiagnostics, String> {
     ensure_com();
-    Ok(crate::gpu_capture::capture_diagnostics())
+    Ok(clipsta_capture::gpu_capture::capture_diagnostics())
 }
 
 #[tauri::command]
@@ -932,13 +932,13 @@ fn find_ffmpeg() -> Option<String> {
 #[tauri::command]
 pub async fn audio_list_devices() -> Result<Vec<serde_json::Value>, String> {
     ensure_com();
-    crate::audio::WasapiCapture::list_audio_devices().map_err(|e| e.to_string())
+    clipsta_capture::audio::WasapiCapture::list_audio_devices().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn audio_default_devices() -> Result<serde_json::Value, String> {
     ensure_com();
-    crate::audio::WasapiCapture::get_default_devices().map_err(|e| e.to_string())
+    clipsta_capture::audio::WasapiCapture::get_default_devices().map_err(|e| e.to_string())
 }
 
 // ── System info ───────────────────────────────────────────────────────────────

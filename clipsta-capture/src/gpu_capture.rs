@@ -648,7 +648,11 @@ unsafe fn init_hardware_encoder_relaxed(
         let val = make_u32_variant(bitrate_kbps * 1000);
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
 
-        // Skip low-latency and VBV buffer — let the driver use defaults
+        // VBV buffer size = 2 seconds of bitrate (guardrail #6: always configure alongside bitrate).
+        // Larger than the primary path (1s) because VBR benefits from a bigger buffer to smooth
+        // rate oscillation, while still preventing unbounded I-frame spikes.
+        let val = make_u32_variant(bitrate_kbps * 1000 * 2);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
     }
 
     // Output type: Baseline profile, adaptive level (maximum compatibility)
@@ -760,6 +764,34 @@ unsafe fn init_hardware_encoder_bare(
     manager.ResetDevice(device, reset_token)?;
     let unk: windows::core::IUnknown = manager.cast()?;
     transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, unk.as_raw() as usize)?;
+
+    // Best-effort rate control — even the bare path should try to cap bitrate (guardrail #6).
+    // If the driver rejects these, we proceed anyway (bare path is last-resort).
+    if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+        use windows::Win32::System::Variant::*;
+
+        unsafe fn make_u32_variant_bare(val: u32) -> VARIANT {
+            let mut v = VARIANT::default();
+            v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                Anonymous: VARIANT_0_0_0 { ulVal: val },
+                ..Default::default()
+            });
+            v
+        }
+
+        // VBR mode (most universally supported)
+        let val = make_u32_variant_bare(0);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+
+        // Target bitrate
+        let val = make_u32_variant_bare(bitrate_kbps * 1000);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+
+        // VBV buffer = 2 seconds (guardrail #6)
+        let val = make_u32_variant_bare(bitrate_kbps * 1000 * 2);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
+    }
 
     // Output type: ONLY mandatory fields — no profile, no level
     let out_type: IMFMediaType = MFCreateMediaType()?;
@@ -2282,8 +2314,8 @@ impl CaptureSession {
         self.frame_drops.store(0, Ordering::SeqCst);
 
         // Reset ring buffer
-        *self.ring.lock() = EncodedMediaRing::new(opts.buffer_duration.max(MAX_RING_SECONDS));
-        *self.audio_buffer.lock() = AudioRingBuffer::new(opts.buffer_duration.max(MAX_RING_SECONDS));
+        *self.ring.lock() = EncodedMediaRing::new_with_bitrate(opts.buffer_duration.min(MAX_RING_SECONDS), opts.bitrate_kbps);
+        *self.audio_buffer.lock() = AudioRingBuffer::new(opts.buffer_duration.min(MAX_RING_SECONDS));
 
         let stop = self.stop_flag.clone();
         let is_recording = self.is_recording.clone();
@@ -3128,12 +3160,14 @@ fn run_gpu_capture(
             }
             let vp_elapsed_us = vp_start.elapsed().as_micros() as i64;
 
-            // If VP took longer than 1 frame interval, GPU is saturated — skip next frame.
+            // If VP took longer than 2 frame intervals, GPU is truly saturated — skip next frame.
             // This prevents Clipsta from competing with the game for GPU time.
-            // Threshold: frame_interval_us (16666μs at 60fps). In practice VP should
-            // take <2ms when GPU is idle; >16ms means the game is GPU-bound.
+            // Previous threshold (1x = 16.6ms) was too aggressive at 1080p where VP
+            // routinely takes 17-20ms under moderate GPU load (BF6, etc.), causing
+            // steady-state drops to ~54fps. 2x threshold (33ms) only triggers when
+            // the GPU is genuinely overloaded, preserving 60fps in normal gameplay.
             let frame_interval_us = 1_000_000i64 / fps as i64;
-            if vp_elapsed_us > frame_interval_us {
+            if vp_elapsed_us > frame_interval_us * 2 {
                 vp_skip_next_cb.store(true, Ordering::Relaxed);
             }
 

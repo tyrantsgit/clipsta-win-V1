@@ -485,11 +485,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipsta-capture"
+version = "2.3.2"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "memmap2",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "clipsta-tauri"
 version = "2.3.2"
 dependencies = [
  "anyhow",
  "chrono",
+ "clipsta-capture",
  "dirs",
  "memmap2",
  "parking_lot",

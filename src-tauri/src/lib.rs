@@ -5,13 +5,9 @@
 //! - Global shortcuts for clip saves and recording toggle
 //! - In-process WGC + WASAPI capture (no separate process)
 
-pub mod audio;
 pub mod capture_proxy;
-pub mod chime;
 pub mod cloud_proxy;
 pub mod commands;
-pub mod gpu_capture;
-pub mod ipc;
 pub mod lossless_trim;
 pub mod mp4_inspect;
 pub mod settings;
@@ -79,8 +75,73 @@ pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings
     }
 }
 
+/// Find the existing Clipsta window and bring it to the foreground.
+/// Best-effort: if we can't find it, the user will see nothing happen (graceful).
+fn bring_existing_window_to_front() {
+    unsafe {
+        use windows::Win32::Foundation::{HWND, LPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows_core::BOOL;
+
+        // EnumWindows callback: find a window with title containing "Clipsta"
+        unsafe extern "system" fn enum_callback(hwnd: HWND, _: LPARAM) -> BOOL {
+            let mut buf = [0u16; 256];
+            let len = GetWindowTextW(hwnd, &mut buf);
+            if len > 0 {
+                let title = String::from_utf16_lossy(&buf[..len as usize]);
+                if title.contains("Clipsta") {
+                    // Found it — restore if minimized and bring to front
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(hwnd);
+                    return BOOL(0); // Stop enumerating
+                }
+            }
+            BOOL(1) // Continue
+        }
+
+        let _ = EnumWindows(Some(enum_callback), LPARAM(0));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Single Instance Guard ─────────────────────────────────────────────────
+    // Prevent multiple instances from fighting over the named pipe and hotkeys.
+    // Uses a named mutex — if it already exists, another instance is running.
+    let _instance_mutex = unsafe {
+        use windows::Win32::Foundation::GetLastError;
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows_core::PCWSTR;
+
+        let name: Vec<u16> = "Global\\ClipstaDesktopV2"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()));
+
+        match handle {
+            Ok(h) => {
+                // Check if mutex already existed (another instance owns it)
+                if GetLastError().0 == 183 {
+                    // ERROR_ALREADY_EXISTS = 183
+                    // Another instance is running — try to bring its window to front
+                    eprintln!("[clipsta] Another instance is already running. Activating it.");
+                    bring_existing_window_to_front();
+                    std::process::exit(0);
+                }
+                Some(h)
+            }
+            Err(_) => {
+                // Mutex creation failed — proceed anyway (better than blocking launch)
+                eprintln!("[clipsta] Warning: Could not create instance mutex");
+                None
+            }
+        }
+    };
+
     // NOTE: Do NOT call CoInitializeEx here. Tauri's window library (tao) requires
     // OleInitialize (STA) on the main thread. COM MTA is initialized on capture/audio
     // threads instead (see capture.rs and audio.rs).
@@ -93,7 +154,7 @@ pub fn run() {
     // heavy GPU load from games + capture encoder. CPU rendering for the HTML UI is
     // fast enough — it's just buttons, text, and thumbnails.
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--disable-gpu --disk-cache-size=52428800 --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding");
+        "--disable-gpu --disk-cache-size=10485760 --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --js-flags=--max-old-space-size=128 --renderer-process-limit=2 --disable-features=V8IdleTasks --disable-dev-shm-usage --single-process");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -190,7 +251,7 @@ pub fn run() {
             }
 
             // Create capture session
-            let proxy = match capture_proxy::CaptureProxy::spawn_and_connect() {
+            let proxy = match capture_proxy::CaptureProxy::spawn_and_connect(app.handle().clone()) {
                 Ok(p) => {
                     eprintln!("[clipsta] Capture process connected successfully");
                     Arc::new(p)
