@@ -10,6 +10,9 @@ export interface RecorderState {
 	savedPath: string | null;
 	error: string | null;
 	bufferSeconds: number;
+	captureWidth: number;
+	captureHeight: number;
+	captureFps: number;
 }
 
 function pad(n: number) { return String(n).padStart(2, "0"); }
@@ -33,6 +36,9 @@ export function useRecorder(settings: AppSettings | null) {
 		savedPath: null,
 		error: null,
 		bufferSeconds: 0,
+		captureWidth: 0,
+		captureHeight: 0,
+		captureFps: 0,
 	});
 
 	const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -89,6 +95,12 @@ export function useRecorder(settings: AppSettings | null) {
 			retryCountRef.current = 0;
 			wgcActiveRef.current = true;
 			await bridge.setRecordingState(true);
+			setState((s) => ({
+				...s,
+				captureWidth: result.width ?? 0,
+				captureHeight: result.height ?? 0,
+				captureFps: result.fps ?? 0,
+			}));
 			startTimer();
 		} catch (err: any) {
 			setState((s) => ({ ...s, status: "idle", error: err.message ?? "Capture failed" }));
@@ -284,84 +296,37 @@ export function useRecorder(settings: AppSettings | null) {
 				}
 				const now = ctx.currentTime;
 
-				// === DSLR Camera Shutter Sound ===
-				// 1. Mirror slap (sharp attack, low-mid frequency thud)
-				const mirrorLen = Math.floor(ctx.sampleRate * 0.015);
-				const mirrorBuf = ctx.createBuffer(1, mirrorLen, ctx.sampleRate);
-				const mirrorData = mirrorBuf.getChannelData(0);
-				for (let i = 0; i < mirrorLen; i++) {
-					const t = i / ctx.sampleRate;
-					mirrorData[i] = Math.sin(t * 800 * Math.PI * 2) * Math.exp(-i / (mirrorLen * 0.2)) * 0.8
-						+ (Math.random() * 2 - 1) * Math.exp(-i / (mirrorLen * 0.1)) * 0.3;
-				}
-				const mirror = ctx.createBufferSource();
-				mirror.buffer = mirrorBuf;
-				const mirrorGain = ctx.createGain();
-				mirrorGain.gain.setValueAtTime(0.7, now);
-				mirrorGain.gain.exponentialRampToValueAtTime(0.001, now + 0.02);
-				mirror.connect(mirrorGain);
-				mirrorGain.connect(ctx.destination);
-				mirror.start(now);
+				// === Clean "Clip Saved" notification tone ===
+				// Two-tone ascending ding (similar to ShadowPlay/Medal save sound)
+				// Short, satisfying, non-intrusive
 
-				// 2. Shutter curtain (quick mechanical slide — band-passed noise)
-				const curtainLen = Math.floor(ctx.sampleRate * 0.04);
-				const curtainBuf = ctx.createBuffer(1, curtainLen, ctx.sampleRate);
-				const curtainData = curtainBuf.getChannelData(0);
-				for (let i = 0; i < curtainLen; i++) {
-					curtainData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (curtainLen * 0.25));
-				}
-				const curtain = ctx.createBufferSource();
-				curtain.buffer = curtainBuf;
-				const bp = ctx.createBiquadFilter();
-				bp.type = "bandpass";
-				bp.frequency.value = 3500;
-				bp.Q.value = 1.5;
-				const curtainGain = ctx.createGain();
-				curtainGain.gain.setValueAtTime(0.5, now + 0.015);
-				curtainGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
-				curtain.connect(bp);
-				bp.connect(curtainGain);
-				curtainGain.connect(ctx.destination);
-				curtain.start(now + 0.015);
+				// Tone 1: lower note (E5 = 659 Hz)
+				const osc1 = ctx.createOscillator();
+				osc1.type = "sine";
+				osc1.frequency.value = 659;
+				const gain1 = ctx.createGain();
+				gain1.gain.setValueAtTime(0.4, now);
+				gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+				osc1.connect(gain1);
+				gain1.connect(ctx.destination);
+				osc1.start(now);
+				osc1.stop(now + 0.15);
 
-				// 3. Body resonance (subtle low thump that gives weight)
-				const bodyOsc = ctx.createOscillator();
-				bodyOsc.type = "sine";
-				bodyOsc.frequency.setValueAtTime(180, now);
-				bodyOsc.frequency.exponentialRampToValueAtTime(80, now + 0.05);
-				const bodyGain = ctx.createGain();
-				bodyGain.gain.setValueAtTime(0.3, now);
-				bodyGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
-				bodyOsc.connect(bodyGain);
-				bodyGain.connect(ctx.destination);
-				bodyOsc.start(now);
-				bodyOsc.stop(now + 0.07);
-
-				// 4. Second curtain (closing) — slightly delayed, softer
-				const curtain2Len = Math.floor(ctx.sampleRate * 0.025);
-				const curtain2Buf = ctx.createBuffer(1, curtain2Len, ctx.sampleRate);
-				const curtain2Data = curtain2Buf.getChannelData(0);
-				for (let i = 0; i < curtain2Len; i++) {
-					curtain2Data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (curtain2Len * 0.2));
-				}
-				const curtain2 = ctx.createBufferSource();
-				curtain2.buffer = curtain2Buf;
-				const bp2 = ctx.createBiquadFilter();
-				bp2.type = "bandpass";
-				bp2.frequency.value = 2800;
-				bp2.Q.value = 2;
-				const curtain2Gain = ctx.createGain();
-				curtain2Gain.gain.setValueAtTime(0.35, now + 0.055);
-				curtain2Gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
-				curtain2.connect(bp2);
-				bp2.connect(curtain2Gain);
-				curtain2Gain.connect(ctx.destination);
-				curtain2.start(now + 0.055);
+				// Tone 2: higher note (B5 = 988 Hz), slightly delayed
+				const osc2 = ctx.createOscillator();
+				osc2.type = "sine";
+				osc2.frequency.value = 988;
+				const gain2 = ctx.createGain();
+				gain2.gain.setValueAtTime(0.35, now + 0.08);
+				gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+				osc2.connect(gain2);
+				gain2.connect(ctx.destination);
+				osc2.start(now + 0.08);
+				osc2.stop(now + 0.25);
 			} catch { /* ignore */ }
 		});
 		return () => {
 			unlistenPromise.then((u) => u()).catch(() => {});
-			// Close the pooled AudioContext on unmount
 			audioCtxRef.current?.close().catch(() => {});
 			audioCtxRef.current = null;
 		};

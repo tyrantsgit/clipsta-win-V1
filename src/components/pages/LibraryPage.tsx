@@ -324,30 +324,58 @@ function useThumbnail(path: string): string | null {
 		thumbQueue.add(path);
 		thumbActive++;
 		let cancelled = false;
-		const video = document.createElement("video");
-		video.crossOrigin = "anonymous";
-		video.muted = true;
-		video.preload = "metadata";
-		video.src = toFileUrl(path);
-		video.onloadeddata = () => { if (!cancelled) video.currentTime = 1; };
-		video.onseeked = () => {
-			if (cancelled) return;
-			try {
-				const canvas = document.createElement("canvas");
-				canvas.width = 160; canvas.height = 90;
-				const ctx = canvas.getContext("2d")!;
-				ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-				const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+
+		// Try pre-generated thumbnail file first (instant, no video decode needed)
+		const thumbPath = path.replace(/\.mp4$/i, ".thumb.jpg");
+		const thumbUrl = toFileUrl(thumbPath);
+
+		const tryPregenerated = () => {
+			const img = new Image();
+			img.onload = () => {
+				if (cancelled) return;
 				if (thumbCache.size >= MAX_THUMB_CACHE) { const firstKey = thumbCache.keys().next().value; if (firstKey) thumbCache.delete(firstKey); }
-				thumbCache.set(path, dataUrl);
+				thumbCache.set(path, thumbUrl);
 				thumbQueue.delete(path);
 				thumbActive--;
-				setThumb(dataUrl);
-			} catch { thumbQueue.delete(path); thumbActive--; }
-			video.remove();
+				setThumb(thumbUrl);
+			};
+			img.onerror = () => {
+				if (cancelled) return;
+				// Fallback: generate from video canvas
+				generateFromVideo();
+			};
+			img.src = thumbUrl;
 		};
-		video.onerror = () => { thumbQueue.delete(path); thumbActive--; video.src = ""; video.load(); video.remove(); };
-		return () => { cancelled = true; thumbActive--; video.src = ""; video.load(); video.remove(); };
+
+		const generateFromVideo = () => {
+			const video = document.createElement("video");
+			video.crossOrigin = "anonymous";
+			video.muted = true;
+			video.preload = "metadata";
+			video.src = toFileUrl(path);
+			video.onloadeddata = () => { if (!cancelled) video.currentTime = 1; };
+			video.onseeked = () => {
+				if (cancelled) return;
+				try {
+					const canvas = document.createElement("canvas");
+					canvas.width = 160; canvas.height = 90;
+					const ctx = canvas.getContext("2d")!;
+					ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+					const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+					if (thumbCache.size >= MAX_THUMB_CACHE) { const firstKey = thumbCache.keys().next().value; if (firstKey) thumbCache.delete(firstKey); }
+					thumbCache.set(path, dataUrl);
+					thumbQueue.delete(path);
+					thumbActive--;
+					setThumb(dataUrl);
+				} catch { thumbQueue.delete(path); thumbActive--; }
+				video.remove();
+			};
+			video.onerror = () => { thumbQueue.delete(path); thumbActive--; video.src = ""; video.load(); video.remove(); };
+		};
+
+		tryPregenerated();
+
+		return () => { cancelled = true; thumbActive--; };
 	}, [path]);
 
 	return thumb;

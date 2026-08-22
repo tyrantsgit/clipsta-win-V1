@@ -13,8 +13,7 @@ export default function StatusBar({ recorder, settings }: {
 			</span>
 			<span>
 				<span className="text-text-mid">{settings.hotkeyClip30Sec || "Win+Alt+G"}</span> 30s ·{" "}
-				<span className="text-text-mid">{settings.hotkeyClip1Min}</span> 1min ·{" "}
-				<span className="text-text-mid">{settings.hotkeyClip5Min}</span> 5min
+				<span className="text-text-mid">{settings.hotkeyClip1Min}</span> 1min
 			</span>
 			<span className="ml-auto">{settings.resolution} · {settings.fps}fps · {settings.bitrate >= 1000 ? `${Math.round(settings.bitrate / 1000)}Mbps` : `${settings.bitrate}kbps`} · {settings.encoder}</span>
 		</div>

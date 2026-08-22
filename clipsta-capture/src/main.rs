@@ -1,31 +1,37 @@
-//! clipsta-capture.exe — Standalone capture process for Clipsta v2.3+
+//! clipsta-capture.exe — Standalone capture process for Clipsta 3.0
 //!
-//! Runs the GPU capture pipeline (WGC + WASAPI + H.264 encoder) in isolation
-//! from WebView2 to eliminate USB audio scheduling interference.
+//! Runs independently as a tray application with its own hotkeys and settings.
+//! The Tauri UI process is OPTIONAL — it connects via named pipe IPC when
+//! the user opens the editor/library.
 //!
-//! Like Clipsta Lite: handles capture, saves, and chime entirely in-process.
-//! The Tauri UI process only sends START/STOP/QUIT commands.
-//! Hotkey saves are triggered by Tauri sending SAVE commands over the pipe.
-//!
-//! Communication: \\.\pipe\clipsta-capture (JSON newline-delimited)
+//! Flow:
+//!   1. Single-instance mutex check
+//!   2. Init COM + Media Foundation
+//!   3. Load settings from disk
+//!   4. Create CaptureSession, warm_start()
+//!   5. Start capture immediately (no pipe wait!)
+//!   6. IPC pipe server runs in background thread
+//!   7. Main thread: tray icon + hotkeys + message pump
+//!   8. Save-worker thread: handles clip saves
 //!
 //! Diagnostic modes (run from command line):
 //!   clipsta-capture.exe --probe-encoder    Print GPU encoder capabilities and exit
 //!   clipsta-capture.exe --probe-pipeline   Run a short test encode and exit
 
-// Prevents console window in release builds (but NOT when run with --probe-* flags)
+// Prevents console window in release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::Arc;
 
-use clipsta_capture::gpu_capture::{
-    CaptureOptions, CaptureSession, CompletedSegment,
-};
-use clipsta_capture::ipc::{
-    self, CaptureCommand, CaptureResponse, ErrorPayload, ReadyPayload,
-    SavedPayload, StartPayload,
-};
+use clipsta_capture::gpu_capture::{CaptureOptions, CaptureSession, CompletedSegment};
+use clipsta_capture::ipc::{self, CaptureCommand, CaptureResponse, ErrorPayload, StatusPayload};
+use clipsta_capture::settings::{self, AppSettings};
+use clipsta_capture::hotkeys;
+use clipsta_capture::tray::TrayIcon;
 use clipsta_capture::chime;
 
 mod logging;
@@ -38,24 +44,23 @@ macro_rules! log {
 }
 
 fn main() {
-    // Parse CLI args before anything else
+    // ── Parse CLI args ────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let probe_encoder = args.iter().any(|a| a == "--probe-encoder");
     let probe_pipeline = args.iter().any(|a| a == "--probe-pipeline");
+    let headless = args.iter().any(|a| a == "--headless");
 
-    // For diagnostic modes: attach/allocate a console so output is visible in release builds
+    // For diagnostic modes: attach/allocate a console so output is visible
     if probe_encoder || probe_pipeline {
         unsafe {
             use windows::Win32::System::Console::{AllocConsole, AttachConsole};
-            // Try attaching to parent console first (running from cmd/powershell)
             if AttachConsole(u32::MAX).is_err() {
-                // No parent console — allocate our own
                 let _ = AllocConsole();
             }
         }
     }
 
-    // Initialize COM for Media Foundation (MTA — same as capture threads)
+    // ── Initialize COM + Media Foundation ─────────────────────────────────────
     unsafe {
         use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -63,16 +68,15 @@ fn main() {
         let _ = MFStartup(0x0002_0070, MFSTARTUP_FULL);
     }
 
-    // Initialize file logging (non-blocking background writer)
+    // Initialize file logging
     logging::init();
 
     log!("[clipsta-capture] Process started (PID {})", std::process::id());
-    log!("[clipsta-capture] Version 2.3.2");
+    log!("[clipsta-capture] Version 3.0.0 — Standalone mode");
 
     // ── Diagnostic modes ──────────────────────────────────────────────────────
     if probe_encoder {
         run_probe_encoder();
-        // Also write probe output to log file for easy retrieval
         log!("[clipsta-capture] --probe-encoder completed");
         return;
     }
@@ -82,151 +86,423 @@ fn main() {
         return;
     }
 
-    // ── Normal capture server mode ────────────────────────────────────────────
-
-    // Create the capture session
-    let session = CaptureSession::new();
-    session.warm_start();
-
-    // Create named pipe server and wait for the Tauri process to connect
-    let pipe_file = match ipc::server::create_and_wait_for_client() {
-        Ok(f) => f,
-        Err(e) => {
-            log!("[clipsta-capture] FATAL: Failed to create pipe: {}", e);
-            std::process::exit(1);
+    // ── Single-instance mutex ─────────────────────────────────────────────────
+    let _mutex = match create_single_instance_mutex() {
+        Some(m) => m,
+        None => {
+            log!("[clipsta-capture] Another instance is already running. Exiting.");
+            return;
         }
     };
 
-    log!("[clipsta-capture] Client connected");
+    // ── Load settings ─────────────────────────────────────────────────────────
+    let settings = settings::load();
+    log!("[clipsta-capture] Settings loaded: {}x @ {}fps, buffer={}s, quality={}",
+        settings.resolution, settings.fps, settings.buffer_duration, settings.quality);
 
-    // Use one handle for reading, one for writing
-    let pipe_read = pipe_file.try_clone().expect("Failed to clone pipe handle");
-    let mut pipe_write = pipe_file;
+    // ── Create capture session ────────────────────────────────────────────────
+    let session = Arc::new(CaptureSession::new());
+    session.warm_start();
 
-    let mut reader = BufReader::new(pipe_read);
+    // ── Start capture immediately ─────────────────────────────────────────────
+    start_capture(&session, &settings);
 
-    // Main command loop — simple request/response like Clipsta Lite
-    loop {
-        let cmd: CaptureCommand = match ipc::read_message(&mut reader) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    log!("[clipsta-capture] Pipe closed — host exited. Shutting down.");
-                } else {
-                    log!("[clipsta-capture] Read error: {}. Shutting down.", e);
-                }
-                if session.is_recording.load(Ordering::Relaxed) {
-                    session.stop();
-                }
+    // ── Create channels ───────────────────────────────────────────────────────
+    // Save channel: hotkeys/tray/pipe → save worker
+    let (save_tx, save_rx) = sync_channel::<u32>(8);
+    // Quit channel: tray quit → main
+    let (quit_tx, _quit_rx) = sync_channel::<()>(1);
+
+    // ── Save worker thread ────────────────────────────────────────────────────
+    let session_for_save = Arc::clone(&session);
+    let settings_for_save = settings.clone();
+    std::thread::Builder::new()
+        .name("save-worker".to_string())
+        .spawn(move || {
+            log!("[clipsta-capture] Save-worker thread started");
+            while let Ok(seconds) = save_rx.recv() {
+                do_save(&session_for_save, &settings_for_save, seconds);
+            }
+            log!("[clipsta-capture] Save-worker thread exiting");
+        })
+        .expect("Failed to spawn save-worker thread");
+
+    // ── IPC pipe server (background thread) ───────────────────────────────────
+    let session_for_pipe = Arc::clone(&session);
+    let save_tx_for_pipe = save_tx.clone();
+    std::thread::Builder::new()
+        .name("ipc-server".to_string())
+        .spawn(move || {
+            run_pipe_server(session_for_pipe, save_tx_for_pipe);
+        })
+        .expect("Failed to spawn IPC server thread");
+
+    // ── Tray icon + hotkeys (main thread) — only in standalone mode ──────────
+    if headless {
+        // Headless mode: no tray, no hotkeys, no message pump.
+        // The Tauri app owns the lifecycle — just block until the pipe disconnects
+        // or the process is killed.
+        log!("[clipsta-capture] Running in headless mode (owned by Tauri app)");
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Check if capture session died unexpectedly
+            if !session.is_recording.load(Ordering::Relaxed) {
+                log!("[clipsta-capture] Capture stopped in headless mode, exiting");
                 break;
             }
-        };
-
-        let response = match cmd {
-            CaptureCommand::Start(payload) => {
-                log!("[clipsta-capture] CMD: Start ({}x{} @ {}fps, buffer={}s, bitrate={}kbps)",
-                    payload.target_width.unwrap_or(0),
-                    payload.target_height.unwrap_or(0),
-                    payload.fps,
-                    payload.buffer_duration,
-                    payload.bitrate_kbps,
-                );
-                handle_start(&session, &payload)
-            }
-            CaptureCommand::Stop => {
-                log!("[clipsta-capture] CMD: Stop");
-                session.stop();
-                CaptureResponse::Stopped
-            }
-            CaptureCommand::Save(ref payload) => {
-                log!("[clipsta-capture] CMD: Save ({}s → {})", payload.seconds, payload.output_path);
-                handle_save(&session, payload)
-            }
-            CaptureCommand::Status => CaptureResponse::StatusResp(ipc::StatusPayload {
-                is_recording: session.is_recording.load(Ordering::Relaxed),
-                is_saving: session.is_saving.load(Ordering::Relaxed),
-                elapsed_secs: session.elapsed_secs(),
-                frame_drops: session.frame_drops.load(Ordering::Relaxed),
-            }),
-            CaptureCommand::Quit => {
-                log!("[clipsta-capture] CMD: Quit");
-                if session.is_recording.load(Ordering::Relaxed) {
-                    session.stop();
-                }
-                let _ = ipc::write_message(&mut pipe_write, &CaptureResponse::Stopped);
-                break;
-            }
-        };
-
-        // Send response back
-        if let Err(e) = ipc::write_message(&mut pipe_write, &response) {
-            log!("[clipsta-capture] Write error: {}. Shutting down.", e);
-            break;
         }
+    } else {
+        let mut tray = TrayIcon::new(save_tx.clone(), quit_tx);
+
+        // Register global hotkeys
+        let hk_count = hotkeys::register_all(
+            &settings.hotkey_clip30_sec,
+            &settings.hotkey_clip1_min,
+            &settings.hotkey_clip5_min,
+        );
+        log!("[clipsta-capture] Registered {} hotkeys", hk_count);
+
+        // Update tooltip to recording state
+        if session.is_recording.load(Ordering::Relaxed) {
+            tray.set_tooltip("Clipsta \u{2014} Recording");
+        } else {
+            tray.set_tooltip("Clipsta \u{2014} Ready");
+        }
+
+        // ── Main message pump (blocks until quit) ─────────────────────────────────
+        log!("[clipsta-capture] Entering message loop");
+        tray.run_message_loop();
     }
 
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    log!("[clipsta-capture] Shutting down...");
+    hotkeys::unregister_all();
+
+    if session.is_recording.load(Ordering::Relaxed) {
+        session.stop();
+    }
     session.cleanup();
+
     log!("[clipsta-capture] Process exiting");
 }
 
-fn handle_start(session: &CaptureSession, payload: &StartPayload) -> CaptureResponse {
+// ── Capture start ─────────────────────────────────────────────────────────────
+
+fn start_capture(session: &CaptureSession, settings: &AppSettings) {
     let seg_dir = std::env::temp_dir().join("clipsta_recording");
     if seg_dir.exists() {
         let _ = std::fs::remove_dir_all(&seg_dir);
     }
 
+    let (target_w, target_h) = settings::resolution_to_dimensions(&settings.resolution);
+    let bitrate = settings::resolve_bitrate_kbps(
+        &settings.resolution,
+        settings.fps,
+        &settings.quality,
+    );
+
+    let mic_device = if settings.capture_mic {
+        if settings.audio_input_device_id.is_empty() {
+            Some("default".to_string())
+        } else {
+            Some(settings.audio_input_device_id.clone())
+        }
+    } else {
+        None
+    };
+
+    let loopback = if settings.desktop_audio_device_id.is_empty() {
+        None
+    } else {
+        Some(settings.desktop_audio_device_id.clone())
+    };
+
+    let no_audio = !settings.capture_audio || settings.audio_source == "none";
+
     let opts = CaptureOptions {
-        source_id: payload.source_id.clone(),
-        fps: payload.fps,
-        no_audio: payload.no_audio,
-        mic_device: payload.mic_device.clone(),
-        loopback_device: payload.loopback_device.clone(),
-        target_width: payload.target_width,
-        target_height: payload.target_height,
-        bitrate_kbps: payload.bitrate_kbps,
+        source_id: None,
+        fps: settings.fps,
+        no_audio,
+        mic_device,
+        loopback_device: loopback,
+        target_width: target_w,
+        target_height: target_h,
+        bitrate_kbps: bitrate,
         segment_duration: 3,
-        buffer_duration: payload.buffer_duration,
+        buffer_duration: settings.buffer_duration,
         segment_dir: seg_dir,
-        multi_track_audio: payload.multi_track_audio,
+        multi_track_audio: settings.multi_track_audio,
         warm_cache: Some(session.warm_cache.clone()),
     };
+
+    log!("[clipsta-capture] Starting capture: {:?}x{:?} @ {}fps, {}kbps, buffer={}s",
+        target_w, target_h, settings.fps, bitrate, settings.buffer_duration);
 
     let on_segment = Box::new(|_seg: CompletedSegment| {});
     let on_died = None;
 
     match session.start(opts, on_segment, on_died) {
         Ok(info) => {
-            log!("[clipsta-capture] Recording started: {}x{} @ {}fps", info.width, info.height, info.fps);
-            CaptureResponse::Ready(ReadyPayload {
-                width: info.width,
-                height: info.height,
-                fps: info.fps,
-            })
+            log!("[clipsta-capture] Capture started: {}x{} @ {}fps", info.width, info.height, info.fps);
         }
         Err(e) => {
-            log!("[clipsta-capture] Start FAILED: {}", e);
-            CaptureResponse::Error(ErrorPayload {
-                message: format!("{}", e),
-            })
+            log!("[clipsta-capture] Capture start FAILED: {}", e);
         }
     }
 }
 
-fn handle_save(session: &CaptureSession, payload: &ipc::SavePayload) -> CaptureResponse {
-    match session.save_clip(payload.seconds, &payload.output_path) {
+// ── Save logic ────────────────────────────────────────────────────────────────
+
+fn do_save(session: &CaptureSession, settings: &AppSettings, seconds: u32) {
+    if !session.is_recording.load(Ordering::Relaxed) {
+        log!("[clipsta-capture] Cannot save — not recording");
+        return;
+    }
+    if session.is_saving.load(Ordering::Relaxed) {
+        log!("[clipsta-capture] Save already in progress, skipping");
+        return;
+    }
+
+    // Generate ShadowPlay-style filename
+    let now = chrono::Local::now();
+    let cs = now.format("%f").to_string();
+    let centiseconds = &cs[..2.min(cs.len())];
+    let stamp = format!("{}.{}", now.format("%Y.%m.%d - %H.%M.%S"), centiseconds);
+
+    let game_name = get_game_name(settings.game_detect);
+
+    let output_folder = PathBuf::from(&settings.output_folder);
+    let _ = std::fs::create_dir_all(&output_folder);
+
+    // Only create game subfolder for actual games (not Desktop, not browser titles)
+    let is_generic = game_name.is_empty()
+        || game_name == "Desktop"
+        || game_name == "Clipsta"
+        || game_name.contains(" - ");
+    let game_folder = if is_generic {
+        output_folder.clone()
+    } else {
+        let gf = output_folder.join(&game_name);
+        let _ = std::fs::create_dir_all(&gf);
+        gf
+    };
+
+    let file_name = format!("{} {}.DVR.mp4", game_name, stamp);
+    let output_path = game_folder.join(&file_name);
+    let output_str = output_path.to_string_lossy().to_string();
+
+    log!("[clipsta-capture] Saving {}s clip → {}", seconds, file_name);
+
+    match session.save_clip(seconds, &output_str) {
         Ok(path) => {
-            log!("[clipsta-capture] Clip saved: {}", path);
-            chime::play();
-            CaptureResponse::Saved(SavedPayload {
-                path,
-                duration_secs: payload.seconds as f64,
-            })
+            log!("[clipsta-capture] ✓ Saved: {}", path);
+            if settings.clip_sound_enabled {
+                chime::play();
+            }
         }
         Err(e) => {
-            log!("[clipsta-capture] Save FAILED: {}", e);
-            CaptureResponse::Error(ErrorPayload {
-                message: format!("{}", e),
+            let msg = format!("{}", e);
+            if msg.contains("Not enough") || msg.contains("No keyframe") {
+                log!("[clipsta-capture] Buffer not ready — wait a few seconds");
+            } else {
+                log!("[clipsta-capture] Save failed: {}", msg);
+            }
+        }
+    }
+}
+
+/// Get the active window title for use as game/folder name.
+fn get_game_name(game_detect: bool) -> String {
+    if !game_detect {
+        return "Desktop".to_string();
+    }
+
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return "Desktop".to_string();
+        }
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len == 0 {
+            return "Desktop".to_string();
+        }
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+
+        // Strip zero-width and invisible Unicode characters
+        let title: String = title
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    *c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                    | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                )
             })
+            .collect();
+
+        // Clean up browser/app suffixes
+        let cleaned = title
+            .trim()
+            .trim_end_matches(" - Google Chrome")
+            .trim_end_matches(" - Mozilla Firefox")
+            .trim_end_matches(" - Microsoft Edge")
+            .trim_end_matches(" - Visual Studio Code")
+            .trim_end_matches(" - Discord")
+            .to_string();
+
+        // Sanitize for filesystem
+        let sanitized: String = cleaned
+            .chars()
+            .map(|c| match c {
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+                _ => c,
+            })
+            .collect();
+
+        if sanitized.is_empty() {
+            "Desktop".to_string()
+        } else {
+            sanitized
+        }
+    }
+}
+
+// ── IPC Pipe Server (background thread) ───────────────────────────────────────
+
+fn run_pipe_server(session: Arc<CaptureSession>, save_tx: SyncSender<u32>) {
+    log!("[clipsta-capture] IPC pipe server thread started");
+
+    loop {
+        // Create pipe and wait for client (blocks this thread only)
+        let pipe_file = match ipc::server::create_and_wait_for_client() {
+            Ok(f) => f,
+            Err(e) => {
+                log!("[clipsta-capture] IPC: Failed to create pipe: {}. Retrying in 1s...", e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        log!("[clipsta-capture] IPC: Client connected");
+
+        let pipe_read = match pipe_file.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                log!("[clipsta-capture] IPC: Failed to clone pipe handle: {}", e);
+                continue;
+            }
+        };
+        let mut pipe_write = pipe_file;
+        let mut reader = BufReader::new(pipe_read);
+
+        // Command loop for this connection
+        loop {
+            let cmd: CaptureCommand = match ipc::read_message(&mut reader) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        log!("[clipsta-capture] IPC: Client disconnected");
+                    } else {
+                        log!("[clipsta-capture] IPC: Read error: {}", e);
+                    }
+                    break; // Go back to waiting for next client
+                }
+            };
+
+            let response = match cmd {
+                CaptureCommand::Start(_payload) => {
+                    // In standalone mode, capture is already running.
+                    // Report current state instead of re-starting.
+                    log!("[clipsta-capture] IPC: Start command (capture already active)");
+                    if session.is_recording.load(Ordering::Relaxed) {
+                        CaptureResponse::Ready(ipc::ReadyPayload {
+                            width: 0,  // Info not stored after start
+                            height: 0,
+                            fps: 0,
+                        })
+                    } else {
+                        CaptureResponse::Error(ErrorPayload {
+                            message: "Capture not active".to_string(),
+                        })
+                    }
+                }
+                CaptureCommand::Stop => {
+                    // In standalone mode, don't stop capture from pipe
+                    log!("[clipsta-capture] IPC: Stop command (ignored in standalone mode)");
+                    CaptureResponse::Stopped
+                }
+                CaptureCommand::Save(ref payload) => {
+                    log!("[clipsta-capture] IPC: Save command ({}s)", payload.seconds);
+                    // Forward to save worker via channel
+                    let _ = save_tx.try_send(payload.seconds);
+                    // Return an immediate ack — actual save happens async
+                    CaptureResponse::Saved(ipc::SavedPayload {
+                        path: payload.output_path.clone(),
+                        duration_secs: payload.seconds as f64,
+                    })
+                }
+                CaptureCommand::Status => {
+                    CaptureResponse::StatusResp(StatusPayload {
+                        is_recording: session.is_recording.load(Ordering::Relaxed),
+                        is_saving: session.is_saving.load(Ordering::Relaxed),
+                        elapsed_secs: session.elapsed_secs(),
+                        frame_drops: session.frame_drops.load(Ordering::Relaxed),
+                    })
+                }
+                CaptureCommand::Quit => {
+                    // In standalone mode, ignore quit from pipe — capture owns its lifecycle
+                    log!("[clipsta-capture] IPC: Quit command (ignored in standalone mode)");
+                    CaptureResponse::Stopped
+                }
+            };
+
+            if let Err(e) = ipc::write_message(&mut pipe_write, &response) {
+                log!("[clipsta-capture] IPC: Write error: {}. Disconnecting client.", e);
+                break;
+            }
+        }
+
+        // Client disconnected — loop back to create new pipe instance
+        log!("[clipsta-capture] IPC: Waiting for next client...");
+    }
+}
+
+// ── Single-instance mutex ─────────────────────────────────────────────────────
+
+/// Creates a named mutex to ensure only one instance of clipsta-capture runs.
+/// Returns None if another instance already owns the mutex.
+fn create_single_instance_mutex() -> Option<MutexHandle> {
+    use windows::core::w;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        let handle = CreateMutexW(None, true, w!("Global\\ClipstaCaptureV3Mutex")).ok()?;
+
+        // Check if we actually own it (vs it already existed)
+        let last_error = windows::Win32::Foundation::GetLastError();
+        if last_error.0 == 183 {
+            // ERROR_ALREADY_EXISTS
+            let _ = CloseHandle(handle);
+            return None;
+        }
+
+        Some(MutexHandle(handle))
+    }
+}
+
+/// RAII wrapper for the named mutex handle.
+struct MutexHandle(windows::Win32::Foundation::HANDLE);
+
+impl Drop for MutexHandle {
+    fn drop(&mut self) {
+        unsafe {
+            use windows::Win32::System::Threading::ReleaseMutex;
+            let _ = ReleaseMutex(self.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
         }
     }
 }
@@ -356,7 +632,6 @@ fn run_probe_pipeline() {
 
     let session = CaptureSession::new();
 
-    // Create a test capture with a tiny buffer, run for 2 seconds, then stop
     let seg_dir = std::env::temp_dir().join("clipsta_probe");
     if seg_dir.exists() {
         let _ = std::fs::remove_dir_all(&seg_dir);
@@ -365,7 +640,7 @@ fn run_probe_pipeline() {
     let opts = CaptureOptions {
         source_id: None,
         fps: 60,
-        no_audio: true, // Skip audio for probe
+        no_audio: true,
         mic_device: None,
         loopback_device: None,
         target_width: Some(1920),

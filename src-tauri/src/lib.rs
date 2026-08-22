@@ -154,7 +154,7 @@ pub fn run() {
     // heavy GPU load from games + capture encoder. CPU rendering for the HTML UI is
     // fast enough — it's just buttons, text, and thumbnails.
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--disable-gpu --disk-cache-size=10485760 --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --js-flags=--max-old-space-size=128 --renderer-process-limit=2 --disable-features=V8IdleTasks --disable-dev-shm-usage --single-process");
+        "--disable-gpu --disk-cache-size=10485760 --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --js-flags=--max-old-space-size=128 --renderer-process-limit=2 --disable-features=V8IdleTasks --disable-dev-shm-usage --single-process --autoplay-policy=no-user-gesture-required");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -276,6 +276,10 @@ pub fn run() {
                     if name.starts_with("clipsta_clip_video_") || name.starts_with("clipsta_concat_") {
                         let _ = std::fs::remove_file(entry.path());
                     }
+                    // Remove orphaned mmap ring buffer file (from hard crash of capture process)
+                    if name == "clipsta_ring_video.bin" {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                     // Remove old debug log files
                     if name.starts_with("clipsta_") && (name.ends_with(".log") || name.ends_with(".txt")) {
                         let _ = std::fs::remove_file(entry.path());
@@ -299,6 +303,7 @@ pub fn run() {
                 let is_saving = proxy.is_saving.clone();
                 let store_for_worker = store.clone();
                 let proxy_for_save = proxy.clone();
+                let app_for_worker = app.handle().clone();
 
                 std::thread::Builder::new()
                     .name("clipsta-save-worker".into())
@@ -327,7 +332,23 @@ pub fn run() {
                                 let len = GetWindowTextW(hwnd, &mut buf);
                                 if len > 0 {
                                     let title = String::from_utf16_lossy(&buf[..len as usize]);
-                                    title.chars()
+                                    // Strip zero-width and invisible Unicode characters
+                                    let title: String = title.chars().filter(|c| {
+                                        !matches!(*c,
+                                            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}' |
+                                            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+                                        )
+                                    }).collect();
+                                    // Clean up browser/app suffixes
+                                    let cleaned = title.trim()
+                                        .trim_end_matches(" - Google Chrome")
+                                        .trim_end_matches(" - Mozilla Firefox")
+                                        .trim_end_matches(" - Microsoft Edge")
+                                        .trim_end_matches(" - Visual Studio Code")
+                                        .trim_end_matches(" - Discord")
+                                        .to_string();
+                                    // Sanitize for filesystem
+                                    cleaned.chars()
                                         .map(|c| match c { '<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*' => '_', _ => c })
                                         .collect::<String>()
                                 } else {
@@ -338,8 +359,19 @@ pub fn run() {
                             let file_name = format!("{} {}.DVR.mp4", game_name, stamp);
                             let output_folder = std::path::PathBuf::from(&settings.output_folder);
                             let _ = std::fs::create_dir_all(&output_folder);
-                            let game_folder = output_folder.join(&game_name);
-                            let _ = std::fs::create_dir_all(&game_folder);
+
+                            // Only create game subfolder for actual games (not Desktop, not browser titles)
+                            let is_desktop = game_name.is_empty()
+                                || game_name == "Desktop"
+                                || game_name == "Clipsta"
+                                || game_name.contains(" - ");
+                            let game_folder = if is_desktop {
+                                output_folder.clone()
+                            } else {
+                                let gf = output_folder.join(&game_name);
+                                let _ = std::fs::create_dir_all(&gf);
+                                gf
+                            };
                             let output_path = game_folder.join(&file_name);
                             let output_str = output_path.to_string_lossy().to_string();
 
@@ -348,7 +380,11 @@ pub fn run() {
                             match result {
                                 Ok(ref path) => {
                                     eprintln!("[clipsta] Clip saved: {}", path);
-                                    // Chime is played by the capture process now
+                                    // Emit events to frontend
+                                    let _ = app_for_worker.emit("wgc:clipSaved", path);
+                                    if settings.clip_sound_enabled {
+                                        let _ = app_for_worker.emit("play-clip-sound", ());
+                                    }
 
                                     // Auto-upload in Rust (no WebView involvement).
                                     let upload_settings = store_for_worker.get();
@@ -406,15 +442,12 @@ pub fn run() {
                 let app = window.app_handle();
                 let store = app.state::<SettingsStore>();
                 if store.get().minimize_to_tray {
-                    // Hide to tray — recording continues in background.
-                    // WebView2 renderer is suspended when window is hidden.
+                    // Hide to tray — recording continues in the capture process.
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
+                    // Disconnect from capture process (don't kill it — it's independent)
                     let proxy = app.state::<Arc<capture_proxy::CaptureProxy>>();
-                    if proxy.is_recording.load(Ordering::Relaxed) {
-                        let _ = proxy.stop();
-                    }
                     proxy.shutdown();
                     app.exit(0);
                 }
@@ -499,11 +532,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "quit" => {
-                // Stop recording if active
+                // Disconnect from capture process (it keeps running independently)
                 let proxy = app.state::<Arc<capture_proxy::CaptureProxy>>();
-                if proxy.is_recording.load(Ordering::Relaxed) {
-                    let _ = proxy.stop();
-                }
                 proxy.shutdown();
                 app.exit(0);
             }

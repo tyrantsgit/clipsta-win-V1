@@ -1,7 +1,7 @@
 [package]
 name = "clipsta-capture"
-version = "2.3.2"
-description = "Clipsta capture engine — WGC + WASAPI + Hardware Encode + Replay Buffer"
+version = "3.0.0"
+description = "Clipsta capture engine — WGC + WASAPI + Hardware Encode + Replay Buffer (Standalone tray app)"
 authors = ["Clipsta"]
 edition = "2021"
 
@@ -20,6 +20,7 @@ anyhow = "1.0"
 parking_lot = "0.12"
 memmap2 = "0.9"
 dirs = "6"
+chrono = "0.4"
 windows-core = "0.62"
 
 [dependencies.windows]
@@ -53,11 +54,14 @@ features = [
   "Win32_System_Pipes",
   "Win32_System_IO",
   "Win32_System_Console",
+  "Win32_System_LibraryLoader",
   "Win32_System_WinRT",
   "Win32_System_WinRT_Direct3D11",
   "Win32_System_WinRT_Graphics_Capture",
-  # UI (for window enumeration)
+  # UI — window enumeration + shell tray + menus
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Input_KeyboardAndMouse",
   # Properties / Security / Storage
   "Win32_Devices_Properties",
   "Win32_UI_Shell_PropertiesSystem",

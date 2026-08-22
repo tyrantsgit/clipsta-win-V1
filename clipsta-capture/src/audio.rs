@@ -170,6 +170,10 @@ impl WasapiCapture {
             // Reused every iteration — only grows, never shrinks (max ~960 stereo samples per packet).
             let mut conv_buf: Vec<f32> = Vec::with_capacity(2048);
             let mut mic_conv_buf: Vec<f32> = Vec::with_capacity(2048);
+            // Mic accumulator ring: stores all mic samples until desktop audio needs them.
+            // This prevents sample loss when mic and desktop deliver at different rates.
+            // Clipsta Lite approach: continuously fill, pull exactly what's needed during mix.
+            let mut mic_ring: Vec<f32> = Vec::with_capacity(48000 * 2); // 1 sec stereo capacity
             let mut total_audio_frames_written: u64 = 0;
             let loop_start = std::time::Instant::now();
 
@@ -216,7 +220,9 @@ impl WasapiCapture {
                                 );
                             }
 
-                            // Mix mic if available (or deliver separately for multi-track)
+                            // Drain ALL pending mic packets into the accumulator ring.
+                            // Clipsta Lite approach: continuously fill regardless of desktop timing,
+                            // then pull exactly what's needed during mix. No samples lost.
                             if let (Some(ref mc_cap), Some(mic_f)) = (&mic_capture, mic_fmt) {
                                 let mic_bps_val = mic_f.bps / 8;
                                 loop {
@@ -239,15 +245,16 @@ impl WasapiCapture {
                                     }
                                     if mf > 0 && !mp_raw.is_null() {
                                         let msilent = (mflags & 0x2) != 0;
-                                        let mraw = std::slice::from_raw_parts(
-                                            mp_raw,
-                                            mf as usize * mic_bpf,
-                                        );
-                                        // Reuse mic_conv_buf to avoid per-packet heap allocation
-                                        mic_conv_buf.clear();
                                         if msilent {
-                                            mic_conv_buf.resize(mf as usize * 2, 0f32);
+                                            // Accumulate silence (keeps mic ring in sync with time)
+                                            let silence_samples = mf as usize * 2;
+                                            mic_ring.extend(std::iter::repeat(0f32).take(silence_samples));
                                         } else {
+                                            let mraw = std::slice::from_raw_parts(
+                                                mp_raw,
+                                                mf as usize * mic_bpf,
+                                            );
+                                            mic_conv_buf.clear();
                                             to_f32_stereo_into(
                                                 mraw,
                                                 mf as usize,
@@ -256,19 +263,32 @@ impl WasapiCapture {
                                                 mic_f.is_float,
                                                 &mut mic_conv_buf,
                                             );
-                                        }
-                                        if let Some(ref mic_cb) = mic_callback {
-                                            // Multi-track: deliver mic separately, don't mix
-                                            mic_cb(&mic_conv_buf);
-                                        } else {
-                                            // Single-track: mix mic into desktop
-                                            let mix_len = conv_buf.len().min(mic_conv_buf.len());
-                                            for i in 0..mix_len {
-                                                conv_buf[i] = mix_samples(conv_buf[i], mic_conv_buf[i]);
+                                            if let Some(ref mic_cb) = mic_callback {
+                                                // Multi-track: deliver mic separately
+                                                mic_cb(&mic_conv_buf);
+                                            } else {
+                                                // Single-track: accumulate for mixing below
+                                                mic_ring.extend_from_slice(&mic_conv_buf);
                                             }
                                         }
                                     }
                                     let _ = mc_cap.ReleaseBuffer(mf);
+                                }
+
+                                // Mix from accumulator: pull exactly conv_buf.len() samples.
+                                // This guarantees 1:1 sample alignment between desktop and mic.
+                                if mic_callback.is_none() && !mic_ring.is_empty() {
+                                    let mix_len = conv_buf.len().min(mic_ring.len());
+                                    for i in 0..mix_len {
+                                        conv_buf[i] = mix_samples(conv_buf[i], mic_ring[i]);
+                                    }
+                                    // Remove consumed samples from the front
+                                    mic_ring.drain(..mix_len);
+                                    // Prevent unbounded growth (cap at 1 second of stereo audio)
+                                    if mic_ring.len() > 96000 {
+                                        let excess = mic_ring.len() - 96000;
+                                        mic_ring.drain(..excess);
+                                    }
                                 }
                             }
 
@@ -295,7 +315,7 @@ impl WasapiCapture {
                         // Zero the silence buffer
                         for s in silence_buf[..needed].iter_mut() { *s = 0.0; }
 
-                        // Mix in mic even during desktop-silent periods
+                        // Drain mic into accumulator during silent periods too
                         if let (Some(ref mc_cap), Some(mic_f)) = (&mic_capture, mic_fmt) {
                             let mic_bps_val = mic_f.bps / 8;
                             loop {
@@ -307,23 +327,33 @@ impl WasapiCapture {
                                 if mc_cap.GetBuffer(&mut mp_raw, &mut mf, &mut mflags, None, None).is_err() { break; }
                                 if mf > 0 && !mp_raw.is_null() {
                                     let msilent = (mflags & 0x2) != 0;
-                                    if !msilent {
+                                    if msilent {
+                                        mic_ring.extend(std::iter::repeat(0f32).take(mf as usize * 2));
+                                    } else {
                                         let mraw = std::slice::from_raw_parts(mp_raw, mf as usize * mic_bpf);
                                         mic_conv_buf.clear();
                                         to_f32_stereo_into(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float, &mut mic_conv_buf);
                                         if let Some(ref mic_cb) = mic_callback {
-                                            // Multi-track: deliver mic separately
                                             mic_cb(&mic_conv_buf);
                                         } else {
-                                            // Single-track: mix into silence buffer
-                                            let mix_len = (needed).min(mic_conv_buf.len());
-                                            for i in 0..mix_len {
-                                                silence_buf[i] = mix_samples(silence_buf[i], mic_conv_buf[i]);
-                                            }
+                                            mic_ring.extend_from_slice(&mic_conv_buf);
                                         }
                                     }
                                 }
                                 let _ = mc_cap.ReleaseBuffer(mf);
+                            }
+
+                            // Mix from accumulator into silence buffer
+                            if mic_callback.is_none() && !mic_ring.is_empty() {
+                                let mix_len = needed.min(mic_ring.len());
+                                for i in 0..mix_len {
+                                    silence_buf[i] = mix_samples(silence_buf[i], mic_ring[i]);
+                                }
+                                mic_ring.drain(..mix_len);
+                                if mic_ring.len() > 96000 {
+                                    let excess = mic_ring.len() - 96000;
+                                    mic_ring.drain(..excess);
+                                }
                             }
                         }
 
@@ -571,7 +601,7 @@ fn read_sample(d: &[u8], bps: usize, float: bool) -> f32 {
 /// a hard clamp produces.
 #[inline]
 fn soft_clip(x: f32) -> f32 {
-    const THRESHOLD: f32 = 0.9;
+    const THRESHOLD: f32 = 0.8; // Start limiting earlier for more headroom
     let ax = x.abs();
     if ax <= THRESHOLD {
         return x;
@@ -583,18 +613,15 @@ fn soft_clip(x: f32) -> f32 {
 
 /// Mix a desktop sample and a mic sample for single-track recording.
 ///
-/// Root cause of the mic distortion: the previous code summed both sources
-/// at full unity gain and then hard-clamped to [-1.0, 1.0]. Two live audio
-/// sources (game audio + mic) routinely both carry meaningful energy at the
-/// same instant, so the raw sum regularly exceeds full scale — and a hard
-/// clamp on that overflow is audible as crackly, flat-topped distortion.
+/// Desktop audio is already mastered (game engines target -3dB headroom), so
+/// we leave it near unity. Mic gets -3dB (standard mixer level) — audible but
+/// won't clip when combined with loud game audio. The soft-knee limiter at 0.8
+/// catches any remaining overs without audible artifacts.
 ///
-/// Fix: apply -3dB (1/sqrt(2)) headroom to each source before summing, which
-/// is standard practice for linear-sum mixers and removes the vast majority
-/// of overs, then run any remaining excursion through a soft-knee limiter
-/// instead of a hard clamp so what little clipping remains is inaudible.
+/// ShadowPlay uses a similar approach: game audio at full volume, mic ducked slightly.
 #[inline]
 fn mix_samples(desktop: f32, mic: f32) -> f32 {
-    const HEADROOM: f32 = 0.7071; // 1/sqrt(2), -3dB per source
-    soft_clip(desktop * HEADROOM + mic * HEADROOM)
+    const DESKTOP_GAIN: f32 = 0.85;   // ~-1.4dB (slight headroom for sum)
+    const MIC_GAIN: f32 = 0.7071;     // -3dB (audible, standard mixer level)
+    soft_clip(desktop * DESKTOP_GAIN + mic * MIC_GAIN)
 }

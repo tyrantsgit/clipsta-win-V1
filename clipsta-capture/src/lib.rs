@@ -5,8 +5,14 @@
 //! - `audio` — WASAPI loopback + mic capture
 //! - `ipc` — Named pipe protocol (server + client)
 //! - `chime` — Clip-saved sound effect
+//! - `settings` — Direct settings.json reader (standalone mode)
+//! - `tray` — Win32 system tray icon
+//! - `hotkeys` — Global hotkey registration
 
 pub mod audio;
 pub mod chime;
 pub mod gpu_capture;
+pub mod hotkeys;
 pub mod ipc;
+pub mod settings;
+pub mod tray;

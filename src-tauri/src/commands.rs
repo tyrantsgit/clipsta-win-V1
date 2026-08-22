@@ -312,13 +312,43 @@ pub async fn wgc_save_clip(
     }
 
     let output_folder = ensure_output_folder(&store);
-    let game_name = file_name
-        .split(|c: char| c.is_ascii_digit())
-        .next()
-        .unwrap_or("Desktop")
-        .trim()
-        .to_string();
-    let game_folder = if game_name.is_empty() {
+    // Extract game name from the ShadowPlay-style filename.
+    // Filename format: "GameName YYYY.MM.DD - HH.MM.SS.ff.DVR.mp4"
+    // Split on the date pattern (4 digits = year) to isolate the game name prefix.
+    let game_name = {
+        // Find the first occurrence of a 4-digit year pattern (e.g., "2026.")
+        let raw = file_name
+            .find(|c: char| c.is_ascii_digit())
+            .and_then(|idx| {
+                // Check if this looks like a date (digit followed by more digits and dots)
+                let rest = &file_name[idx..];
+                if rest.len() >= 4 && rest[..4].chars().all(|c| c.is_ascii_digit()) {
+                    Some(file_name[..idx].trim().to_string())
+                } else {
+                    // Single digit in game name (e.g., "Battlefield 6") — skip to next digit group
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback: split on first digit
+                file_name
+                    .split(|c: char| c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("Desktop")
+                    .trim()
+                    .to_string()
+            });
+        raw
+    };
+    // Only create a game subfolder if the name looks like an actual game/app
+    // (not a browser page title, not "Desktop", not empty).
+    // Browser titles are stripped by get_active_window_title but may still
+    // contain page titles. Skip folder creation for common non-game patterns.
+    let is_desktop = game_name.is_empty()
+        || game_name == "Desktop"
+        || game_name == "Clipsta"
+        || game_name.contains(" - ");  // Browser page titles typically have " - "
+    let game_folder = if is_desktop {
         output_folder.clone()
     } else {
         let gf = output_folder.join(&game_name);
@@ -332,9 +362,16 @@ pub async fn wgc_save_clip(
     match proxy.save_clip(seconds, &output_str) {
         Ok(path) => {
             eprintln!("[clipsta] Clip saved: {}", path);
-            // Emit clipSaved event so the library auto-refreshes.
-            // The capture process handles the chime; this just notifies the UI.
+            // Generate thumbnail in background (non-blocking — clip is already saved)
+            let thumb_path = path.clone();
+            std::thread::spawn(move || {
+                generate_thumbnail(&thumb_path);
+            });
             let _ = app.emit("wgc:clipSaved", &path);
+            let settings = store.get();
+            if settings.clip_sound_enabled {
+                let _ = app.emit("play-clip-sound", ());
+            }
             Ok(Some(path))
         }
         Err(e) => {
@@ -879,6 +916,52 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
     Ok(())
 }
 
+/// Generate a thumbnail image (JPEG) for a saved clip.
+/// Extracts a frame at 1 second into the video. Saves as "{clip_path}.thumb.jpg".
+/// Best-effort: failures are logged but don't affect the saved clip.
+fn generate_thumbnail(clip_path: &str) {
+    use std::os::windows::process::CommandExt;
+
+    let ffmpeg = match find_ffmpeg() {
+        Some(f) => f,
+        None => {
+            eprintln!("[clipsta] Thumbnail: ffmpeg not found, skipping");
+            return;
+        }
+    };
+
+    // Output path: same directory, same name + .thumb.jpg
+    let thumb_path = format!("{}.thumb.jpg", clip_path.trim_end_matches(".mp4"));
+
+    let result = std::process::Command::new(&ffmpeg)
+        .args([
+            "-y",                    // Overwrite
+            "-ss", "1",              // Seek to 1 second
+            "-i", clip_path,         // Input
+            "-vframes", "1",         // Extract 1 frame
+            "-vf", "scale=320:-1",   // 320px wide, maintain aspect ratio
+            "-q:v", "5",             // JPEG quality (2-31, lower = better)
+            &thumb_path,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            eprintln!("[clipsta] Thumbnail generated: {}", thumb_path);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[clipsta] Thumbnail failed: {}", stderr.lines().last().unwrap_or("unknown"));
+        }
+        Err(e) => {
+            eprintln!("[clipsta] Thumbnail error: {}", e);
+        }
+    }
+}
+
 /// Find ffmpeg executable on the system
 fn find_ffmpeg() -> Option<String> {
     use std::os::windows::process::CommandExt;
@@ -959,6 +1042,14 @@ pub async fn get_active_window_title() -> Result<String, String> {
             return Ok("Desktop".to_string());
         }
         let title = String::from_utf16_lossy(&buf[..len as usize]);
+        // Strip zero-width and invisible Unicode characters (e.g. Call of Duty uses U+200B
+        // between every character in its window title, creating duplicate folder names)
+        let title: String = title.chars().filter(|c| {
+            !matches!(*c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}' |
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+            )
+        }).collect();
         // Clean up the title — remove common suffixes that aren't game names
         let cleaned = title
             .trim()
@@ -1419,9 +1510,31 @@ pub async fn watch_folder_status(
 pub async fn set_start_at_login(enabled: bool) -> Result<bool, String> {
     use std::os::windows::process::CommandExt;
 
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?;
-    let exe_str = exe_path.to_string_lossy().to_string();
+    // In Clipsta 3.0, the capture process is the startup item (not Tauri).
+    // It runs as a lightweight tray app with its own hotkeys.
+    let exe_dir = std::env::current_exe()
+        .map_err(|e| format!("Failed to get exe path: {}", e))?
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // Find clipsta-capture.exe
+    let capture_exe = {
+        let p1 = exe_dir.join("clipsta-capture.exe");
+        if p1.exists() {
+            p1
+        } else {
+            let p2 = exe_dir.join("resources").join("clipsta-capture.exe");
+            if p2.exists() {
+                p2
+            } else {
+                // Fallback: register ourselves (legacy behavior)
+                std::env::current_exe()
+                    .map_err(|e| format!("Failed to get exe path: {}", e))?
+            }
+        }
+    };
+    let exe_str = capture_exe.to_string_lossy().to_string();
 
     if enabled {
         // Add to HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run

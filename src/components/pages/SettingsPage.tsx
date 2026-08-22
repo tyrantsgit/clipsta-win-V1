@@ -131,7 +131,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					<div className="grid grid-cols-3 gap-4">
 						<HotkeyField label="Save Last 30 Seconds" value={local.hotkeyClip30Sec || "Super+Alt+G"} onChange={(v) => update("hotkeyClip30Sec", v)} />
 						<HotkeyField label="Save Last 1 Minute" value={local.hotkeyClip1Min} onChange={(v) => update("hotkeyClip1Min", v)} />
-						<HotkeyField label="Save Last 5 Minutes" value={local.hotkeyClip5Min} onChange={(v) => update("hotkeyClip5Min", v)} />
+						<HotkeyField label="Save Last 5 Minutes" value={local.hotkeyClip5Min || "Alt+F10"} onChange={(v) => update("hotkeyClip5Min", v)} />
 					</div>
 				</Section>
 
@@ -140,10 +140,9 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 					<div className="grid grid-cols-2 gap-4">
 						<SelectField label="Resolution" value={local.resolution} onChange={(v) => update("resolution", v)} options={["native", "480p", "720p", "1080p", "1440p", "4k"]} display={(v) => v === "native" ? "Native (Monitor Resolution)" : v} />
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60"]} />
-						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
 						<SelectField label="Clip Quality" value={local.quality} onChange={(v) => update("quality", v)} options={["standard", "high", "ultra"]} display={(v) => v === "standard" ? "Standard (Smaller files)" : v === "high" ? "High (Recommended)" : v === "ultra" ? "Ultra (Maximum clarity)" : v} />
-						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "180", "300"]} display={(v) => v === "60" ? "1 minute" : v === "300" ? "5 minutes" : v === "120" ? "2 minutes" : v === "180" ? "3 minutes" : `${v}s`} />
+						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "300"]} display={(v) => v === "60" ? "1 minute" : v === "120" ? "2 minutes" : v === "300" ? "5 minutes" : `${v}s`} />
 					</div>
 				</Section>
 

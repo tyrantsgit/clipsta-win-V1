@@ -8,7 +8,7 @@ export const DEFAULTS: AppSettings = {
 	hotkeyClip1Min: "Alt+F9",
 	hotkeyClip5Min: "Alt+F10",
 	hotkeyRecord: "F9",
-	bufferDuration: 300,
+	bufferDuration: 60,
 	resolution: "1080p",
 	fps: 60,
 	aspectRatio: "16:9",

@@ -143,9 +143,11 @@ export default function App() {
 
 // ── Status Page ─────────────────────────────────────────────────────────────
 function StatusPage({ recorder, settings }: { recorder: any; settings: any }) {
-	const { status, duration, error } = recorder.state;
+	const { status, duration, error, captureWidth, captureHeight, captureFps } = recorder.state;
 	const isActive = status === "recording";
-	const bufferDuration = settings?.bufferDuration ?? 300;
+	const bufferDuration = settings?.bufferDuration ?? 60;
+	const bufferFill = isActive ? Math.min(duration / bufferDuration, 1) : 0;
+	const bufferReady = duration >= 5;
 
 	return (
 		<div className="h-full flex flex-col items-center justify-center p-8 space-y-6">
@@ -156,21 +158,54 @@ function StatusPage({ recorder, settings }: { recorder: any; settings: any }) {
 				<h2 className={`text-2xl font-black ${isActive ? "text-green-400" : error ? "text-red-400" : "text-yellow-400"}`}>
 					{isActive ? "RECORDING" : error ? "CAPTURE FAILED" : "STARTING..."}
 				</h2>
-				{isActive && duration < 5 && <p className="text-text-dim text-sm">Clip available in {5 - duration}s</p>}
-				{isActive && duration >= 5 && <p className="text-text-dim text-sm">Buffer: <span className="text-white font-mono">{formatDur(duration)}</span> / {Math.floor(bufferDuration / 60)} min</p>}
+				{isActive && !bufferReady && <p className="text-text-dim text-sm">Clip available in {5 - duration}s</p>}
+				{isActive && bufferReady && <p className="text-text-dim text-sm">Buffer: <span className="text-white font-mono">{formatDur(duration)}</span> / {Math.floor(bufferDuration / 60)} min</p>}
 				{error && !error.includes("available") && <p className="text-red-400 text-xs mt-2 animate-pulse">{error}</p>}
 				{error && error.includes("available") && <p className="text-yellow-400 text-xs mt-2">{error}</p>}
 			</div>
-			<div className="grid grid-cols-3 gap-3 w-full max-w-md">
-				<ClipButton label="Last 30s" hotkey={settings?.hotkeyClip30Sec || "Win+Alt+G"} onClick={() => recorder.saveClip(30)} disabled={!isActive} />
+
+			{/* Buffer Fill Indicator */}
+			{isActive && (
+				<div className="w-full max-w-md space-y-1">
+					<div className="flex items-center justify-between text-[10px] text-text-dim">
+						<span>{bufferFill >= 1 ? "✓ Ready to clip" : "Filling buffer..."}</span>
+						<span>{bufferFill >= 1 ? `${Math.floor(bufferDuration / 60)} min available` : `${Math.round(bufferFill * 100)}%`}</span>
+					</div>
+					<div className="h-1.5 bg-muted rounded-full overflow-hidden">
+						<div
+							className="h-full rounded-full transition-all duration-1000"
+							style={{
+								width: `${bufferFill * 100}%`,
+								backgroundColor: bufferFill >= 1 ? "#22c55e" : "#D4F000",
+							}}
+						/>
+					</div>
+				</div>
+			)}
+
+			<div className="grid grid-cols-3 gap-3 w-full max-w-lg">
+				<ClipButton label="Last 30s" hotkey={settings?.hotkeyClip30Sec || "Ctrl+Shift+G"} onClick={() => recorder.saveClip(30)} disabled={!isActive} />
 				<ClipButton label="Last 1 Min" hotkey={settings?.hotkeyClip1Min || "Alt+F9"} onClick={() => recorder.saveClip(60)} disabled={!isActive} />
-				<ClipButton label="Last 5 Min" hotkey={settings?.hotkeyClip5Min || "Alt+F10"} onClick={() => recorder.saveClip(300)} disabled={!isActive} />
+				<ClipButton label="Last 5 Min" hotkey={settings?.hotkeyClip5Min || "Alt+F10"} onClick={() => recorder.saveClip(300)} disabled={!isActive || bufferDuration < 300} />
 			</div>
+
+			{/* Capture Stats */}
+			{isActive && captureWidth > 0 && (
+				<div className="flex items-center gap-4 text-[11px] text-text-dim">
+					<span className="flex items-center gap-1">
+						<span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+						{captureWidth}×{captureHeight}
+					</span>
+					<span>{captureFps}fps</span>
+					<span>H.264 HW</span>
+					<span>{settings?.quality === "ultra" ? "Ultra" : settings?.quality === "high" ? "High" : "Standard"}</span>
+				</div>
+			)}
+
 			<div className="text-center text-text-dim text-xs max-w-sm space-y-1">
 				<p>Clipsta records continuously in the background.</p>
 				<p>Press a hotkey or click a button to save your clip.</p>
 				<p className="text-text-dim/60">Minimize to tray — recording continues.</p>
-
 			</div>
 		</div>
 	);

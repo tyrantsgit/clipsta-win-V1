@@ -51,10 +51,12 @@ const AUDIO_BLOCK_ALIGN: u32 = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
 const OUTPUT_WIDTH: u32 = 1280;
 const OUTPUT_HEIGHT: u32 = 720;
 
-/// Maximum ring buffer duration in seconds
+/// Maximum ring buffer duration in seconds (5 minutes — matches Medal, closes gap with ShadowPlay)
 const MAX_RING_SECONDS: u32 = 300;
 
-/// NV12 pool size for video processor output
+/// NV12 pool size for video processor output.
+/// 16 textures balances encoder headroom with VRAM usage.
+/// At 1080p: 16 × 1920×1088×1.5 = ~50MB VRAM (matches ShadowPlay's footprint).
 const NV12_POOL_SIZE: usize = 16;
 
 fn pack_u64(high: u32, low: u32) -> u64 {
@@ -885,27 +887,23 @@ fn encoder_thread_fn(
         }).collect()
     };
 
-    // Frame duplication tracking: when WGC misses a delivery, we duplicate
-    // the last frame to maintain exactly fps frames per second.
+    // Frame duplication tracking
+    // Frame duplication tracking
     let mut last_texture_idx: usize = usize::MAX;
     let mut last_pts: i64 = 0;
     let mut last_duration: i64 = 10_000_000 / fps as i64;
 
     // NV12 free-list return: track which texture index was last submitted to ProcessInput.
-    // When the MFT signals METransformNeedInput again, the previous texture is safe to reuse.
     let mut in_flight_texture_idx: Option<usize> = None;
 
-    // Log first event attempt
     let mut event_count: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             log("stop flag set, draining encoder");
-            // Drain: send DRAIN message
             unsafe {
                 let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             }
-            // Continue processing events until no more output
             for _ in 0..200 {
                 match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(event) => {
@@ -919,7 +917,6 @@ fn encoder_thread_fn(
                     Err(_) => break,
                 }
             }
-            // Return any in-flight texture to the free pool before exiting
             if let Some(idx) = in_flight_texture_idx.take() {
                 let _ = nv12_free_tx.try_send(idx);
             }
@@ -951,19 +948,12 @@ fn encoder_thread_fn(
         match event_type {
             // METransformNeedInput (601)
             601 => {
-                // Return the previous texture to the free pool — the MFT is done
-                // reading it (proven by asking for new input). This prevents the
-                // WGC callback from overwriting a texture still in use by the encoder.
+                // Return the previous texture to the free pool
                 if let Some(idx) = in_flight_texture_idx.take() {
                     let _ = nv12_free_tx.try_send(idx);
                 }
 
-                // Wait for a real frame from WGC (Clipsta Lite approach).
-                // No frame duplication — only encode actual delivered frames.
-                // This produces slightly variable fps (58-60) but enables:
-                // - Clean grid PTS (perfect audio sync)
-                // - Less encoder work (no duplicate frames)
-                // - Lower RAM (no duplicate H.264 in ring)
+                // Wait for a real frame from WGC
                 let msg = match rx.recv() {
                     Ok(m) => {
                         last_texture_idx = m.texture_index;
@@ -977,11 +967,7 @@ fn encoder_thread_fn(
                     }
                 };
 
-                let tex = &nv12_pool[msg.texture_index];
                 unsafe {
-                    // Reuse pre-allocated IMFSample from pool (avoids COM alloc per frame).
-                    // The sample permanently wraps this texture's DXGI surface buffer;
-                    // we only update PTS + duration before each ProcessInput.
                     if let Some(Some(ref sample)) = sample_pool.get(msg.texture_index) {
                         let _ = sample.SetSampleTime(msg.pts_100ns);
                         let _ = sample.SetSampleDuration(msg.duration_100ns);
@@ -990,7 +976,8 @@ fn encoder_thread_fn(
                             log(&format!("ProcessInput failed: {}", e));
                         }
                     } else {
-                        // Fallback: pool entry creation failed at init — create on the fly
+                        // Fallback: pool entry creation failed at init
+                        let tex = &nv12_pool[msg.texture_index];
                         match MFCreateDXGISurfaceBuffer(
                             &ID3D11Texture2D::IID,
                             tex,
@@ -1016,7 +1003,6 @@ fn encoder_thread_fn(
                         }
                     }
                 }
-                // Track which texture is now in-flight (will be returned on next NeedInput)
                 in_flight_texture_idx = Some(msg.texture_index);
             }
             // METransformHaveOutput (602)
@@ -1028,15 +1014,9 @@ fn encoder_thread_fn(
                     if event_count < 20 || event_count % 120 == 0 {
                         log(&format!("encoded frame: {}B keyframe={}", data_len, is_kf));
                     }
-                } else {
-                    if event_count < 20 {
-                        log("HaveOutput but extract_output returned None");
-                    }
                 }
             }
-            _ => {
-                // Ignore other events
-            }
+            _ => {}
         }
     }
 }
@@ -1270,8 +1250,11 @@ impl MmapVideoRing {
         // Size the file: bitrate × duration × 1.3 (headroom for I-frame spikes)
         let bytes_per_sec = (bitrate_kbps as u64 * 1000) / 8;
         let capacity = bytes_per_sec * max_seconds as u64 * 13 / 10;
-        // Minimum 100 MB, maximum 2 GB
-        let capacity = capacity.max(100 * 1024 * 1024).min(2 * 1024 * 1024 * 1024);
+        // Minimum 100 MB, maximum 1500 MB (1.5 GB).
+        // The ring wraps and prunes by duration, so exceeding this cap just means
+        // the file wraps sooner (not data loss). 1.5 GB supports 5 min of
+        // 1080p/60fps at 20 Mbps with headroom for AMD's 50% bitrate boost.
+        let capacity = capacity.max(100 * 1024 * 1024).min(1500 * 1024 * 1024);
 
         let file_path = std::env::temp_dir().join("clipsta_ring_video.bin");
         // Remove old file if it exists
@@ -1680,6 +1663,7 @@ impl EncodedMediaRing {
 
     /// Slice video frames from start_idx to end.
     /// When using mmap, reads frame data from disk (OS pages it in automatically).
+    /// For in-memory path, returns full frames with Arc-cloned data (instant).
     fn slice_video(&self, start_idx: usize) -> Vec<EncodedFrame> {
         if let Some(ref mmap_ring) = self.video_mmap {
             // Read frames from mmap — OS pages in the data on demand
@@ -1694,6 +1678,12 @@ impl EncodedMediaRing {
         }
         // Fallback: in-memory path (Arc clones)
         self.video_frames.iter().skip(start_idx).cloned().collect()
+    }
+
+    /// Get the mmap file path (for reading outside lock).
+    #[allow(dead_code)]
+    fn mmap_file_path(&self) -> Option<std::path::PathBuf> {
+        self.video_mmap.as_ref().map(|r| r.file_path.clone())
     }
 
     /// Slice audio chunks that overlap the given PTS range.
@@ -2868,9 +2858,8 @@ fn run_gpu_capture(
 
     // Create channel: WGC callback → encoder thread
     // SyncSender with bound=12 provides backpressure while allowing burst tolerance.
-    // NV12 pool has 16 textures, so 12 in-flight is safe.
-    // Higher bound (was 4) prevents frame drops on AMD VCN and NVIDIA when encoder
-    // occasionally stalls under GPU load — gives ~200ms of burst tolerance.
+    // NV12 pool has 16 textures, so 12 in-flight is safe (4 free for WGC writes).
+    // Provides ~200ms of burst tolerance when encoder stalls on keyframes.
     let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(12);
 
     // Clone NV12 pool for encoder thread (Arc-wrapped for shared access)
