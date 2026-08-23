@@ -65,6 +65,7 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 	const [speedMarkIn, setSpeedMarkIn] = useState<number | null>(null);
 	const [dragOver, setDragOver] = useState(false);
 	const dragSrcRef = useRef<number | null>(null);
+	const [previewAll, setPreviewAll] = useState(false);
 	const uploadJob = filePath ? cloud.queue.find((j) => j.path === filePath) : undefined;
 	const uploadBusy = !!(uploadJob && (uploadJob.status === "queued" || uploadJob.status === "uploading"));
 	const [showUploaded, setShowUploaded] = useState(false);
@@ -204,6 +205,29 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 		const entry: TimelineEntry = { id: crypto.randomUUID(), path, name, trimIn: 0, trimOut: 0 };
 		setTimeline((prev) => [...prev, entry]);
 		setActiveIdx(timeline.length);
+		// Probe duration in background so merge works even if clip isn't viewed
+		try {
+			const info = await bridge.inspectMp4(path);
+			if (info && info.duration > 0) {
+				setTimeline((prev) => prev.map((e) =>
+					e.path === path && e.trimOut === 0 ? { ...e, trimOut: info.duration } : e
+				));
+			}
+		} catch {
+			// Fallback: try getting duration from a hidden video element
+			const probe = document.createElement("video");
+			probe.preload = "metadata";
+			probe.src = path.startsWith("http") ? path : `asset://localhost/${encodeURIComponent(path)}`;
+			probe.onloadedmetadata = () => {
+				if (probe.duration && isFinite(probe.duration)) {
+					setTimeline((prev) => prev.map((e) =>
+						e.path === path && e.trimOut === 0 ? { ...e, trimOut: probe.duration } : e
+					));
+				}
+				probe.remove();
+			};
+			probe.onerror = () => probe.remove();
+		}
 	}, [timeline.length]);
 
 	// Tauri 2 native drag-drop: provides full file paths even in WebView2
@@ -274,6 +298,29 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 		if (!v) return;
 		setCurrentTime(v.currentTime);
 		if (trimOut > 0 && v.currentTime >= trimOut) {
+			// Preview All mode: advance to next clip
+			if (previewAll && playing && activeIdx < timeline.length - 1) {
+				// Save current clip's trim state
+				setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e));
+				const nextIdx = activeIdx + 1;
+				setActiveIdx(nextIdx);
+				const nextEntry = timeline[nextIdx];
+				if (nextEntry) {
+					setTrimIn(nextEntry.trimIn);
+					setTrimOut(nextEntry.trimOut > 0 ? nextEntry.trimOut : 0);
+					// Video src will change via the key={filePath} prop, then onLoadedMetadata fires
+					// We need to auto-play the next clip after it loads
+					setTimeout(() => {
+						const vid = videoRef.current;
+						if (vid) {
+							vid.currentTime = nextEntry.trimIn;
+							vid.play().catch(() => {});
+						}
+					}, 200);
+				}
+				return;
+			}
+			// Normal mode: loop within trim region
 			v.currentTime = trimIn;
 			if (!playing) v.pause();
 		}
@@ -393,12 +440,40 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 	const togglePlay = () => {
 		const v = videoRef.current;
 		if (!v) return;
-		if (playing) { v.pause(); setPlaying(false); }
+		if (playing) { v.pause(); setPlaying(false); setPreviewAll(false); }
 		else {
 			if (v.currentTime >= trimOut || v.currentTime < trimIn) v.currentTime = trimIn;
 			v.play().catch(() => setExportError("Failed to play video file"));
 			setPlaying(true);
 		}
+	};
+
+	const previewAllClips = () => {
+		if (timeline.length < 2) { togglePlay(); return; }
+		const v = videoRef.current;
+		if (!v) return;
+		if (playing && previewAll) {
+			// Stop preview
+			v.pause();
+			setPlaying(false);
+			setPreviewAll(false);
+			return;
+		}
+		// Start from clip 1
+		setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e));
+		setActiveIdx(0);
+		setPreviewAll(true);
+		const firstEntry = timeline[0];
+		setTrimIn(firstEntry.trimIn);
+		setTrimOut(firstEntry.trimOut > 0 ? firstEntry.trimOut : 0);
+		setTimeout(() => {
+			const vid = videoRef.current;
+			if (vid) {
+				vid.currentTime = firstEntry.trimIn;
+				vid.play().catch(() => {});
+				setPlaying(true);
+			}
+		}, 100);
 	};
 
 	const setVol = (val: number) => {
@@ -504,11 +579,19 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 		e.preventDefault();
 		dragCounterRef.current = 0;
 		setDragOver(false);
+		// Only process external file drops (not internal clip reorders)
+		if (e.dataTransfer.getData("text/plain").match(/^\d+$/)) return;
 		const paths = getDroppedPathsLocal(e.dataTransfer);
 		paths.forEach((p) => addToTimeline(p));
 	};
 
-	const handleDragEnter = (e: React.DragEvent) => { e.preventDefault(); dragCounterRef.current++; setDragOver(true); };
+	const handleDragEnter = (e: React.DragEvent) => {
+		e.preventDefault();
+		// Don't show drop overlay for internal clip reorders
+		if (e.dataTransfer.types.includes("text/plain") && !e.dataTransfer.types.includes("Files")) return;
+		dragCounterRef.current++;
+		setDragOver(true);
+	};
 	const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); };
 	const handleDragLeave = (e: React.DragEvent) => {
 		e.preventDefault();
@@ -526,20 +609,29 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 		setPlaying(false);
 		if (videoRef.current) videoRef.current.pause();
 		const exportTimeline = timeline.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e);
-		const zeroDur = exportTimeline.find((e) => e.trimOut <= e.trimIn);
-		if (zeroDur) { setExportError(`"${zeroDur.name}" has no duration loaded yet.`); return; }
+		// For clips that haven't been loaded (trimOut is 0), probe them now
+		const resolvedTimeline = await Promise.all(exportTimeline.map(async (e) => {
+			if (e.trimOut > e.trimIn) return e;
+			// Try to get duration from mp4 inspection
+			try {
+				const info = await bridge.inspectMp4(e.path);
+				if (info && info.duration > 0) return { ...e, trimOut: info.duration };
+			} catch { /* fallback below */ }
+			// Use a generous default — FFmpeg will use the full file if -t isn't specified
+			return { ...e, trimOut: 9999 };
+		}));
 		const folder = settings.outputFolder;
 		if (!folder) { setExportError("No output folder set in Settings"); return; }
-		const mergedName = exportTimeline.map((e) => sanitizeName(e.name.replace(/\.[^.]+$/, ""))).join(" + ");
+		const mergedName = resolvedTimeline.map((e) => sanitizeName(e.name.replace(/\.[^.]+$/, ""))).join(" + ");
 		const outPath = `${folder}\\${mergedName}.mp4`;
 		try { await bridge.ensureDir(folder); } catch { /* best effort */ }
 		setExporting(true); setExportDone(null); setExportError(null); setExportProgress(0);
 		try {
-			const primaryPath = exportTimeline[0].path;
+			const primaryPath = resolvedTimeline[0].path;
 			const opts: ExportOpts = {
 				format: "mp4", resolution: expResolution, aspectRatio: expAspect,
 				fps: settings.fps, encoder: settings.encoder,
-				timeline: exportTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut })),
+				timeline: resolvedTimeline.map((e) => ({ path: e.path, trimIn: e.trimIn, trimOut: e.trimOut })),
 			};
 			const out = await bridge.exportRecording(primaryPath, outPath, opts);
 			if (out) {
@@ -665,6 +757,7 @@ export default function EditorPage({ initialFile, settings, cloud, onExportDone 
 			transitions={transitions} setTransitions={setTransitions}
 			history={history} historyIdx={historyIdx}
 			undo={undo} redo={redo} pushHistory={pushHistory}
+			previewAll={previewAll} previewAllClips={previewAllClips}
 		/>
 	);
 }
@@ -704,6 +797,7 @@ function EditorLayout(props: any) {
 		transitions, setTransitions,
 		history, historyIdx,
 		undo, redo, pushHistory,
+		previewAll, previewAllClips,
 	} = props;
 
 	return (
@@ -723,9 +817,85 @@ function EditorLayout(props: any) {
 
 			{/* Main editor area */}
 			<div className="flex-1 flex flex-col overflow-hidden">
-				{/* Clip strip */}
+				{/* Multi-clip timeline strip (Medal-style visual track) */}
 				{timeline.length > 0 && (
-					<div className="flex-shrink-0 bg-[#0d0d0d] border-b border-border px-3 py-2">
+					<div className="flex-shrink-0 bg-[#0d0d0d] border-b border-border px-3 py-2 space-y-2">
+						{/* Combined timeline bar — clips shown proportionally by duration */}
+						{timeline.length > 1 && (() => {
+							const totalDur = timeline.reduce((sum: number, c: any) => sum + Math.max(0.1, (c.trimOut || 1) - c.trimIn), 0);
+							return (
+								<div className="space-y-1">
+									<div className="flex items-center justify-between">
+										<span className="text-[10px] text-text-dim font-semibold uppercase tracking-wider">Combined Timeline</span>
+										<div className="flex items-center gap-2">
+											<button
+												onClick={previewAllClips}
+												className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+													previewAll ? "bg-y text-black" : "bg-muted text-text-mid hover:text-y hover:bg-y/10 border border-border hover:border-y/50"
+												}`}
+												title="Preview all clips combined (plays through each clip sequentially)"
+											>
+												{previewAll ? <Pause size={10} /> : <Play size={10} />}
+												{previewAll ? "Stop Preview" : "▶ Preview All"}
+											</button>
+											<span className="text-[10px] text-y font-mono">{formatTime(totalDur)} total · {timeline.length} clips</span>
+										</div>
+									</div>
+									<div className="flex h-8 rounded-lg overflow-hidden border border-border bg-muted">
+										{timeline.map((clip: any, idx: number) => {
+											const clipDur = Math.max(0.1, (clip.trimOut || 1) - clip.trimIn);
+											const widthPct = (clipDur / totalDur) * 100;
+											const colors = ["bg-y/30 border-y/60", "bg-blue-500/30 border-blue-500/60", "bg-purple-500/30 border-purple-500/60", "bg-green-500/30 border-green-500/60", "bg-orange-500/30 border-orange-500/60"];
+											const activeColor = ["bg-y/50 border-y", "bg-blue-500/50 border-blue-500", "bg-purple-500/50 border-purple-500", "bg-green-500/50 border-green-500", "bg-orange-500/50 border-orange-500"];
+											return (
+												<div
+													key={clip.id}
+													onClick={() => selectClip(idx)}
+													draggable
+													onDragStart={(e: React.DragEvent) => {
+														e.dataTransfer.effectAllowed = "move";
+														e.dataTransfer.setData("text/plain", String(idx));
+														(e.currentTarget as HTMLElement).style.opacity = "0.5";
+													}}
+													onDragEnd={(e: React.DragEvent) => { (e.currentTarget as HTMLElement).style.opacity = "1"; }}
+													onDragOver={(e: React.DragEvent) => {
+														e.preventDefault();
+														e.dataTransfer.dropEffect = "move";
+														(e.currentTarget as HTMLElement).style.outline = "2px solid #D4F000";
+													}}
+													onDragLeave={(e: React.DragEvent) => {
+														(e.currentTarget as HTMLElement).style.outline = "none";
+													}}
+													onDrop={(e: React.DragEvent) => {
+														e.preventDefault(); e.stopPropagation();
+														(e.currentTarget as HTMLElement).style.outline = "none";
+														const fromIdx = parseInt(e.dataTransfer.getData("text/plain"));
+														if (isNaN(fromIdx) || fromIdx === idx) return;
+														setTimeline((prev: any[]) => {
+															const next = [...prev];
+															const [moved] = next.splice(fromIdx, 1);
+															next.splice(idx, 0, moved);
+															return next;
+														});
+														setActiveIdx(idx);
+													}}
+													className={`h-full flex items-center justify-center cursor-grab active:cursor-grabbing transition-all border-r last:border-r-0 ${
+														idx === activeIdx ? activeColor[idx % 5] : colors[idx % 5]
+													} hover:brightness-125`}
+													style={{ width: `${widthPct}%`, minWidth: "40px" }}
+													title={`Drag to reorder · ${clip.name} (${formatTime(clipDur)})`}
+												>
+													<span className={`text-[9px] font-semibold truncate px-1 ${idx === activeIdx ? "text-white" : "text-text-mid"}`}>
+														{clip.name.replace(/\.[^.]+$/, "").slice(0, 12)}
+													</span>
+												</div>
+											);
+										})}
+									</div>
+								</div>
+							);
+						})()}
+						{/* Individual clip chips (draggable) */}
 						<div className="flex gap-2 items-center overflow-x-auto">
 							{timeline.map((clip: any, idx: number) => (
 								<div
@@ -746,11 +916,13 @@ function EditorLayout(props: any) {
 										setTimeline((prev: any[]) => {
 											const next = [...prev]; const [moved] = next.splice(fromIdx, 1); next.splice(idx, 0, moved); return next;
 										});
+										setActiveIdx(idx);
 									}}
 									className={`flex-shrink-0 flex items-center gap-2 px-3 py-1.5 rounded text-xs transition-colors border select-none cursor-grab active:cursor-grabbing ${
 										idx === activeIdx ? "bg-y/10 border-y/50 text-y" : "bg-muted border-border text-text-mid hover:border-y/30 hover:text-white"
 									}`}
 								>
+									<span className="text-[10px] font-bold opacity-50">{idx + 1}</span>
 									<span className="font-mono truncate max-w-[120px]">{clip.name}</span>
 									<span className="text-[10px] opacity-60 tabular-nums">{clip.trimOut > 0 ? formatTime(clip.trimOut - clip.trimIn) : "—"}</span>
 								</div>
@@ -790,6 +962,12 @@ function EditorLayout(props: any) {
 						{speedSegments.some((s: SpeedSegment) => currentTime >= s.start && currentTime <= s.end && s.speed !== 1) && (
 							<div className="absolute top-3 left-3 bg-black/70 text-y text-[11px] font-bold px-2 py-1 rounded z-10">
 								{speedSegments.find((s: SpeedSegment) => currentTime >= s.start && currentTime <= s.end)?.speed ?? 1}x
+							</div>
+						)}
+						{/* Preview All mode indicator */}
+						{previewAll && (
+							<div className="absolute top-3 right-3 bg-y/90 text-black text-[10px] font-bold px-2 py-1 rounded z-10 flex items-center gap-1">
+								<Play size={10} /> Preview · Clip {activeIdx + 1}/{timeline.length}
 							</div>
 						)}
 						<VolumeSync videoRef={videoRef} muted={muted} volume={volume} />

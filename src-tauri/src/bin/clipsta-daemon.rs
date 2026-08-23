@@ -4,7 +4,6 @@
 //! - Auto-starts WGC capture on launch
 //! - Registers global hotkeys (Ctrl+Shift+G = 30s, Alt+F9 = 60s, Alt+F10 = 5min)
 //! - Saves clips directly to the output folder
-//! - Plays chime on save
 //! - Exposes named pipe for Tauri UI to query status
 //! - System tray icon with status indicator
 //!
@@ -20,7 +19,6 @@ use std::thread;
 use std::time::Duration;
 
 use clipsta_capture::gpu_capture::{CaptureOptions, CaptureSession};
-use clipsta_capture::chime;
 use clipsta_tauri_lib::settings::{AppSettings, SettingsStore};
 
 /// Daemon state shared across threads.
@@ -133,7 +131,7 @@ fn start_capture(session: &CaptureSession, settings: &AppSettings) -> bool {
         _ => 8000,
     };
 
-    let mic_device = if settings.capture_mic {
+    let mic_device = if settings.capture_mic || settings.audio_source == "mic" || settings.audio_source == "both" {
         if settings.audio_input_device_id.is_empty() {
             Some("default".to_string())
         } else {
@@ -210,7 +208,6 @@ fn save_clip(session: &CaptureSession, settings: &AppSettings, seconds: u32) {
     match session.save_clip(seconds, &output_str) {
         Ok(path) => {
             eprintln!("[clipsta-daemon] ✓ Saved: {}", path);
-            chime::play();
         }
         Err(e) => {
             let msg = format!("{}", e);

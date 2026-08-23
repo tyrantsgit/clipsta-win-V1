@@ -286,44 +286,49 @@ export function useRecorder(settings: AppSettings | null) {
 	const audioCtxRef = useRef<AudioContext | null>(null);
 	useEffect(() => {
 		const unlistenPromise = bridge.onPlayClipSound(() => {
-			try {
-				if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
-					audioCtxRef.current = new AudioContext();
-				}
-				const ctx = audioCtxRef.current;
-				if (ctx.state === "suspended") {
-					ctx.resume().catch(() => {});
-				}
-				const now = ctx.currentTime;
+			// Delay chime slightly so it doesn't get captured in the ring buffer
+			// (the clip is already saved, but the buffer is still recording)
+			setTimeout(() => {
+				try {
+					if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
+						audioCtxRef.current = new AudioContext();
+					}
+					const ctx = audioCtxRef.current;
+					if (ctx.state === "suspended") {
+						ctx.resume().catch(() => {});
+					}
+					const now = ctx.currentTime;
 
-				// === Clean "Clip Saved" notification tone ===
-				// Two-tone ascending ding (similar to ShadowPlay/Medal save sound)
-				// Short, satisfying, non-intrusive
+					// === ShadowPlay/Medal-style "clip saved" chime ===
+					// Quick two-note ascending ding — gaming feel, satisfying confirmation
 
-				// Tone 1: lower note (E5 = 659 Hz)
-				const osc1 = ctx.createOscillator();
-				osc1.type = "sine";
-				osc1.frequency.value = 659;
-				const gain1 = ctx.createGain();
-				gain1.gain.setValueAtTime(0.4, now);
-				gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
-				osc1.connect(gain1);
-				gain1.connect(ctx.destination);
-				osc1.start(now);
-				osc1.stop(now + 0.15);
+					// Note 1: E6 (1318 Hz) — short ping
+					const osc1 = ctx.createOscillator();
+					osc1.type = "sine";
+					osc1.frequency.value = 1318;
+					const gain1 = ctx.createGain();
+					gain1.gain.setValueAtTime(0, now);
+					gain1.gain.linearRampToValueAtTime(0.25, now + 0.005);
+					gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+					osc1.connect(gain1);
+					gain1.connect(ctx.destination);
+					osc1.start(now);
+					osc1.stop(now + 0.08);
 
-				// Tone 2: higher note (B5 = 988 Hz), slightly delayed
-				const osc2 = ctx.createOscillator();
-				osc2.type = "sine";
-				osc2.frequency.value = 988;
-				const gain2 = ctx.createGain();
-				gain2.gain.setValueAtTime(0.35, now + 0.08);
-				gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
-				osc2.connect(gain2);
-				gain2.connect(ctx.destination);
-				osc2.start(now + 0.08);
-				osc2.stop(now + 0.25);
-			} catch { /* ignore */ }
+					// Note 2: G6 (1568 Hz) — slightly delayed, higher pitch
+					const osc2 = ctx.createOscillator();
+					osc2.type = "sine";
+					osc2.frequency.value = 1568;
+					const gain2 = ctx.createGain();
+					gain2.gain.setValueAtTime(0, now + 0.06);
+					gain2.gain.linearRampToValueAtTime(0.2, now + 0.065);
+					gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+					osc2.connect(gain2);
+					gain2.connect(ctx.destination);
+					osc2.start(now + 0.06);
+					osc2.stop(now + 0.15);
+				} catch { /* ignore */ }
+			}, 500);
 		});
 		return () => {
 			unlistenPromise.then((u) => u()).catch(() => {});

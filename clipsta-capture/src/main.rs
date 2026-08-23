@@ -32,7 +32,6 @@ use clipsta_capture::ipc::{self, CaptureCommand, CaptureResponse, ErrorPayload, 
 use clipsta_capture::settings::{self, AppSettings};
 use clipsta_capture::hotkeys;
 use clipsta_capture::tray::TrayIcon;
-use clipsta_capture::chime;
 
 mod logging;
 
@@ -201,7 +200,7 @@ fn start_capture(session: &CaptureSession, settings: &AppSettings) {
         &settings.quality,
     );
 
-    let mic_device = if settings.capture_mic {
+    let mic_device = if settings.capture_mic || settings.audio_source == "mic" || settings.audio_source == "both" {
         if settings.audio_input_device_id.is_empty() {
             Some("default".to_string())
         } else {
@@ -296,9 +295,6 @@ fn do_save(session: &CaptureSession, settings: &AppSettings, seconds: u32) {
     match session.save_clip(seconds, &output_str) {
         Ok(path) => {
             log!("[clipsta-capture] ✓ Saved: {}", path);
-            if settings.clip_sound_enabled {
-                chime::play();
-            }
         }
         Err(e) => {
             let msg = format!("{}", e);
@@ -414,19 +410,46 @@ fn run_pipe_server(session: Arc<CaptureSession>, save_tx: SyncSender<u32>) {
 
             let response = match cmd {
                 CaptureCommand::Start(_payload) => {
-                    // In standalone mode, capture is already running.
-                    // Report current state instead of re-starting.
+                    // Report current state — capture is already running with correct settings
+                    // from start_capture() at launch (which uses audio_source for mic).
                     log!("[clipsta-capture] IPC: Start command (capture already active)");
                     if session.is_recording.load(Ordering::Relaxed) {
                         CaptureResponse::Ready(ipc::ReadyPayload {
-                            width: 0,  // Info not stored after start
+                            width: 0,
                             height: 0,
                             fps: 0,
                         })
                     } else {
-                        CaptureResponse::Error(ErrorPayload {
-                            message: "Capture not active".to_string(),
-                        })
+                        // Not yet recording — start with the payload from Tauri
+                        log!("[clipsta-capture] IPC: Starting capture (mic: {:?})", _payload.mic_device);
+                        let seg_dir = std::env::temp_dir().join(format!("clipsta_segments_{}", std::process::id()));
+                        let _ = std::fs::create_dir_all(&seg_dir);
+                        let capture_opts = CaptureOptions {
+                            source_id: _payload.source_id,
+                            fps: _payload.fps,
+                            no_audio: _payload.no_audio,
+                            mic_device: _payload.mic_device,
+                            loopback_device: _payload.loopback_device,
+                            target_width: _payload.target_width,
+                            target_height: _payload.target_height,
+                            bitrate_kbps: _payload.bitrate_kbps,
+                            segment_duration: 3,
+                            buffer_duration: _payload.buffer_duration,
+                            segment_dir: seg_dir,
+                            multi_track_audio: _payload.multi_track_audio,
+                            warm_cache: None,
+                        };
+                        let on_segment = Box::new(|_seg: CompletedSegment| {});
+                        match session.start(capture_opts, on_segment, None) {
+                            Ok(info) => CaptureResponse::Ready(ipc::ReadyPayload {
+                                width: info.width,
+                                height: info.height,
+                                fps: info.fps,
+                            }),
+                            Err(e) => CaptureResponse::Error(ErrorPayload {
+                                message: format!("Start failed: {}", e),
+                            }),
+                        }
                     }
                 }
                 CaptureCommand::Stop => {

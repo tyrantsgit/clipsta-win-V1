@@ -258,7 +258,8 @@ pub async fn wgc_start_recording(
         fps,
         no_audio,
         mic_device: opts.mic_device.or_else(|| {
-            if settings.capture_mic {
+            let wants_mic = settings.audio_source == "mic" || settings.audio_source == "both" || settings.capture_mic;
+            if wants_mic {
                 if settings.audio_input_device_id.is_empty() { Some("default".to_string()) }
                 else { Some(settings.audio_input_device_id.clone()) }
             } else {
@@ -528,6 +529,15 @@ pub struct ExportOpts {
     pub saturation: Option<u32>,
     pub speed_segments: Option<Vec<SpeedSegmentOpts>>,
     pub transitions: Option<Vec<TransitionOpts>>,
+    pub timeline: Option<Vec<TimelineClip>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineClip {
+    pub path: String,
+    pub trim_in: f64,
+    pub trim_out: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,23 +615,392 @@ pub async fn recording_export(
 /// Wrapper that runs FFmpeg with real-time progress parsing from stderr.
 /// Replaces the old estimation-based approach with actual FFmpeg progress.
 fn ffmpeg_export_with_progress(app: &AppHandle, input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
-    // Get input duration for percentage calculation
+    // Multi-clip timeline merge: use concat approach
+    if let Some(ref timeline) = opts.timeline {
+        if timeline.len() > 1 {
+            let result = ffmpeg_concat_timeline(app, timeline, output, opts);
+            let _ = app.emit("export:progress", 100u32);
+            return result;
+        }
+    }
+
+    // Single clip path
     let input_duration = get_video_duration(input).unwrap_or(30.0);
-    // If trim is set, use trimmed duration
     let effective_duration = if let (Some(start), Some(end)) = (opts.trim_start, opts.trim_end) {
         end - start
     } else {
         input_duration
     };
 
-    // Build the FFmpeg command args using the same logic as ffmpeg_export
-    // We need to replicate the arg building to run with piped stderr
     let result = ffmpeg_export_piped(app, input, output, opts, effective_duration);
 
     // Emit 100% on completion
     let _ = app.emit("export:progress", 100u32);
 
     result
+}
+
+/// Multi-clip timeline merge via FFmpeg filter_complex concat.
+/// Each clip gets trimmed to its trimIn/trimOut, then all clips are concatenated.
+fn ffmpeg_concat_timeline(app: &AppHandle, timeline: &[TimelineClip], output: &str, opts: &ExportOpts) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+
+    // Calculate total duration for progress
+    let total_duration: f64 = timeline.iter().map(|c| {
+        let dur = c.trim_out - c.trim_in;
+        if dur > 0.0 { dur } else { get_video_duration(&c.path).unwrap_or(30.0) }
+    }).sum();
+
+    let n = timeline.len();
+    let mut args: Vec<String> = vec!["-y".to_string()];
+
+    // Add all inputs WITHOUT -ss/-t (trimming handled in filter_complex)
+    for clip in timeline {
+        args.push("-i".to_string());
+        args.push(clip.path.clone());
+    }
+
+    // Build filter_complex for concat with per-clip trimming
+    let target_res = match opts.resolution.as_deref() {
+        Some("480p") => "854:480",
+        Some("720p") => "1280:720",
+        Some("1440p") => "2560:1440",
+        Some("4k") => "3840:2160",
+        _ => "1920:1080",
+    };
+
+    let mut filter_parts: Vec<String> = Vec::new();
+    let mut concat_inputs = String::new();
+
+    for i in 0..n {
+        let clip = &timeline[i];
+        // Only apply trim filter if user actually set markers (trimIn > 0 or trimOut is less than a reasonable full-file assumption)
+        // If trimOut >= 9000, it means "full file" — skip trim entirely
+        // If trimIn == 0 and trimOut was set by auto-probe to full duration, we still trim to be precise
+        let has_real_trim = clip.trim_in > 0.1 || (clip.trim_out > 0.0 && clip.trim_out < 9000.0);
+        
+        if has_real_trim && clip.trim_out < 9000.0 {
+            let trim_start = clip.trim_in;
+            let trim_end = clip.trim_out;
+            // Video: trim with explicit start/end, then reset PTS, then scale
+            filter_parts.push(format!(
+                "[{i}:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS,scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]",
+                trim_start, trim_end
+            ));
+            // Audio: atrim with explicit start/end
+            filter_parts.push(format!(
+                "[{i}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a{i}]",
+                trim_start, trim_end
+            ));
+        } else {
+            // No trim — just scale
+            filter_parts.push(format!(
+                "[{i}:v]scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            ));
+            filter_parts.push(format!(
+                "[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
+            ));
+        }
+        concat_inputs.push_str(&format!("[v{i}][a{i}]"));
+    }
+
+    let filter_complex = format!(
+        "{};{}concat=n={}:v=1:a=1[vout][aout]",
+        filter_parts.join(";"),
+        concat_inputs,
+        n
+    );
+
+    args.push("-filter_complex".to_string());
+    args.push(filter_complex);
+    args.push("-map".to_string());
+    args.push("[vout]".to_string());
+    args.push("-map".to_string());
+    args.push("[aout]".to_string());
+
+    // Framerate
+    args.push("-r".to_string());
+    args.push(format!("{}", opts.fps.unwrap_or(60)));
+
+    // Video codec — try NVENC first
+    args.push("-c:v".to_string());
+    args.push("h264_nvenc".to_string());
+    args.push("-preset".to_string());
+    args.push("p7".to_string());
+    args.push("-rc".to_string());
+    args.push("vbr".to_string());
+    args.push("-cq".to_string());
+    args.push("18".to_string());
+    args.push("-b:v".to_string());
+    args.push("20M".to_string());
+
+    // Audio codec
+    args.push("-c:a".to_string());
+    args.push("aac".to_string());
+    args.push("-b:a".to_string());
+    args.push("192k".to_string());
+
+    args.push(output.to_string());
+
+    // Run FFmpeg
+    let mut child = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|e| format!("Failed to run FFmpeg for merge: {}", e))?;
+
+    // Parse progress
+    let mut last_error_line = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        let reader = std::io::BufReader::new(stderr);
+        let mut last_pct: u32 = 0;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if let Some(time_pos) = line.find("time=") {
+                let time_str = &line[time_pos + 5..];
+                if let Some(end) = time_str.find(|c: char| c == ' ' || c == '\r') {
+                    let time_val = &time_str[..end];
+                    if let Some(secs) = parse_ffmpeg_time(time_val) {
+                        let pct = if total_duration > 0.0 {
+                            ((secs / total_duration) * 100.0).min(99.0) as u32
+                        } else { 0 };
+                        if pct != last_pct {
+                            last_pct = pct;
+                            let _ = app.emit("export:progress", pct);
+                        }
+                    }
+                }
+            }
+            if line.contains("Error") || line.contains("error") || line.contains("Cannot") || line.contains("Invalid") {
+                last_error_line = line.clone();
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("FFmpeg merge error: {}", e))?;
+
+    if !status.success() {
+        // Fallback to software encoder if NVENC fails
+        if last_error_line.contains("nvenc") || last_error_line.contains("Cannot load") || last_error_line.contains("No NVENC") {
+            return ffmpeg_concat_timeline_software(timeline, output, opts, total_duration, app);
+        }
+        // Fallback: if audio stream missing, try without audio
+        if last_error_line.contains("does not contain any stream") || last_error_line.contains("Stream map") {
+            return ffmpeg_concat_timeline_video_only(timeline, output, opts, total_duration, app);
+        }
+        return Err(format!("Merge failed: {}", if last_error_line.is_empty() { "FFmpeg error".to_string() } else { last_error_line }));
+    }
+
+    Ok(())
+}
+
+/// Software fallback for multi-clip concat (no NVENC).
+fn ffmpeg_concat_timeline_software(timeline: &[TimelineClip], output: &str, opts: &ExportOpts, total_duration: f64, app: &AppHandle) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+    let n = timeline.len();
+    let mut args: Vec<String> = vec!["-y".to_string()];
+
+    for clip in timeline {
+        args.push("-i".to_string());
+        args.push(clip.path.clone());
+    }
+
+    let target_res = match opts.resolution.as_deref() {
+        Some("480p") => "854:480",
+        Some("720p") => "1280:720",
+        Some("1440p") => "2560:1440",
+        Some("4k") => "3840:2160",
+        _ => "1920:1080",
+    };
+
+    let mut filter_parts: Vec<String> = Vec::new();
+    let mut concat_inputs = String::new();
+    for i in 0..n {
+        let clip = &timeline[i];
+        let has_trim = clip.trim_in > 0.0 || (clip.trim_out > 0.0 && clip.trim_out < 9000.0);
+        if has_trim {
+            let trim_start = clip.trim_in;
+            let trim_end = if clip.trim_out > 0.0 && clip.trim_out < 9000.0 { clip.trim_out } else { 99999.0 };
+            filter_parts.push(format!(
+                "[{i}:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS,scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]",
+                trim_start, trim_end
+            ));
+            filter_parts.push(format!(
+                "[{i}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a{i}]",
+                trim_start, trim_end
+            ));
+        } else {
+            filter_parts.push(format!(
+                "[{i}:v]scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            ));
+            filter_parts.push(format!(
+                "[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
+            ));
+        }
+        concat_inputs.push_str(&format!("[v{i}][a{i}]"));
+    }
+
+    let filter_complex = format!(
+        "{};{}concat=n={}:v=1:a=1[vout][aout]",
+        filter_parts.join(";"),
+        concat_inputs,
+        n
+    );
+
+    args.push("-filter_complex".to_string());
+    args.push(filter_complex);
+    args.push("-map".to_string());
+    args.push("[vout]".to_string());
+    args.push("-map".to_string());
+    args.push("[aout]".to_string());
+    args.push("-r".to_string());
+    args.push(format!("{}", opts.fps.unwrap_or(60)));
+    args.push("-c:v".to_string());
+    args.push("libx264".to_string());
+    args.push("-preset".to_string());
+    args.push("medium".to_string());
+    args.push("-crf".to_string());
+    args.push("18".to_string());
+    args.push("-c:a".to_string());
+    args.push("aac".to_string());
+    args.push("-b:a".to_string());
+    args.push("192k".to_string());
+    args.push(output.to_string());
+
+    let mut child = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|e| format!("Failed to run FFmpeg (software): {}", e))?;
+
+    if let Some(stderr) = child.stderr.take() {
+        let reader = std::io::BufReader::new(stderr);
+        let mut last_pct: u32 = 0;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if let Some(time_pos) = line.find("time=") {
+                let time_str = &line[time_pos + 5..];
+                if let Some(end) = time_str.find(|c: char| c == ' ' || c == '\r') {
+                    if let Some(secs) = parse_ffmpeg_time(&time_str[..end]) {
+                        let pct = ((secs / total_duration) * 100.0).min(99.0) as u32;
+                        if pct != last_pct { last_pct = pct; let _ = app.emit("export:progress", pct); }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("FFmpeg merge error: {}", e))?;
+    if !status.success() {
+        return Err("Merge failed with software encoder".to_string());
+    }
+    Ok(())
+}
+
+/// Video-only fallback for clips that don't have audio streams.
+fn ffmpeg_concat_timeline_video_only(timeline: &[TimelineClip], output: &str, opts: &ExportOpts, total_duration: f64, app: &AppHandle) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+    let n = timeline.len();
+    let mut args: Vec<String> = vec!["-y".to_string()];
+
+    for clip in timeline {
+        args.push("-i".to_string());
+        args.push(clip.path.clone());
+    }
+
+    let target_res = match opts.resolution.as_deref() {
+        Some("480p") => "854:480",
+        Some("720p") => "1280:720",
+        Some("1440p") => "2560:1440",
+        Some("4k") => "3840:2160",
+        _ => "1920:1080",
+    };
+
+    let mut filter_parts: Vec<String> = Vec::new();
+    let mut concat_inputs = String::new();
+    for i in 0..n {
+        let clip = &timeline[i];
+        let has_trim = clip.trim_in > 0.0 || (clip.trim_out > 0.0 && clip.trim_out < 9000.0);
+        if has_trim {
+            let trim_start = clip.trim_in;
+            let trim_end = if clip.trim_out > 0.0 && clip.trim_out < 9000.0 { clip.trim_out } else { 99999.0 };
+            filter_parts.push(format!(
+                "[{i}:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS,scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]",
+                trim_start, trim_end
+            ));
+        } else {
+            filter_parts.push(format!(
+                "[{i}:v]scale={target_res}:force_original_aspect_ratio=decrease,pad={target_res}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            ));
+        }
+        concat_inputs.push_str(&format!("[v{i}]"));
+    }
+
+    let filter_complex = format!(
+        "{};{}concat=n={}:v=1:a=0[vout]",
+        filter_parts.join(";"),
+        concat_inputs,
+        n
+    );
+
+    args.push("-filter_complex".to_string());
+    args.push(filter_complex);
+    args.push("-map".to_string());
+    args.push("[vout]".to_string());
+    args.push("-r".to_string());
+    args.push(format!("{}", opts.fps.unwrap_or(60)));
+    args.push("-c:v".to_string());
+    args.push("libx264".to_string());
+    args.push("-preset".to_string());
+    args.push("medium".to_string());
+    args.push("-crf".to_string());
+    args.push("18".to_string());
+    args.push("-an".to_string());
+    args.push(output.to_string());
+
+    let mut child = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|e| format!("Failed to run FFmpeg (video-only): {}", e))?;
+
+    if let Some(stderr) = child.stderr.take() {
+        let reader = std::io::BufReader::new(stderr);
+        let mut last_pct: u32 = 0;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if let Some(time_pos) = line.find("time=") {
+                let time_str = &line[time_pos + 5..];
+                if let Some(end) = time_str.find(|c: char| c == ' ' || c == '\r') {
+                    if let Some(secs) = parse_ffmpeg_time(&time_str[..end]) {
+                        let pct = ((secs / total_duration) * 100.0).min(99.0) as u32;
+                        if pct != last_pct { last_pct = pct; let _ = app.emit("export:progress", pct); }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("FFmpeg merge error: {}", e))?;
+    if !status.success() {
+        return Err("Merge failed (video-only fallback)".to_string());
+    }
+    Ok(())
 }
 
 /// Run FFmpeg with piped stderr for real-time progress, with proper error handling.
