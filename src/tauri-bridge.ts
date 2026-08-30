@@ -264,11 +264,42 @@ export async function uploadClip(opts: UploadClipOpts): Promise<UploadClipRespon
 	}
 
 	// Use native Rust upload — avoids reading 100MB+ files into WebView memory
-	// which caused WebView2 crashes under GPU pressure.
-	await invoke<string>("native_upload_clip", { filePath: opts.filePath });
+	// which caused WebView2 crashes under GPU pressure. The Rust side streams the
+	// file and emits real "upload:progress" events (see onUploadProgress). We pass
+	// the real clip duration when known; Rust falls back to 30s when it's undefined.
+	await invoke<string>("native_upload_clip", {
+		filePath: opts.filePath,
+		durationSeconds: opts.durationSeconds,
+	});
 
 	// Return minimal response (the actual stream info isn't needed for the queue)
 	return { streamUid: undefined, shareUrl: undefined } as any;
+}
+
+/**
+ * Real upload progress emitted by the Rust backend during the file transfer.
+ * `id` is the clip's file path (matches UploadJob.path). Percent is 0–100.
+ */
+export function onUploadProgress(
+	cb: (p: { id: string; sent: number; total: number; percent: number }) => void,
+): Promise<UnlistenFn> {
+	return listen<{ id: string; sent: number; total: number; percent: number }>(
+		"upload:progress",
+		(event) => cb(event.payload),
+	);
+}
+
+/**
+ * Emitted by the Rust backend when a transient upload failure is being retried
+ * with exponential backoff. Informational only — the retry happens in Rust.
+ */
+export function onUploadRetry(
+	cb: (p: { id: string; attempt: number; maxAttempts: number; message: string }) => void,
+): Promise<UnlistenFn> {
+	return listen<{ id: string; attempt: number; maxAttempts: number; message: string }>(
+		"upload:retry",
+		(event) => cb(event.payload),
+	);
 }
 
 export async function notifyUploadStatus(body: UploadStatusBody): Promise<void> {
@@ -365,6 +396,8 @@ const bridge = {
 	copyToDownloads,
 	getCloudConfig,
 	uploadClip,
+	onUploadProgress,
+	onUploadRetry,
 	notifyUploadStatus,
 	inspectMp4,
 	getMp4Keyframes,

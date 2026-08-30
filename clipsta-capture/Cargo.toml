@@ -1,6 +1,6 @@
 [package]
 name = "clipsta-capture"
-version = "3.0.0"
+version = "2.3.2"
 description = "Clipsta capture engine — WGC + WASAPI + Hardware Encode + Replay Buffer (Standalone tray app)"
 authors = ["Clipsta"]
 edition = "2021"

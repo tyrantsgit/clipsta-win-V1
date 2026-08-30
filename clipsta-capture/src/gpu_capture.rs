@@ -1287,21 +1287,46 @@ impl MmapVideoRing {
         let len = data.len() as u32;
         if len == 0 { return; }
 
-        // Check if we need to wrap around
+        // A single frame larger than the whole ring can never be stored coherently.
+        // Dropping it is preferable to corrupting the buffer (this should never happen
+        // in practice — 1.5 GB capacity vs. worst-case single I-frame of a few MB).
+        if len as u64 > self.capacity {
+            eprintln!(
+                "[gpu_capture] Dropping frame larger than ring capacity ({} B > {} B)",
+                len, self.capacity
+            );
+            return;
+        }
+
+        // Check if we need to wrap around. If the frame won't fit in the remaining
+        // tail space, restart at the beginning of the file.
         let end_pos = self.write_cursor + len as u64;
         if end_pos > self.capacity {
-            // Wrap: write at the beginning
+            // Wrap: write at the beginning.
             self.write_cursor = 0;
         }
 
+        let start = self.write_cursor;
+        let end = start + len as u64;
+
+        // CRITICAL (corruption fix): evict metadata for any frame whose byte region
+        // overlaps the region we are about to overwrite. Frames are written
+        // contiguously in order, so overwritten frames are always the oldest ones
+        // at the front of the deque. Previously `prune()` only dropped frames by
+        // *duration*, so after a wrap the write cursor could overwrite the bytes of
+        // frames that were still referenced in metadata — `read_frame` then returned
+        // garbage and produced corrupted saved clips. We now drop those metadata
+        // entries here so the ring never hands out a slice into overwritten bytes.
+        self.evict_overlapping(start, end);
+
         // Write frame data to mmap
-        let start = self.write_cursor as usize;
-        let end = start + len as usize;
-        self.mmap[start..end].copy_from_slice(data);
+        let start_us = start as usize;
+        let end_us = end as usize;
+        self.mmap[start_us..end_us].copy_from_slice(data);
 
         // Record metadata
         let entry = FrameEntry {
-            offset: self.write_cursor,
+            offset: start,
             len,
             pts_100ns,
             duration_100ns,
@@ -1313,10 +1338,43 @@ impl MmapVideoRing {
         }
         self.frames.push_back(entry);
         self.frames_pushed += 1;
-        self.write_cursor += len as u64;
+        self.write_cursor = end;
 
         // Prune old frames that exceed max duration
         self.prune();
+    }
+
+    /// Drop metadata for front frames whose byte range [offset, offset+len)
+    /// intersects the write region [start, end). This keeps the metadata index
+    /// consistent with the physical bytes after a wrap-around, preventing reads
+    /// of overwritten data. Because frames are laid down in write order, any frame
+    /// physically colliding with the new write is at the front of the deque.
+    fn evict_overlapping(&mut self, start: u64, end: u64) {
+        while let Some(front) = self.frames.front() {
+            let f_start = front.offset;
+            let f_end = front.offset + front.len as u64;
+            // Overlap test for half-open intervals [start,end) vs [f_start,f_end).
+            let overlaps = f_start < end && start < f_end;
+            if overlaps {
+                self.frames.pop_front();
+                self.sync_keyframe_indices_after_pop();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// After popping the front frame, drop any keyframe indices that now point
+    /// at or before the new base offset (i.e. frames no longer in the deque).
+    fn sync_keyframe_indices_after_pop(&mut self) {
+        let base = self.frames_pushed - self.frames.len();
+        while let Some(&ki) = self.keyframe_indices.front() {
+            if ki < base {
+                self.keyframe_indices.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Remove frames that exceed the maximum buffer duration.
@@ -1326,15 +1384,7 @@ impl MmapVideoRing {
             let oldest_pts = self.frames.front().map(|f| f.pts_100ns).unwrap_or(0);
             if newest_pts - oldest_pts > self.max_duration_100ns {
                 self.frames.pop_front();
-                // Update keyframe indices
-                let base = self.frames_pushed - self.frames.len() - 1;
-                while let Some(&ki) = self.keyframe_indices.front() {
-                    if ki <= base {
-                        self.keyframe_indices.pop_front();
-                    } else {
-                        break;
-                    }
-                }
+                self.sync_keyframe_indices_after_pop();
             } else {
                 break;
             }
@@ -2161,6 +2211,8 @@ pub struct CaptureSession {
     audio_file: Arc<Mutex<Option<String>>>,
     pub(crate) ring: Arc<Mutex<EncodedMediaRing>>,
     pub(crate) audio_buffer: Arc<Mutex<AudioRingBuffer>>,
+    /// Separate mic-only audio buffer, populated only when multi_track_audio is on.
+    pub(crate) mic_audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     pub(crate) session_fps: Arc<AtomicU32>,
     pub(crate) session_width: Arc<AtomicU32>,
     pub(crate) session_height: Arc<AtomicU32>,
@@ -2188,6 +2240,7 @@ impl Default for CaptureSession {
             audio_file: Arc::new(Mutex::new(None)),
             ring: Arc::new(Mutex::new(EncodedMediaRing::new(MAX_RING_SECONDS))),
             audio_buffer: Arc::new(Mutex::new(AudioRingBuffer::new(MAX_RING_SECONDS))),
+            mic_audio_buffer: Arc::new(Mutex::new(AudioRingBuffer::new(MAX_RING_SECONDS))),
             session_fps: Arc::new(AtomicU32::new(60)),
             session_width: Arc::new(AtomicU32::new(OUTPUT_WIDTH)),
             session_height: Arc::new(AtomicU32::new(OUTPUT_HEIGHT)),
@@ -2306,11 +2359,13 @@ impl CaptureSession {
         // Reset ring buffer
         *self.ring.lock() = EncodedMediaRing::new_with_bitrate(opts.buffer_duration.min(MAX_RING_SECONDS), opts.bitrate_kbps);
         *self.audio_buffer.lock() = AudioRingBuffer::new(opts.buffer_duration.min(MAX_RING_SECONDS));
+        *self.mic_audio_buffer.lock() = AudioRingBuffer::new(opts.buffer_duration.min(MAX_RING_SECONDS));
 
         let stop = self.stop_flag.clone();
         let is_recording = self.is_recording.clone();
         let ring = self.ring.clone();
         let audio_buffer = self.audio_buffer.clone();
+        let mic_audio_buffer = self.mic_audio_buffer.clone();
         let frame_drops = self.frame_drops.clone();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<CaptureReadyInfo>>();
@@ -2319,7 +2374,7 @@ impl CaptureSession {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            let result = run_gpu_capture(opts, stop.clone(), ring, audio_buffer, ready_tx.clone(), frame_drops);
+            let result = run_gpu_capture(opts, stop.clone(), ring, audio_buffer, mic_audio_buffer, ready_tx.clone(), frame_drops);
             let error_msg = match &result {
                 Ok(()) => None,
                 Err(e) => {
@@ -2417,7 +2472,10 @@ impl CaptureSession {
         // Snapshot the ring with minimal lock hold time.
         // Split into two brief lock acquisitions so the encoder thread can push_video
         // between them — prevents the ~100-300ms stall that caused game hitches on save.
-        let multi_track = false; // Multi-track disabled (was causing Discord interference)
+        // Read the real multi-track setting for this session. When on, we slice the
+        // separate mic buffer and write it as a second MP4 audio track. Default off
+        // keeps the single mixed track (mic mixed into desktop audio).
+        let multi_track = self.multi_track_audio.load(Ordering::Relaxed);
         let (video_frames, audio_chunks, mic_audio_chunks) = {
             // Phase 1: grab video frames (brief lock — Arc clones are cheap refcount bumps)
             let (video, start_pts, end_pts) = {
@@ -2441,7 +2499,13 @@ impl CaptureSession {
                 abuf.slice(start_pts, end_pts)
             };
 
-            let mic_audio: Vec<AudioChunk> = Vec::new();
+            // Phase 3: grab mic-only audio (multi-track mode only) from the separate buffer.
+            let mic_audio: Vec<AudioChunk> = if multi_track {
+                let mbuf = self.mic_audio_buffer.lock();
+                mbuf.slice(start_pts, end_pts)
+            } else {
+                Vec::new()
+            };
 
             (video, audio, mic_audio)
         };
@@ -2663,6 +2727,7 @@ fn run_gpu_capture(
     stop: Arc<AtomicBool>,
     ring: Arc<Mutex<EncodedMediaRing>>,
     audio_buffer: Arc<Mutex<AudioRingBuffer>>,
+    mic_audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     ready_tx: std::sync::mpsc::Sender<Result<CaptureReadyInfo>>,
     frame_drops: Arc<AtomicU32>,
 ) -> Result<()> {
@@ -2966,13 +3031,16 @@ fn run_gpu_capture(
     let session_start: Arc<std::sync::OnceLock<std::time::Instant>> = Arc::new(std::sync::OnceLock::new());
     let audio_thread = if !opts.no_audio {
         let audio_buf = audio_buffer.clone();
+        let mic_buf = mic_audio_buffer.clone();
         let s = stop.clone();
         let ss = session_start.clone();
         let mic = opts.mic_device.clone();
         let lb = opts.loopback_device.clone();
-        let multi_track = false;
+        // Multi-track only when the user opted in AND a mic is configured.
+        // Default (false) keeps the proven single mixed track (mic mixed into desktop).
+        let multi_track = opts.multi_track_audio && opts.mic_device.is_some();
         Some(thread::spawn(move || {
-            gpu_audio_loop(s, mic, lb, audio_buf, ss, multi_track);
+            gpu_audio_loop(s, mic, lb, audio_buf, mic_buf, ss, multi_track);
         }))
     } else {
         None
@@ -3389,14 +3457,18 @@ unsafe fn feed_aac_encoder(
 }
 
 /// Audio capture loop: captures 48kHz stereo PCM and pushes to the ring buffer.
-/// Also encodes AAC in real-time for fast save (falls back to PCM-only if AAC encoder init fails).
+///
+/// Single-track mode (default): desktop + mic are mixed into one track (`audio_buffer`).
+/// Multi-track mode: desktop-only goes to `audio_buffer`, mic-only goes to
+/// `mic_audio_buffer`, and the mux writes them as two separate MP4 audio tracks.
 fn gpu_audio_loop(
     stop: Arc<AtomicBool>,
     mic_device: Option<String>,
     loopback: Option<String>,
     audio_buffer: Arc<Mutex<AudioRingBuffer>>,
+    mic_audio_buffer: Arc<Mutex<AudioRingBuffer>>,
     session_start: Arc<std::sync::OnceLock<std::time::Instant>>,
-    _multi_track_audio: bool,
+    multi_track_audio: bool,
 ) {
     unsafe {
         use windows::Win32::System::Threading::*;
@@ -3410,14 +3482,11 @@ fn gpu_audio_loop(
         if session_start.get().is_some() { break; }
         thread::sleep(std::time::Duration::from_millis(1));
     }
-    eprintln!("[gpu_audio] Lock-free audio: callback → channel → buffer (Medal approach)");
+    eprintln!("[gpu_audio] Lock-free audio (multi_track={})", multi_track_audio);
 
-    let audio_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter_clone = audio_sample_counter.clone();
-
-    // Lock-free channel: callback sends raw samples, this thread receives and pushes to buffer.
-    // The callback NEVER locks any mutex — it only does try_send which is non-blocking.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, i64, i64)>(200);
+    // Channel item: (samples, pts_100ns, duration_100ns, is_mic_track).
+    // is_mic_track routes to the separate mic buffer in multi-track mode.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, i64, i64, bool)>(400);
 
     let stop_clone = stop.clone();
     let session_start_clone = session_start.clone();
@@ -3428,50 +3497,75 @@ fn gpu_audio_loop(
             use windows::Win32::System::Threading::*;
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         }
-        let res = WasapiCapture::capture_to_callback(stop_clone, mic_device, loopback, move |chunk: &[f32]| {
-            let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
-            let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
-
-            // Clipsta Lite approach: wall-clock PTS from session_start.
-            // This ensures audio PTS matches video PTS (both use elapsed time),
-            // preventing A/V drift regardless of USB audio scheduling jitter.
-            let pts_100ns = match session_start_clone.get() {
+        let pts_now = {
+            let ss = session_start_clone.clone();
+            move || match ss.get() {
                 Some(start) => start.elapsed().as_nanos() as i64 / 100,
                 None => 0,
-            };
+            }
+        };
 
-            // ZERO BLOCKING: try_send returns immediately.
-            // If channel is full (consumer is slow), drop this chunk — better than blocking.
-            let _ = tx.try_send((chunk.to_vec(), pts_100ns, duration_100ns));
-        });
-        if let Err(e) = res {
-            eprintln!("[gpu_audio] WASAPI error: {e}");
+        if multi_track_audio {
+            // Multi-track: desktop-only to the main track, mic-only to the mic track.
+            let tx_main = tx.clone();
+            let pts_main = pts_now.clone();
+            let tx_mic = tx.clone();
+            let pts_mic = pts_now.clone();
+            let res = WasapiCapture::capture_to_callback_multi(
+                stop_clone,
+                mic_device,
+                loopback,
+                move |chunk: &[f32]| {
+                    let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
+                    let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
+                    let _ = tx_main.try_send((chunk.to_vec(), pts_main(), duration_100ns, false));
+                },
+                Some(move |chunk: &[f32]| {
+                    let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
+                    let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
+                    let _ = tx_mic.try_send((chunk.to_vec(), pts_mic(), duration_100ns, true));
+                }),
+            );
+            if let Err(e) = res {
+                eprintln!("[gpu_audio] WASAPI (multi-track) error: {e}");
+            }
+        } else {
+            // Single-track: desktop + mic mixed into one stream (proven default).
+            let res = WasapiCapture::capture_to_callback(stop_clone, mic_device, loopback, move |chunk: &[f32]| {
+                let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
+                let duration_100ns = (n_frames as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;
+                let _ = tx.try_send((chunk.to_vec(), pts_now(), duration_100ns, false));
+            });
+            if let Err(e) = res {
+                eprintln!("[gpu_audio] WASAPI error: {e}");
+            }
         }
     });
 
-    // Consumer loop: pull audio from channel and push to ring buffer.
-    // This thread can safely lock the AudioRingBuffer because it's NOT
-    // the WASAPI callback thread — USB audio scheduling is not affected.
+    // Consumer loop: pull audio from channel and push to the appropriate ring buffer.
+    // This thread can safely lock the buffers because it's NOT the WASAPI callback thread.
+    let push_chunk = |buf: &Arc<Mutex<AudioRingBuffer>>, samples: &[f32], pts: i64, dur: i64| {
+        let mut abuf = buf.lock();
+        let mut b = abuf.acquire_buffer(samples.len());
+        b.extend_from_slice(samples);
+        abuf.push(AudioChunk { data: Arc::new(b), pts_100ns: pts, duration_100ns: dur });
+    };
+
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(std::time::Duration::from_millis(20)) {
-            Ok((samples, pts, dur)) => {
-                let mut abuf = audio_buffer.lock();
-                let mut buf = abuf.acquire_buffer(samples.len());
-                buf.extend_from_slice(&samples);
-                abuf.push(AudioChunk {
-                    data: Arc::new(buf),
-                    pts_100ns: pts,
-                    duration_100ns: dur,
-                });
+            Ok((samples, pts, dur, is_mic)) => {
+                if is_mic {
+                    push_chunk(&mic_audio_buffer, &samples, pts, dur);
+                } else {
+                    push_chunk(&audio_buffer, &samples, pts, dur);
+                }
                 // Drain any additional pending chunks
-                while let Ok((samples, pts, dur)) = rx.try_recv() {
-                    let mut buf = abuf.acquire_buffer(samples.len());
-                    buf.extend_from_slice(&samples);
-                    abuf.push(AudioChunk {
-                        data: Arc::new(buf),
-                        pts_100ns: pts,
-                        duration_100ns: dur,
-                    });
+                while let Ok((samples, pts, dur, is_mic)) = rx.try_recv() {
+                    if is_mic {
+                        push_chunk(&mic_audio_buffer, &samples, pts, dur);
+                    } else {
+                        push_chunk(&audio_buffer, &samples, pts, dur);
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,

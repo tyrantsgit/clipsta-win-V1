@@ -106,22 +106,49 @@ impl WasapiCapture {
                     .context("GetDefaultAudioEndpoint")?
             };
 
-            let lb_client: IAudioClient = render_device
-                .Activate(CLSCTX_ALL, None)
-                .context("Activate loopback")?;
-            let lb_fmt = lb_client.GetMixFormat().context("GetMixFormat")? as *const WAVEFORMATEX;
-            lb_client
-                .Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    2_000_000,
-                    0,
-                    lb_fmt,
-                    None,
-                )
-                .context("Initialize loopback")?;
-            let lb_capture: IAudioCaptureClient =
-                lb_client.GetService().context("GetService loopback")?;
+            let lb_client: IAudioClient = match render_device.Activate(CLSCTX_ALL, None) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[audio] Desktop-audio (loopback) Activate failed: {e}. \
+                               Falling back to mic-only/silent capture (recording continues).");
+                    return Self::capture_mic_only_or_silent(
+                        stop, &enumerator, mic_device, callback, mic_callback,
+                    );
+                }
+            };
+            let lb_fmt = match lb_client.GetMixFormat() {
+                Ok(f) => f as *const WAVEFORMATEX,
+                Err(e) => {
+                    eprintln!("[audio] Desktop-audio GetMixFormat failed: {e}. Falling back to mic-only/silent.");
+                    return Self::capture_mic_only_or_silent(
+                        stop, &enumerator, mic_device, callback, mic_callback,
+                    );
+                }
+            };
+            if let Err(e) = lb_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                2_000_000,
+                0,
+                lb_fmt,
+                None,
+            ) {
+                eprintln!("[audio] Desktop-audio Initialize failed: {e}. Falling back to mic-only/silent.");
+                CoTaskMemFree(Some(lb_fmt as *const _));
+                return Self::capture_mic_only_or_silent(
+                    stop, &enumerator, mic_device, callback, mic_callback,
+                );
+            }
+            let lb_capture: IAudioCaptureClient = match lb_client.GetService() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[audio] Desktop-audio GetService failed: {e}. Falling back to mic-only/silent.");
+                    CoTaskMemFree(Some(lb_fmt as *const _));
+                    return Self::capture_mic_only_or_silent(
+                        stop, &enumerator, mic_device, callback, mic_callback,
+                    );
+                }
+            };
 
             let fmt = parse_format(lb_fmt);
             // Free CoTaskMem-allocated WAVEFORMATEX (GetMixFormat allocates via CoTaskMemAlloc)
@@ -150,10 +177,20 @@ impl WasapiCapture {
                 };
 
             let lb_event = CreateEventW(None, false, false, None).context("CreateEventW")?;
-            lb_client
-                .SetEventHandle(lb_event)
-                .context("SetEventHandle")?;
-            lb_client.Start().context("Loopback Start")?;
+            if let Err(e) = lb_client.SetEventHandle(lb_event) {
+                eprintln!("[audio] Desktop-audio SetEventHandle failed: {e}. Falling back to mic-only/silent.");
+                let _ = CloseHandle(lb_event);
+                return Self::capture_mic_only_or_silent(
+                    stop, &enumerator, mic_device, callback, mic_callback,
+                );
+            }
+            if let Err(e) = lb_client.Start() {
+                eprintln!("[audio] Desktop-audio Start failed: {e}. Falling back to mic-only/silent.");
+                let _ = CloseHandle(lb_event);
+                return Self::capture_mic_only_or_silent(
+                    stop, &enumerator, mic_device, callback, mic_callback,
+                );
+            }
 
             let mic_event = mic_client.as_ref().and_then(|mc| {
                 let e = CreateEventW(None, false, false, None).ok()?;
@@ -170,6 +207,8 @@ impl WasapiCapture {
             // Reused every iteration — only grows, never shrinks (max ~960 stereo samples per packet).
             let mut conv_buf: Vec<f32> = Vec::with_capacity(2048);
             let mut mic_conv_buf: Vec<f32> = Vec::with_capacity(2048);
+            // Scratch buffer for mic samples resampled to the desktop/output rate.
+            let mut mic_resampled: Vec<f32> = Vec::with_capacity(2048);
             // Mic accumulator ring: stores all mic samples until desktop audio needs them.
             // This prevents sample loss when mic and desktop deliver at different rates.
             // Clipsta Lite approach: continuously fill, pull exactly what's needed during mix.
@@ -263,12 +302,20 @@ impl WasapiCapture {
                                                 mic_f.is_float,
                                                 &mut mic_conv_buf,
                                             );
+                                            // Resample mic → desktop rate so samples stay aligned
+                                            // (fixes drift when mic rate != desktop rate).
+                                            resample_stereo_linear(
+                                                &mic_conv_buf,
+                                                mic_f.sample_rate,
+                                                fmt.sample_rate,
+                                                &mut mic_resampled,
+                                            );
                                             if let Some(ref mic_cb) = mic_callback {
                                                 // Multi-track: deliver mic separately
-                                                mic_cb(&mic_conv_buf);
+                                                mic_cb(&mic_resampled);
                                             } else {
                                                 // Single-track: accumulate for mixing below
-                                                mic_ring.extend_from_slice(&mic_conv_buf);
+                                                mic_ring.extend_from_slice(&mic_resampled);
                                             }
                                         }
                                     }
@@ -333,10 +380,11 @@ impl WasapiCapture {
                                         let mraw = std::slice::from_raw_parts(mp_raw, mf as usize * mic_bpf);
                                         mic_conv_buf.clear();
                                         to_f32_stereo_into(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float, &mut mic_conv_buf);
+                                        resample_stereo_linear(&mic_conv_buf, mic_f.sample_rate, fmt.sample_rate, &mut mic_resampled);
                                         if let Some(ref mic_cb) = mic_callback {
-                                            mic_cb(&mic_conv_buf);
+                                            mic_cb(&mic_resampled);
                                         } else {
-                                            mic_ring.extend_from_slice(&mic_conv_buf);
+                                            mic_ring.extend_from_slice(&mic_resampled);
                                         }
                                     }
                                 }
@@ -536,9 +584,165 @@ impl WasapiCapture {
         let cap: IAudioCaptureClient = c.GetService().context("Mic GetService")?;
         Ok((c, cap, fmt))
     }
+
+    /// Fallback capture path used when desktop-audio (loopback) initialization fails.
+    /// Recording must continue, so we still deliver a constant-rate 48 kHz stereo stream
+    /// to the callback: mixing in mic audio if a mic is available, otherwise pure silence.
+    /// This prevents a desktop-audio failure (exclusive-mode conflict, disabled endpoint,
+    /// format mismatch) from aborting the whole recording.
+    unsafe fn capture_mic_only_or_silent<F, M>(
+        stop: Arc<AtomicBool>,
+        enumerator: &IMMDeviceEnumerator,
+        mic_device: Option<String>,
+        callback: F,
+        mic_callback: Option<M>,
+    ) -> Result<()>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+        M: Fn(&[f32]) + Send + 'static,
+    {
+        const OUT_RATE: u32 = 48_000;
+
+        // Try to bring up the mic (best-effort). On failure we emit silence only.
+        let (mic_client, mic_capture, mic_fmt, mic_bpf) = match mic_device {
+            Some(ref id) if !id.is_empty() => match Self::init_mic(enumerator, id) {
+                Ok((c, cap, ptr)) => {
+                    let mfmt = parse_format(ptr);
+                    CoTaskMemFree(Some(ptr as *const _));
+                    (Some(c), Some(cap), Some(mfmt), mfmt.channels * (mfmt.bps / 8))
+                }
+                Err(e) => {
+                    eprintln!("[audio] Mic init also failed in fallback: {e}. Emitting silence.");
+                    (None, None, None, 0)
+                }
+            },
+            _ => (None, None, None, 0),
+        };
+
+        let mic_event = mic_client.as_ref().and_then(|mc| {
+            let e = CreateEventW(None, false, false, None).ok()?;
+            mc.SetEventHandle(e).ok()?;
+            mc.Start().ok()?;
+            Some(e)
+        });
+
+        eprintln!(
+            "[audio] Running fallback audio path ({}).",
+            if mic_capture.is_some() { "mic-only" } else { "silent" }
+        );
+
+        let mut out_buf: Vec<f32> = Vec::with_capacity(4096);
+        let mut mic_conv_buf: Vec<f32> = Vec::with_capacity(2048);
+        let mut resampled: Vec<f32> = Vec::with_capacity(2048);
+        let mut total_frames_written: u64 = 0;
+        let loop_start = std::time::Instant::now();
+
+        while !stop.load(Ordering::SeqCst) {
+            // Drain mic if present.
+            if let (Some(ref mc_cap), Some(mic_f)) = (&mic_capture, mic_fmt) {
+                let mic_bps_val = mic_f.bps / 8;
+                loop {
+                    let Ok(mp) = mc_cap.GetNextPacketSize() else { break; };
+                    if mp == 0 { break; }
+                    let mut mp_raw = std::ptr::null_mut();
+                    let mut mf = 0u32;
+                    let mut mflags = 0u32;
+                    if mc_cap.GetBuffer(&mut mp_raw, &mut mf, &mut mflags, None, None).is_err() { break; }
+                    if mf > 0 && !mp_raw.is_null() {
+                        let msilent = (mflags & 0x2) != 0;
+                        mic_conv_buf.clear();
+                        if msilent {
+                            mic_conv_buf.resize(mf as usize * 2, 0f32);
+                        } else {
+                            let mraw = std::slice::from_raw_parts(mp_raw, mf as usize * mic_bpf);
+                            to_f32_stereo_into(mraw, mf as usize, mic_f.channels, mic_bps_val, mic_f.is_float, &mut mic_conv_buf);
+                        }
+                        // Resample mic to the 48 kHz output rate so it stays in sync.
+                        resample_stereo_linear(&mic_conv_buf, mic_f.sample_rate, OUT_RATE, &mut resampled);
+                        if let Some(ref mic_cb) = mic_callback {
+                            mic_cb(&resampled);
+                        } else {
+                            // Apply mic gain so levels match the normal mixed path.
+                            out_buf.clear();
+                            out_buf.extend(resampled.iter().map(|s| soft_clip(s * 0.7071)));
+                            callback(&out_buf);
+                        }
+                        total_frames_written += (resampled.len() / 2) as u64;
+                    }
+                    let _ = mc_cap.ReleaseBuffer(mf);
+                }
+            }
+
+            // Pace with wall clock and emit silence to keep the stream advancing at OUT_RATE.
+            let elapsed_ms = loop_start.elapsed().as_millis() as u64;
+            let expected = elapsed_ms * OUT_RATE as u64 / 1000;
+            if expected > total_frames_written {
+                let deficit = ((expected - total_frames_written) as usize).min(OUT_RATE as usize);
+                if deficit > 0 {
+                    out_buf.clear();
+                    out_buf.resize(deficit * 2, 0f32);
+                    callback(&out_buf);
+                    total_frames_written += deficit as u64;
+                }
+            }
+
+            // Wait either on the mic event or a fixed 10 ms tick.
+            match mic_event {
+                Some(ev) => { WaitForSingleObject(ev, 10); }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+
+        if let (Some(ref mc), Some(me)) = (&mic_client, mic_event) {
+            let _ = mc.Stop();
+            let _ = CloseHandle(me);
+        }
+        Ok(())
+    }
 }
 
 // ── PCM conversion helpers ────────────────────────────────────────────────────
+// (resampler + converters below)
+
+/// Resample interleaved f32 stereo from `in_rate` to `out_rate` using linear
+/// interpolation, writing into `out`. When the rates are equal this is a fast
+/// copy. Linear interpolation is cheap and good enough for voice mics; it fixes
+/// the drift/desync that occurred when a non-48 kHz mic was mixed 1:1 by index
+/// against 48 kHz desktop audio.
+fn resample_stereo_linear(input: &[f32], in_rate: u32, out_rate: u32, out: &mut Vec<f32>) {
+    out.clear();
+    if input.is_empty() {
+        return;
+    }
+    let in_frames = input.len() / 2;
+    if in_frames == 0 {
+        return;
+    }
+    if in_rate == out_rate || in_rate == 0 {
+        out.extend_from_slice(input);
+        return;
+    }
+    // Number of output frames for this block.
+    let out_frames = ((in_frames as u64) * out_rate as u64 / in_rate as u64).max(1) as usize;
+    out.reserve(out_frames * 2);
+    let ratio = in_rate as f64 / out_rate as f64;
+    for i in 0..out_frames {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let (l0, r0) = (
+            input[idx * 2],
+            input[idx * 2 + 1],
+        );
+        let (l1, r1) = if idx + 1 < in_frames {
+            (input[(idx + 1) * 2], input[(idx + 1) * 2 + 1])
+        } else {
+            (l0, r0)
+        };
+        out.push(l0 + (l1 - l0) * frac);
+        out.push(r0 + (r1 - r0) * frac);
+    }
+}
 
 fn to_f32_stereo(data: &[u8], frames: usize, ch: usize, bps: usize, float: bool) -> Vec<f32> {
     let mut out = Vec::with_capacity(frames * 2);

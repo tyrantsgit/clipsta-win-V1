@@ -12,6 +12,41 @@ interface CloudState {
 	queue: UploadJob[];
 }
 
+/**
+ * Structured classification of an upload error message into permanent vs retryable.
+ *
+ * Replaces the old `msg.includes("HTTP 4")` heuristic. The Rust backend formats
+ * failures as e.g. "Upload: HTTP 403" / "Cloud API error: HTTP 500", and already
+ * retries transient cases (network, 5xx, 429) before surfacing anything here.
+ *
+ * Permanent (do NOT retry in the frontend):
+ *   - local/terminal conditions: "too large", "Not paired", "No uploadUrl", "Parse error", "empty"
+ *   - HTTP 4xx client errors EXCEPT 429 (rate limit is transient)
+ * Everything else is treated as retryable (last-resort frontend safety net).
+ */
+function isPermanentUploadError(msg: string): boolean {
+	const terminal = [
+		"too large",
+		"Not paired",
+		"No uploadUrl",
+		"Parse error",
+		"empty or doesn't exist",
+	];
+	if (terminal.some((t) => msg.includes(t))) return true;
+
+	// Extract an HTTP status code if present, e.g. "HTTP 403".
+	const m = msg.match(/HTTP\s+(\d{3})/);
+	if (m) {
+		const code = Number(m[1]);
+		if (code === 429) return false; // rate-limited → transient
+		if (code >= 400 && code < 500) return true; // other client errors → permanent
+		// 5xx (and anything else) → transient
+		return false;
+	}
+	// No status code (network error, unknown) → treat as transient/retryable.
+	return false;
+}
+
 export function useCloudUpload(settings: AppSettings | null) {
 	const [state, setState] = useState<CloudState>({
 		paired: false,
@@ -128,11 +163,17 @@ export function useCloudUpload(settings: AppSettings | null) {
 				updateJobRef.current(job.id, { status: "uploading", progress: 0 });
 
 				try {
-					const uploadPromise = bridge.uploadClip({
+					// Real progress arrives via the "upload:progress" Tauri event
+					// (wired in the effect below), keyed by the clip's file path.
+					// The Rust backend also does its own bounded retry with backoff
+					// for transient failures and streams the file (no 120s abort),
+					// so we no longer race against a frontend timeout that couldn't
+					// cancel the backend anyway.
+					const result = await bridge.uploadClip({
 						desktopDeviceId: getDeviceIdRef.current(),
 						filePath: job.path,
 						fileName: job.name,
-						durationSeconds: 30,
+						durationSeconds: job.durationSeconds,
 						bytes: job.size,
 						capturedAt: new Date().toISOString(),
 						encoder: settingsRef.current?.encoder,
@@ -140,16 +181,6 @@ export function useCloudUpload(settings: AppSettings | null) {
 						trimEnd: job.trimEnd,
 						cuts: job.cuts,
 					});
-
-					const timeoutPromise = new Promise<never>((_, reject) => {
-						setTimeout(() => reject(new Error("Upload timed out (120s)")), 120000);
-					});
-
-					const result = await Promise.race([uploadPromise, timeoutPromise]);
-
-					if (!result) {
-						throw new Error("Upload returned empty result");
-					}
 
 					updateJobRef.current(job.id, {
 						status: "done",
@@ -161,12 +192,17 @@ export function useCloudUpload(settings: AppSettings | null) {
 					const msg = e?.message ?? String(e ?? "Unknown upload error");
 					const retryCount = (job.retryCount ?? 0) + 1;
 
-					// Don't retry on permanent errors
-					const permanent = msg.includes("too large") || msg.includes("Not paired") || msg.includes("HTTP 4");
+					// Structured permanent-error detection (replaces the fragile
+					// `msg.includes("HTTP 4")` check). The backend already exhausted
+					// its own transient retries before surfacing an error here, so a
+					// frontend retry is a last-resort safety net. Treat client errors
+					// (4xx except 429) and known-terminal conditions as permanent.
+					const permanent = isPermanentUploadError(msg);
 					if (!permanent && retryCount <= MAX_RETRIES) {
 						const delay = RETRY_DELAYS[retryCount - 1] ?? 16000;
 						updateJobRef.current(job.id, {
 							status: "queued",
+							progress: 0,
 							retryCount,
 							error: `Retry ${retryCount}/${MAX_RETRIES}: ${msg}`,
 						});
@@ -211,6 +247,48 @@ export function useCloudUpload(settings: AppSettings | null) {
 		}, 5000);
 		return () => clearInterval(interval);
 	}, [processQueue]);
+
+	// ── Real upload progress ──────────────────────────────────────────────
+	// The Rust backend streams the file and emits "upload:progress" events
+	// (keyed by the clip's file path) as bytes go out the socket, plus
+	// "upload:retry" on transient backoff retries. Match by path → job id.
+	useEffect(() => {
+		let unlistenProgress: (() => void) | undefined;
+		let unlistenRetry: (() => void) | undefined;
+		let cancelled = false;
+
+		bridge.onUploadProgress((p) => {
+			const job = queueRef.current.find((j) => j.path === p.id);
+			if (job && job.status === "uploading") {
+				const pct = Math.max(0, Math.min(100, Math.round(p.percent)));
+				updateJobRef.current(job.id, { progress: pct });
+				lastProgressRef.current = Date.now();
+			}
+		}).then((fn) => {
+			if (cancelled) fn();
+			else unlistenProgress = fn;
+		}).catch(() => {});
+
+		bridge.onUploadRetry((p) => {
+			const job = queueRef.current.find((j) => j.path === p.id);
+			if (job) {
+				updateJobRef.current(job.id, {
+					progress: 0,
+					error: `Retrying (${p.attempt}/${p.maxAttempts}): ${p.message}`,
+				});
+				lastProgressRef.current = Date.now();
+			}
+		}).then((fn) => {
+			if (cancelled) fn();
+			else unlistenRetry = fn;
+		}).catch(() => {});
+
+		return () => {
+			cancelled = true;
+			unlistenProgress?.();
+			unlistenRetry?.();
+		};
+	}, []);
 
 	const clearPairing = useCallback(() => {
 		setState((prev) => ({

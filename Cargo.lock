@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "clipsta-capture"
-version = "3.0.0"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "chrono",

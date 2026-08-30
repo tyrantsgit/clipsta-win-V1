@@ -577,16 +577,23 @@ pub async fn compress_for_upload(file_path: String) -> Result<Option<String>, St
 
 /// Upload a clip entirely in Rust (avoids WebView2 memory crash from 100MB+ fetch).
 /// The frontend calls this instead of reading the file + doing fetch() in JavaScript.
+///
+/// Emits `upload:progress` events (`{ id, sent, total, percent }`, keyed by
+/// `file_path`) as bytes stream out, and `upload:retry` on transient retries.
+/// `duration_seconds` is the real clip duration when the frontend knows it,
+/// falling back to the legacy 30s inside `do_rust_upload_ex`.
 #[tauri::command]
 pub async fn native_upload_clip(
+    app: AppHandle,
     store: State<'_, SettingsStore>,
     file_path: String,
+    duration_seconds: Option<u32>,
 ) -> Result<String, String> {
     let settings = store.get();
     let device_id = settings.desktop_device_id.clone();
 
     tokio::task::spawn_blocking(move || {
-        crate::do_rust_upload(&file_path, &device_id)
+        crate::do_rust_upload_ex(&file_path, &device_id, Some(&app), duration_seconds)
     })
     .await
     .map_err(|e| format!("Upload task failed: {}", e))?

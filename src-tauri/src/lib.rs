@@ -553,10 +553,91 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A `Read` wrapper that reports bytes-read progress via a callback.
+///
+/// Wrapping the file handle (instead of `std::fs::read` into a `Vec`) gives us
+/// two wins at once: (1) we don't pull 100 MB+ into RAM, and (2) reqwest pulls
+/// bytes through this reader as it writes the socket, so `on_progress` fires with
+/// the *actual* number of bytes handed to the transport — real upload progress.
+struct ProgressReader<R: std::io::Read, F: FnMut(u64)> {
+    inner: R,
+    read_so_far: u64,
+    on_progress: F,
+}
+
+impl<R: std::io::Read, F: FnMut(u64)> std::io::Read for ProgressReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.read_so_far += n as u64;
+            (self.on_progress)(self.read_so_far);
+        }
+        Ok(n)
+    }
+}
+
+/// Classified upload error so retry logic can be structured instead of string-matching.
+struct UploadError {
+    message: String,
+    /// True for network/timeout errors, HTTP 5xx and HTTP 429 — worth retrying.
+    /// False for other 4xx (auth/validation) and local errors — permanent.
+    transient: bool,
+}
+
+impl UploadError {
+    fn transient(msg: impl Into<String>) -> Self {
+        Self { message: msg.into(), transient: true }
+    }
+    fn permanent(msg: impl Into<String>) -> Self {
+        Self { message: msg.into(), transient: false }
+    }
+    /// Classify an HTTP status: 5xx and 429 are transient, other non-2xx are permanent.
+    fn from_status(prefix: &str, status: u16) -> Self {
+        let msg = format!("{}: HTTP {}", prefix, status);
+        if status >= 500 || status == 429 {
+            Self::transient(msg)
+        } else {
+            Self::permanent(msg)
+        }
+    }
+}
+
 /// Upload a clip directly from Rust (no WebView involvement).
-/// Uses blocking reqwest since this runs on a dedicated upload thread.
+///
+/// Back-compat entry point used by the hotkey auto-upload path (no progress UI).
+/// Delegates to `do_rust_upload_ex` with no AppHandle and the legacy 30s duration.
 fn do_rust_upload(file_path: &str, device_id: &str) -> Result<(), String> {
-    use crate::cloud_proxy::{CLOUD_API_BASE, CLOUD_API_KEY};
+    do_rust_upload_ex(file_path, device_id, None, None)
+}
+
+/// Upload a clip directly from Rust with optional real-time progress events.
+///
+/// Enhancement over the original whole-file upload:
+///   * Streams the file through a `ProgressReader` and emits `upload:progress`
+///     Tauri events (`{ id, sent, total, percent }`) as bytes go out the socket.
+///   * No total request timeout (only connect + per-read timeouts) so 100 MB+
+///     clips are never aborted mid-transfer.
+///   * Bounded retry with exponential backoff for transient failures (network
+///     errors, HTTP 5xx, HTTP 429); other 4xx are permanent.
+///   * `duration_seconds` uses the real clip duration when known (falls back to 30).
+///
+/// The wire format is IDENTICAL to the original: a multipart POST with a `file`
+/// part named after the clip and `video/mp4` MIME. This is the guaranteed
+/// fallback — nothing about auth, endpoints, or JSON shapes changes.
+///
+/// RESUMABLE NOTE: the `/clip-uploads` endpoint hands back a Cloudflare Stream
+/// *direct-upload* URL, which expects a single multipart POST and does NOT
+/// advertise tus/Range support. Byte-level resume would require a separate tus
+/// endpoint that we must not assume exists. Retries therefore re-send the whole
+/// file (the progress bar simply restarts), which is the correct graceful
+/// degradation for a direct-upload URL.
+fn do_rust_upload_ex(
+    file_path: &str,
+    device_id: &str,
+    app: Option<&tauri::AppHandle>,
+    duration_seconds: Option<u32>,
+) -> Result<(), String> {
+    use crate::cloud_proxy::{cloud_api_key, CLOUD_API_BASE};
 
     let path = std::path::Path::new(file_path);
     let file_name = path.file_name()
@@ -573,47 +654,148 @@ fn do_rust_upload(file_path: &str, device_id: &str) -> Result<(), String> {
 
     eprintln!("[clipsta] Auto-uploading: {} ({} MB)", file_name, file_size / (1024 * 1024));
 
-    // Step 1: Request upload URL from cloud API
+    // HTTP client for the transfer: NO total timeout (large clips must not abort),
+    // only a connect timeout so we still fail fast if the endpoint is unreachable.
+    // A dead socket mid-transfer eventually surfaces as a network error, which the
+    // retry logic below classifies as transient and re-attempts.
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
+    let bounded_retries: u32 = 4;
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+        match upload_attempt(
+            &client,
+            CLOUD_API_BASE,
+            cloud_api_key(),
+            file_path,
+            &file_name,
+            device_id,
+            file_size,
+            duration_seconds.unwrap_or(30),
+            app,
+        ) {
+            Ok(()) => {
+                eprintln!("[clipsta] Auto-upload complete: {}", file_name);
+                if let Some(app) = app {
+                    let _ = app.emit("upload:progress", serde_json::json!({
+                        "id": file_path,
+                        "sent": file_size,
+                        "total": file_size,
+                        "percent": 100u32,
+                    }));
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if e.transient && attempt <= bounded_retries {
+                    // Exponential backoff: 1s, 2s, 4s, 8s (capped).
+                    let backoff_ms = 1000u64 * (1u64 << (attempt - 1).min(3));
+                    eprintln!(
+                        "[clipsta] Upload attempt {} failed (transient): {} — retrying in {}ms",
+                        attempt, e.message, backoff_ms
+                    );
+                    if let Some(app) = app {
+                        let _ = app.emit("upload:retry", serde_json::json!({
+                            "id": file_path,
+                            "attempt": attempt,
+                            "maxAttempts": bounded_retries,
+                            "message": e.message,
+                        }));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    continue;
+                }
+                eprintln!("[clipsta] Upload failed permanently: {}", e.message);
+                return Err(e.message);
+            }
+        }
+    }
+}
+
+/// A single upload attempt: request a fresh upload URL, then stream the file.
+/// A fresh URL is requested per attempt because direct-upload URLs are single-use.
+#[allow(clippy::too_many_arguments)]
+fn upload_attempt(
+    client: &reqwest::blocking::Client,
+    api_base: &str,
+    api_key: &str,
+    file_path: &str,
+    file_name: &str,
+    device_id: &str,
+    file_size: u64,
+    duration_seconds: u32,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), UploadError> {
+    // Step 1: Request upload URL from cloud API (unchanged JSON shape).
     let upload_req = serde_json::json!({
         "desktopDeviceId": device_id,
         "fileName": file_name,
-        "durationSeconds": 30,
+        "durationSeconds": duration_seconds,
         "bytes": file_size,
         "capturedAt": chrono::Local::now().to_rfc3339(),
     });
 
     let res = client
-        .post(format!("{}/clip-uploads", CLOUD_API_BASE))
+        .post(format!("{}/clip-uploads", api_base))
         .header("Content-Type", "application/json")
-        .header("X-Clipsta-Test-Key", CLOUD_API_KEY)
+        .header("X-Clipsta-Test-Key", api_key)
         .json(&upload_req)
         .send()
-        .map_err(|e| format!("Upload request failed: {}", e))?;
+        .map_err(|e| UploadError::transient(format!("Upload request failed: {}", e)))?;
 
     if !res.status().is_success() {
-        return Err(format!("Cloud API error: HTTP {}", res.status().as_u16()));
+        return Err(UploadError::from_status("Cloud API error", res.status().as_u16()));
     }
 
     let data: serde_json::Value = res.json()
-        .map_err(|e| format!("Parse error: {}", e))?;
+        .map_err(|e| UploadError::permanent(format!("Parse error: {}", e)))?;
 
     let upload_url = data["uploadUrl"].as_str()
-        .ok_or("No uploadUrl in response")?
+        .ok_or_else(|| UploadError::permanent("No uploadUrl in response"))?
         .to_string();
 
-    // Step 2: Read file and upload as multipart form (matches frontend behavior)
-    let file_bytes = std::fs::read(file_path)
-        .map_err(|e| format!("Read file failed: {}", e))?;
+    // Step 2: Stream the file as a multipart form (SAME wire format as before),
+    // wrapping the file handle in a ProgressReader so we can emit real progress.
+    let file = std::fs::File::open(file_path)
+        .map_err(|e| UploadError::permanent(format!("Read file failed: {}", e)))?;
 
-    let part = reqwest::blocking::multipart::Part::bytes(file_bytes)
-        .file_name(file_name.clone())
+    // Throttle progress emits: at most one event per ~1% or per ~1MB, whichever
+    // comes first, so we don't flood the event bus for large files.
+    let mut last_percent: i64 = -1;
+    let file_path_owned = file_path.to_string();
+    let app_cloned = app.cloned();
+    let progress_reader = ProgressReader {
+        inner: file,
+        read_so_far: 0,
+        on_progress: move |sent| {
+            if let Some(app) = &app_cloned {
+                let percent = if file_size > 0 {
+                    ((sent as f64 / file_size as f64) * 100.0) as i64
+                } else {
+                    0
+                };
+                if percent != last_percent {
+                    last_percent = percent;
+                    let _ = app.emit("upload:progress", serde_json::json!({
+                        "id": file_path_owned,
+                        "sent": sent,
+                        "total": file_size,
+                        "percent": percent.clamp(0, 100) as u32,
+                    }));
+                }
+            }
+        },
+    };
+
+    let part = reqwest::blocking::multipart::Part::reader_with_length(progress_reader, file_size)
+        .file_name(file_name.to_string())
         .mime_str("video/mp4")
-        .map_err(|e| format!("Multipart error: {}", e))?;
+        .map_err(|e| UploadError::permanent(format!("Multipart error: {}", e)))?;
 
     let form = reqwest::blocking::multipart::Form::new()
         .part("file", part);
@@ -622,12 +804,11 @@ fn do_rust_upload(file_path: &str, device_id: &str) -> Result<(), String> {
         .post(&upload_url)
         .multipart(form)
         .send()
-        .map_err(|e| format!("Upload failed: {}", e))?;
+        .map_err(|e| UploadError::transient(format!("Upload failed: {}", e)))?;
 
     if !upload_res.status().is_success() {
-        return Err(format!("Upload HTTP {}", upload_res.status().as_u16()));
+        return Err(UploadError::from_status("Upload", upload_res.status().as_u16()));
     }
 
-    eprintln!("[clipsta] Auto-upload complete: {}", file_name);
     Ok(())
 }

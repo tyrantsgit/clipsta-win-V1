@@ -48,6 +48,8 @@ export interface UploadJob {
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
 	retryCount?: number;
+	/** Real clip duration in seconds, when known (falls back to 30 in backend). */
+	durationSeconds?: number;
 }
 
 export interface UploadClipResponse {
@@ -94,7 +96,7 @@ export interface UploadClipOpts {
 	desktopDeviceId: string;
 	filePath: string;
 	fileName: string;
-	durationSeconds: number;
+	durationSeconds?: number;
 	bytes: number;
 	capturedAt: string;
 	encoder?: string;

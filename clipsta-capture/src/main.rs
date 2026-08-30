@@ -129,10 +129,11 @@ fn main() {
     // ── IPC pipe server (background thread) ───────────────────────────────────
     let session_for_pipe = Arc::clone(&session);
     let save_tx_for_pipe = save_tx.clone();
+    let settings_for_pipe = settings.clone();
     std::thread::Builder::new()
         .name("ipc-server".to_string())
         .spawn(move || {
-            run_pipe_server(session_for_pipe, save_tx_for_pipe);
+            run_pipe_server(session_for_pipe, save_tx_for_pipe, settings_for_pipe);
         })
         .expect("Failed to spawn IPC server thread");
 
@@ -252,14 +253,35 @@ fn start_capture(session: &CaptureSession, settings: &AppSettings) {
 
 // ── Save logic ────────────────────────────────────────────────────────────────
 
+/// Fire-and-forget save used by the tray/hotkey worker thread. Logs the outcome.
 fn do_save(session: &CaptureSession, settings: &AppSettings, seconds: u32) {
+    match do_save_inner(session, settings, seconds) {
+        Ok((path, _dur)) => log!("[clipsta-capture] ✓ Saved: {}", path),
+        Err(msg) => {
+            if msg.contains("Not enough") || msg.contains("No keyframe") {
+                log!("[clipsta-capture] Buffer not ready — wait a few seconds");
+            } else {
+                log!("[clipsta-capture] Save failed: {}", msg);
+            }
+        }
+    }
+}
+
+/// Perform a save synchronously and return the real result: (output_path, duration_secs).
+/// This is the source of truth used by the IPC Save handler so the Tauri side only
+/// receives a "Saved" ack after the clip is actually written to disk. Returns Err with
+/// a human-readable message on any failure (not recording, save in progress, buffer not
+/// ready, encoder/mux error).
+fn do_save_inner(
+    session: &CaptureSession,
+    settings: &AppSettings,
+    seconds: u32,
+) -> Result<(String, f64), String> {
     if !session.is_recording.load(Ordering::Relaxed) {
-        log!("[clipsta-capture] Cannot save — not recording");
-        return;
+        return Err("Cannot save — not recording".to_string());
     }
     if session.is_saving.load(Ordering::Relaxed) {
-        log!("[clipsta-capture] Save already in progress, skipping");
-        return;
+        return Err("Save already in progress".to_string());
     }
 
     // Generate ShadowPlay-style filename
@@ -293,17 +315,8 @@ fn do_save(session: &CaptureSession, settings: &AppSettings, seconds: u32) {
     log!("[clipsta-capture] Saving {}s clip → {}", seconds, file_name);
 
     match session.save_clip(seconds, &output_str) {
-        Ok(path) => {
-            log!("[clipsta-capture] ✓ Saved: {}", path);
-        }
-        Err(e) => {
-            let msg = format!("{}", e);
-            if msg.contains("Not enough") || msg.contains("No keyframe") {
-                log!("[clipsta-capture] Buffer not ready — wait a few seconds");
-            } else {
-                log!("[clipsta-capture] Save failed: {}", msg);
-            }
-        }
+        Ok(path) => Ok((path, seconds as f64)),
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
@@ -368,7 +381,7 @@ fn get_game_name(game_detect: bool) -> String {
 
 // ── IPC Pipe Server (background thread) ───────────────────────────────────────
 
-fn run_pipe_server(session: Arc<CaptureSession>, save_tx: SyncSender<u32>) {
+fn run_pipe_server(session: Arc<CaptureSession>, _save_tx: SyncSender<u32>, settings: AppSettings) {
     log!("[clipsta-capture] IPC pipe server thread started");
 
     loop {
@@ -459,13 +472,17 @@ fn run_pipe_server(session: Arc<CaptureSession>, save_tx: SyncSender<u32>) {
                 }
                 CaptureCommand::Save(ref payload) => {
                     log!("[clipsta-capture] IPC: Save command ({}s)", payload.seconds);
-                    // Forward to save worker via channel
-                    let _ = save_tx.try_send(payload.seconds);
-                    // Return an immediate ack — actual save happens async
-                    CaptureResponse::Saved(ipc::SavedPayload {
-                        path: payload.output_path.clone(),
-                        duration_secs: payload.seconds as f64,
-                    })
+                    // Perform the save synchronously so the Tauri side only receives a
+                    // "Saved" ack after the clip is actually written to disk. Previously
+                    // this fired the save on a background channel and returned success
+                    // immediately, so the UI reported success for saves that never happened.
+                    match do_save_inner(&session, &settings, payload.seconds) {
+                        Ok((path, duration_secs)) => CaptureResponse::Saved(ipc::SavedPayload {
+                            path,
+                            duration_secs,
+                        }),
+                        Err(message) => CaptureResponse::Error(ErrorPayload { message }),
+                    }
                 }
                 CaptureCommand::Status => {
                     CaptureResponse::StatusResp(StatusPayload {

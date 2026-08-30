@@ -164,7 +164,43 @@ impl CaptureProxy {
     }
 
     /// Send a command and read the response (blocking, serialized by mutex).
+    ///
+    /// On any pipe I/O error the connection is dropped, a single reconnect is
+    /// attempted, and the command is retried once. This recovers automatically
+    /// when the capture process restarts/crashes instead of failing every
+    /// subsequent command until the app is restarted.
     fn send_and_recv(&self, cmd: &CaptureCommand) -> Result<CaptureResponse, String> {
+        match self.send_and_recv_once(cmd) {
+            Ok(resp) => Ok(resp),
+            Err(first_err) => {
+                eprintln!(
+                    "[clipsta] Pipe error ({}). Dropping connection and attempting reconnect...",
+                    first_err
+                );
+                // Drop the (likely broken) connection before reconnecting.
+                *self.conn.lock() = None;
+                match self.reconnect() {
+                    Ok(()) => {
+                        // Retry the command exactly once on the fresh connection.
+                        self.send_and_recv_once(cmd).map_err(|retry_err| {
+                            format!(
+                                "Pipe command failed after reconnect: {} (original: {})",
+                                retry_err, first_err
+                            )
+                        })
+                    }
+                    Err(reconnect_err) => Err(format!(
+                        "Pipe error: {} — reconnect failed: {}",
+                        first_err, reconnect_err
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Single send/recv attempt with no retry. Returns Err on any I/O failure
+    /// or if the pipe is not currently connected.
+    fn send_and_recv_once(&self, cmd: &CaptureCommand) -> Result<CaptureResponse, String> {
         let mut conn_guard = self.conn.lock();
         let conn = conn_guard
             .as_mut()
