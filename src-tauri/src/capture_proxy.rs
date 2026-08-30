@@ -302,6 +302,19 @@ impl CaptureProxy {
         }
     }
 
+    /// Whether this Tauri process spawned (and therefore owns) the capture
+    /// process. True only when we spawned `clipsta-capture.exe --headless`
+    /// ourselves. False when we connected to an already-running standalone
+    /// capture process (started at login), which owns its OWN global hotkeys.
+    ///
+    /// Used to decide whether Tauri should register clip hotkeys: if a
+    /// standalone capture process is already running, it already owns the
+    /// hotkeys and Tauri must NOT register duplicates (doing so causes every
+    /// hotkey press to save two clips — one per process).
+    pub fn owns_capture_process(&self) -> bool {
+        self.we_own_process.load(Ordering::Relaxed)
+    }
+
     /// Disconnect from the capture process. Does NOT kill it (it's independent).
     pub fn shutdown(&self) {
         // Drop the pipe connection

@@ -33,13 +33,14 @@ pub async fn settings_get_all(store: State<'_, SettingsStore>) -> Result<AppSett
 pub async fn settings_set(
     app: AppHandle,
     store: State<'_, SettingsStore>,
+    proxy: State<'_, std::sync::Arc<crate::capture_proxy::CaptureProxy>>,
     key: String,
     value: serde_json::Value,
 ) -> Result<bool, String> {
     store.set_field(&key, value);
     // Re-register hotkeys if a hotkey field was changed
     if key.starts_with("hotkey") {
-        crate::register_hotkeys(&app, &store.get());
+        crate::register_hotkeys(&app, &store.get(), proxy.owns_capture_process());
     }
     Ok(true)
 }
@@ -48,11 +49,12 @@ pub async fn settings_set(
 pub async fn settings_set_all(
     app: AppHandle,
     store: State<'_, SettingsStore>,
+    proxy: State<'_, std::sync::Arc<crate::capture_proxy::CaptureProxy>>,
     settings: serde_json::Value,
 ) -> Result<bool, String> {
     store.set_all(settings);
     // Re-register global hotkeys with the updated settings
-    crate::register_hotkeys(&app, &store.get());
+    crate::register_hotkeys(&app, &store.get(), proxy.owns_capture_process());
     Ok(true)
 }
 
@@ -1481,8 +1483,12 @@ pub async fn hotkeys_suspend(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn hotkeys_resume(app: AppHandle, store: State<'_, SettingsStore>) -> Result<bool, String> {
-    crate::register_hotkeys(&app, &store.get());
+pub async fn hotkeys_resume(
+    app: AppHandle,
+    store: State<'_, SettingsStore>,
+    proxy: State<'_, std::sync::Arc<crate::capture_proxy::CaptureProxy>>,
+) -> Result<bool, String> {
+    crate::register_hotkeys(&app, &store.get(), proxy.owns_capture_process());
     Ok(true)
 }
 

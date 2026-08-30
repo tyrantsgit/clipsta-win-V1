@@ -31,7 +31,21 @@ use watch_folder::WatchFolderService;
 static SAVE_TX: std::sync::OnceLock<std_mpsc::SyncSender<u32>> = std::sync::OnceLock::new();
 
 /// Register global hotkeys based on current settings.
-pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings) {
+///
+/// `register_clip_hotkeys` controls whether the clip-save hotkeys (30s/1min/5min)
+/// are registered by THIS (Tauri) process. It must be `false` when a standalone
+/// `clipsta-capture.exe` (started at login) is already running, because that
+/// process registers the SAME global hotkeys and runs its own save loop.
+/// Registering duplicates here means a single hotkey press is delivered to both
+/// processes, saving two clips. See `CaptureProxy::owns_capture_process()`.
+///
+/// The record-toggle hotkey is always registered: it only emits a UI event and
+/// the standalone capture process does not handle it, so there is no duplication.
+pub fn register_hotkeys(
+    app: &tauri::AppHandle,
+    settings: &settings::AppSettings,
+    register_clip_hotkeys: bool,
+) {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
 
@@ -55,9 +69,19 @@ pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings
         }
     };
 
-    try_register(&settings.hotkey_clip30_sec, 30);
-    try_register(&settings.hotkey_clip1_min, 60);
-    try_register(&settings.hotkey_clip5_min, 300);
+    // Only register clip-save hotkeys when we own the capture process.
+    // Otherwise the standalone capture process already owns them, and
+    // double-registration would save two clips per keypress.
+    if register_clip_hotkeys {
+        try_register(&settings.hotkey_clip30_sec, 30);
+        try_register(&settings.hotkey_clip1_min, 60);
+        try_register(&settings.hotkey_clip5_min, 300);
+    } else {
+        eprintln!(
+            "[clipsta] Standalone capture process owns clip hotkeys; \
+             skipping duplicate registration in the UI process."
+        );
+    }
 
     // Record toggle (still emits to WebView — only used when app is in foreground for UI)
     if !settings.hotkey_record.is_empty() {
@@ -431,9 +455,14 @@ pub fn run() {
                 eprintln!("[clipsta] tray setup failed (non-fatal): {}", e);
             }
 
-            // Register global shortcuts (non-fatal: app works without them)
+            // Register global shortcuts (non-fatal: app works without them).
+            // Only register the clip-save hotkeys if WE spawned the capture
+            // process. If we connected to an already-running standalone capture
+            // process (started at login), it already owns those hotkeys; adding
+            // duplicates here would save two clips per keypress.
             let app_handle = app.handle().clone();
-            register_hotkeys(&app_handle, &settings);
+            let owns_capture = proxy.owns_capture_process();
+            register_hotkeys(&app_handle, &settings, owns_capture);
 
             Ok(())
         })
