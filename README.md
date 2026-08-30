@@ -7,6 +7,41 @@ Built with Tauri v2 + React + Windows Graphics Capture + Hardware H.264 encoding
 
 ---
 
+## What's New — v2.3.2 Latest (production hardening)
+
+This release fixes several data-integrity and reliability issues found in a full
+production audit, and adds two features.
+
+### 🛠️ Reliability & Data-Integrity Fixes
+- **Fixed replay-buffer corruption** — the memory-mapped ring buffer could overwrite
+  frames that were still referenced when it wrapped around, producing garbled saved
+  clips at high bitrate. The ring now evicts a frame's metadata before its bytes are
+  overwritten and safely drops any frame larger than the buffer.
+- **Real "clip saved" confirmation** — saving now completes synchronously and reports
+  the actual file path/duration (or a real error). Previously the app could report
+  success for a clip that was never written.
+- **Automatic capture-pipe reconnect** — if the capture process restarts, the app now
+  reconnects and retries instead of silently failing every save until relaunch.
+- **Audio no longer lost on desktop-audio failure** — if system (loopback) audio can't
+  initialize (exclusive-mode conflict, disabled endpoint), recording now degrades to
+  mic-only/silent instead of dropping all audio.
+- **Fixed microphone drift** — mics running at a different sample rate than desktop audio
+  (e.g. 44.1 kHz) are now resampled to 48 kHz, eliminating slow mic desync over long clips.
+
+### ✨ New Features
+- **Multi-track audio** *(opt-in via the Multi-track Audio setting)* — records the
+  microphone as a **separate audio track** in the MP4, alongside the game/desktop track,
+  so you can balance or mute voice in editing. Default stays as the single mixed track.
+- **Robust cloud uploads** — real upload **progress**, no more timeout aborts on large
+  clips, and automatic retry with exponential backoff (with transient vs. permanent error
+  handling). The existing upload path is preserved as a fallback.
+
+### 🔒 Security
+- **API key removed from source** — the cloud key is now read from the `CLIPSTA_API_KEY`
+  build-time environment variable (with a fallback), keeping the secret out of the repo.
+
+---
+
 ## What's New in v2.3.2
 
 ### 🔀 Split Process Architecture
