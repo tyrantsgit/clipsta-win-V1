@@ -17,6 +17,11 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Surface secret presence to step-level `if:` conditions. `if` cannot read
+      # `secrets.*` directly, so we mirror it into a job env var. When the signing
+      # secret is unset this is empty and the signing steps are skipped.
+      HAS_SIGNING_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +36,57 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # ── Code signing (Authenticode) ─────────────────────────────────────────
+      # Runs only when a signing certificate is configured in repo secrets.
+      # WINDOWS_CERTIFICATE:          base64-encoded .pfx file
+      # WINDOWS_CERTIFICATE_PASSWORD: the .pfx password
+      # WINDOWS_CERTIFICATE_THUMBPRINT: SHA-1 thumbprint of the cert
+      # Without these secrets the step is skipped and the build is unsigned.
+      - name: Import code-signing certificate
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "clipsta-cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+          Remove-Item $pfxPath -Force
+
+      - name: Inject certificate thumbprint into tauri.conf.json
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        shell: pwsh
+        run: |
+          $conf = "src-tauri/tauri.conf.json"
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          # Add signing fields only in CI when a cert exists. They are intentionally
+          # absent from the committed config so local/dev builds stay unsigned and
+          # don't invoke signtool (an empty thumbprint makes signtool fail).
+          $signing = [ordered]@{
+            certificateThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
+            digestAlgorithm       = "sha256"
+            timestampUrl          = "http://timestamp.digicert.com"
+          }
+          foreach ($k in $signing.Keys) {
+            $json.bundle.windows | Add-Member -NotePropertyName $k -NotePropertyValue $signing[$k] -Force
+          }
+          $json | ConvertTo-Json -Depth 32 | Set-Content $conf -Encoding utf8
+          Write-Host "Injected Authenticode signing config into $conf"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing. The private key + its password live in repo secrets
+          # (Settings → Secrets and variables → Actions). tauri-action signs the
+          # NSIS installer and generates `latest.json` (the update manifest the
+          # app's updater endpoint points at) when these are present.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           # Only create/publish a GitHub Release when triggered by a version
           # tag push; manual runs just produce downloadable build artifacts.
@@ -42,6 +94,8 @@ jobs:
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Clipsta {0}', github.ref_name) || '' }}
           releaseDraft: true
           prerelease: false
+          # Include the updater manifest + signature so the in-app updater works.
+          includeUpdaterJson: true
 
       - name: Upload installer as build artifact
         uses: actions/upload-artifact@v4

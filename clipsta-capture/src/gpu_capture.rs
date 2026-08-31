@@ -1124,6 +1124,71 @@ struct EncodedFrame {
     is_keyframe: bool,
 }
 
+/// A snapshot of the video ring for a save, materializable OUTSIDE the ring lock.
+enum VideoSnapshot {
+    /// mmap path: shared mmap handle + copied frame metadata. Bytes are copied
+    /// from the mmap in `into_frames`, which runs without the ring lock held.
+    Mmap {
+        mmap: Arc<memmap2::MmapMut>,
+        entries: Vec<FrameEntry>,
+    },
+    /// in-memory fallback path: frames are already Arc-backed, nothing to copy.
+    InMemory(Vec<EncodedFrame>),
+}
+
+impl VideoSnapshot {
+    fn is_empty(&self) -> bool {
+        match self {
+            VideoSnapshot::Mmap { entries, .. } => entries.is_empty(),
+            VideoSnapshot::InMemory(v) => v.is_empty(),
+        }
+    }
+
+    /// First frame's PTS (0 if empty).
+    fn first_pts(&self) -> i64 {
+        match self {
+            VideoSnapshot::Mmap { entries, .. } => entries.first().map(|e| e.pts_100ns).unwrap_or(0),
+            VideoSnapshot::InMemory(v) => v.first().map(|f| f.pts_100ns).unwrap_or(0),
+        }
+    }
+
+    /// Last frame's end PTS (pts + duration), falling back to first_pts if empty.
+    fn last_end_pts(&self) -> i64 {
+        match self {
+            VideoSnapshot::Mmap { entries, .. } => entries
+                .last()
+                .map(|e| e.pts_100ns + e.duration_100ns)
+                .unwrap_or_else(|| self.first_pts()),
+            VideoSnapshot::InMemory(v) => v
+                .last()
+                .map(|f| f.pts_100ns + f.duration_100ns)
+                .unwrap_or_else(|| self.first_pts()),
+        }
+    }
+
+    /// Materialize into owned `EncodedFrame`s. For the mmap path this copies the
+    /// H.264 bytes out of the mmap — the whole point is that this runs WITHOUT the
+    /// ring lock, so the encoder keeps pushing frames while a save is in flight.
+    fn into_frames(self) -> Vec<EncodedFrame> {
+        match self {
+            VideoSnapshot::Mmap { mmap, entries } => entries
+                .into_iter()
+                .map(|e| {
+                    let start = e.offset as usize;
+                    let end = start + e.len as usize;
+                    EncodedFrame {
+                        data: Arc::new(mmap[start..end].to_vec()),
+                        pts_100ns: e.pts_100ns,
+                        duration_100ns: e.duration_100ns,
+                        is_keyframe: e.is_keyframe,
+                    }
+                })
+                .collect(),
+            VideoSnapshot::InMemory(v) => v,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AudioChunk {
     /// Arc-wrapped audio samples: cloning is a cheap ref-count bump.
@@ -1225,7 +1290,10 @@ struct FrameEntry {
 /// buffer can hold 5+ minutes of 1080p video without consuming heap memory.
 struct MmapVideoRing {
     /// Memory-mapped file holding raw H.264 frame data.
-    mmap: memmap2::MmapMut,
+    /// Wrapped in an `Arc` so the save path can clone a handle and copy frame
+    /// bytes OUTSIDE the ring lock — the encoder is the only writer and is
+    /// serialized by the ring `Mutex`, so shared reads during a save are sound.
+    mmap: Arc<memmap2::MmapMut>,
     /// Path to the backing file (for cleanup).
     file_path: std::path::PathBuf,
     /// Total capacity of the mmap in bytes.
@@ -1268,7 +1336,7 @@ impl MmapVideoRing {
         file.set_len(capacity)?;
 
         // Memory-map the file
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        let mmap = Arc::new(unsafe { memmap2::MmapMut::map_mut(&file)? });
 
         Ok(Self {
             mmap,
@@ -1319,10 +1387,18 @@ impl MmapVideoRing {
         // entries here so the ring never hands out a slice into overwritten bytes.
         self.evict_overlapping(start, end);
 
-        // Write frame data to mmap
+        // Write frame data to mmap.
+        // The mmap is behind an `Arc` (shared), so we write through a raw pointer.
+        // This is sound: the encoder is the ONLY writer and every mutation of the
+        // ring goes through the ring `Mutex`, so there is never a concurrent write.
+        // Concurrent readers (the save path) only read frame regions that are not
+        // being actively overwritten (see evict_overlapping + ring sizing).
         let start_us = start as usize;
         let end_us = end as usize;
-        self.mmap[start_us..end_us].copy_from_slice(data);
+        unsafe {
+            let dst = self.mmap.as_ptr().add(start_us) as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, (end_us - start_us).min(data.len()));
+        }
 
         // Record metadata
         let entry = FrameEntry {
@@ -1433,6 +1509,15 @@ impl MmapVideoRing {
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
         &self.mmap[start..end]
+    }
+
+    /// Snapshot for a lock-free save: clone the mmap `Arc` handle and copy the
+    /// lightweight frame metadata (a few bytes each) for frames from `start_idx`.
+    /// The caller can then copy frame BYTES from the returned mmap handle without
+    /// holding the ring lock, so the encoder is never blocked on a large save.
+    fn snapshot_from(&self, start_idx: usize) -> (Arc<memmap2::MmapMut>, Vec<FrameEntry>) {
+        let entries: Vec<FrameEntry> = self.frames.iter().skip(start_idx).copied().collect();
+        (Arc::clone(&self.mmap), entries)
     }
 
     /// Iterate frame entries from start_idx onward.
@@ -1714,6 +1799,7 @@ impl EncodedMediaRing {
     /// Slice video frames from start_idx to end.
     /// When using mmap, reads frame data from disk (OS pages it in automatically).
     /// For in-memory path, returns full frames with Arc-cloned data (instant).
+    #[allow(dead_code)]
     fn slice_video(&self, start_idx: usize) -> Vec<EncodedFrame> {
         if let Some(ref mmap_ring) = self.video_mmap {
             // Read frames from mmap — OS pages in the data on demand
@@ -1728,6 +1814,23 @@ impl EncodedMediaRing {
         }
         // Fallback: in-memory path (Arc clones)
         self.video_frames.iter().skip(start_idx).cloned().collect()
+    }
+
+    /// Snapshot video for a LOCK-FREE save. Returns data that can be turned into
+    /// `Vec<EncodedFrame>` WITHOUT holding the ring lock:
+    /// - mmap path: the mmap `Arc` handle + copied frame metadata. The caller
+    ///   copies frame bytes from the mmap after releasing the lock, so the
+    ///   encoder is never blocked on a large (multi-hundred-MB) memcpy.
+    /// - in-memory path: `Vec<EncodedFrame>` directly (Arc clones are already cheap).
+    fn snapshot_video_from(&self, start_idx: usize) -> VideoSnapshot {
+        if let Some(ref mmap_ring) = self.video_mmap {
+            let (mmap, entries) = mmap_ring.snapshot_from(start_idx);
+            VideoSnapshot::Mmap { mmap, entries }
+        } else {
+            VideoSnapshot::InMemory(
+                self.video_frames.iter().skip(start_idx).cloned().collect(),
+            )
+        }
     }
 
     /// Get the mmap file path (for reading outside lock).
@@ -2477,18 +2580,29 @@ impl CaptureSession {
         // keeps the single mixed track (mic mixed into desktop audio).
         let multi_track = self.multi_track_audio.load(Ordering::Relaxed);
         let (video_frames, audio_chunks, mic_audio_chunks) = {
-            // Phase 1: grab video frames (brief lock — Arc clones are cheap refcount bumps)
+            // Phase 1: snapshot the ring under the lock, then release it and copy
+            // frame bytes OUTSIDE the lock. Previously the mmap byte-copy (up to
+            // hundreds of MB for a 5-min clip) ran while holding the ring lock,
+            // which blocked the encoder's push_video() for the whole copy and
+            // caused capture hitches — worst on long/consecutive clips. Now the
+            // lock is held only long enough to copy lightweight frame metadata.
             let (video, start_pts, end_pts) = {
-                let ring = self.ring.lock();
-                let start_idx = ring
-                    .find_slice_start(seconds)
-                    .ok_or_else(|| anyhow::anyhow!("No keyframe found in ring buffer"))?;
-                let video = ring.slice_video(start_idx);
-                if video.is_empty() {
-                    anyhow::bail!("No video frames available for clip");
-                }
-                let s_pts = video[0].pts_100ns;
-                let e_pts = video.last().map(|f| f.pts_100ns + f.duration_100ns).unwrap_or(s_pts);
+                let snapshot = {
+                    let ring = self.ring.lock();
+                    let start_idx = ring
+                        .find_slice_start(seconds)
+                        .ok_or_else(|| anyhow::anyhow!("No keyframe found in ring buffer"))?;
+                    let snap = ring.snapshot_video_from(start_idx);
+                    if snap.is_empty() {
+                        anyhow::bail!("No video frames available for clip");
+                    }
+                    snap
+                    // ring lock released here
+                };
+                let s_pts = snapshot.first_pts();
+                let e_pts = snapshot.last_end_pts();
+                // Copy H.264 bytes out of the mmap without the ring lock held.
+                let video = snapshot.into_frames();
                 (video, s_pts, e_pts)
             };
             // Lock released here — encoder can push frames while we grab audio

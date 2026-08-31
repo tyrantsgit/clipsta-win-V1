@@ -346,6 +346,29 @@ export function onWatchFolderNewFile(
 	});
 }
 
+// ── Auto-update ─────────────────────────────────────────────────────────────
+export interface UpdateInfo {
+	available: boolean;
+	version: string;
+	current_version: string;
+	notes: string;
+}
+
+/** Check the update endpoint for a newer release (metadata only). */
+export function checkForUpdates(): Promise<UpdateInfo> {
+	return invoke<UpdateInfo>("check_for_updates");
+}
+
+/** Download + install the available update and relaunch. */
+export function installUpdate(): Promise<void> {
+	return invoke<void>("install_update");
+}
+
+/** Progress events (0-100) emitted while an update downloads. */
+export function onUpdateProgress(cb: (pct: number) => void): Promise<UnlistenFn> {
+	return listen<number>("update:progress", (event) => cb(event.payload));
+}
+
 // ── Convenience: unified bridge object ──────────────────────────────────────
 const bridge = {
 	minimize,
@@ -406,6 +429,9 @@ const bridge = {
 	watchFolderStop,
 	watchFolderStatus,
 	onWatchFolderNewFile,
+	checkForUpdates,
+	installUpdate,
+	onUpdateProgress,
 };
 
 export default bridge;

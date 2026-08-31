@@ -85,6 +85,92 @@ fn log_dir() -> PathBuf {
         .join("logs")
 }
 
+/// Install a panic hook that records the panic (message, thread, location, and
+/// a backtrace) to a dedicated crash log AND the normal capture log before the
+/// process unwinds/aborts. Call once, after `init()`.
+///
+/// For an always-on background process this is the only way to diagnose field
+/// crashes — there is no console to read. The crash log is append-only so
+/// repeated crashes accumulate for post-mortem analysis.
+pub fn install_panic_hook(process_tag: &'static str) {
+    // Chain to the default hook so behavior (e.g. abort on panic=abort) is preserved.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let timestamp = full_timestamp();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
+
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let record = format!(
+            "\n===== PANIC =====\n\
+             time:     {}\n\
+             process:  {} (PID {})\n\
+             thread:   {}\n\
+             location: {}\n\
+             message:  {}\n\
+             backtrace:\n{}\n\
+             =================\n",
+            timestamp,
+            process_tag,
+            std::process::id(),
+            thread_name,
+            location,
+            msg,
+            backtrace,
+        );
+
+        // Write to the dedicated crash log (best-effort, synchronous — we may be
+        // about to die, so we can't rely on the async log-writer thread).
+        let dir = log_dir();
+        let _ = fs::create_dir_all(&dir);
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = f.write_all(record.as_bytes());
+            let _ = f.flush();
+        }
+
+        // Also emit to stderr and the async log (if it survives).
+        eprintln!("{}", record);
+        if let Some(tx) = LOG_TX.get() {
+            let _ = tx.try_send(record.clone());
+        }
+
+        // Preserve default behavior.
+        default_hook(info);
+    }));
+}
+
+/// Full ISO-8601-ish timestamp for crash records (date + time).
+fn full_timestamp() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    // Delegate to chrono (already a dependency of the workspace) for readability.
+    let secs = now.as_secs() as i64;
+    let nsecs = now.subsec_nanos();
+    chrono::DateTime::from_timestamp(secs, nsecs)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string())
+        .unwrap_or_else(|| format!("{}s since epoch", secs))
+}
+
 /// Open the log file for appending.
 fn open_log_file(path: &PathBuf) -> Option<File> {
     OpenOptions::new()

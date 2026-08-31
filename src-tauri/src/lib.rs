@@ -26,6 +26,74 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use settings::SettingsStore;
 use watch_folder::WatchFolderService;
 
+/// Directory for Clipsta logs (%APPDATA%/Clipsta/logs on Windows).
+fn crash_log_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("Clipsta")
+        .join("logs")
+}
+
+/// Install a panic hook for the UI process that records panics (message,
+/// thread, location, backtrace) to %APPDATA%/Clipsta/logs/crash.log before the
+/// process unwinds. This is the counterpart to the capture process's hook, so
+/// crashes in either process land in the same crash log for diagnosis.
+fn install_panic_hook() {
+    use std::io::Write;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
+
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let record = format!(
+            "\n===== PANIC =====\n\
+             time:     {}\n\
+             process:  clipsta-ui (PID {})\n\
+             thread:   {}\n\
+             location: {}\n\
+             message:  {}\n\
+             backtrace:\n{}\n\
+             =================\n",
+            now,
+            std::process::id(),
+            thread_name,
+            location,
+            msg,
+            backtrace,
+        );
+
+        let dir = crash_log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = f.write_all(record.as_bytes());
+            let _ = f.flush();
+        }
+        eprintln!("{}", record);
+
+        default_hook(info);
+    }));
+}
+
 /// Channel sender for hotkey-triggered clip saves.
 /// Lives as a global so the hotkey closure (which can't access Tauri state) can send save requests.
 static SAVE_TX: std::sync::OnceLock<std_mpsc::SyncSender<u32>> = std::sync::OnceLock::new();
@@ -131,6 +199,9 @@ fn bring_existing_window_to_front() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Record panics in either process to %APPDATA%/Clipsta/logs/crash.log.
+    install_panic_hook();
+
     // ── Single Instance Guard ─────────────────────────────────────────────────
     // Prevent multiple instances from fighting over the named pipe and hotkeys.
     // Uses a named mutex — if it already exists, another instance is running.
@@ -186,6 +257,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             // Settings
             commands::settings_get_all,
@@ -224,6 +296,9 @@ pub fn run() {
             // Hotkeys
             commands::hotkeys_suspend,
             commands::hotkeys_resume,
+            // Auto-update
+            commands::check_for_updates,
+            commands::install_update,
             // MP4 Inspection
             commands::mp4_inspect,
             commands::mp4_keyframes,

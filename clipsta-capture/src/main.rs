@@ -69,6 +69,8 @@ fn main() {
 
     // Initialize file logging
     logging::init();
+    // Capture panics to %APPDATA%/Clipsta/logs/crash.log for post-mortem diagnosis.
+    logging::install_panic_hook("clipsta-capture");
 
     log!("[clipsta-capture] Process started (PID {})", std::process::id());
     log!("[clipsta-capture] Version 3.0.0 — Standalone mode");

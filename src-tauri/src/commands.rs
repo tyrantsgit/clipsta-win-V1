@@ -1492,6 +1492,88 @@ pub async fn hotkeys_resume(
     Ok(true)
 }
 
+// ── Auto-update ────────────────────────────────────────────────────────────────
+
+/// Result of checking for an update.
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    /// Whether a newer version is available.
+    pub available: bool,
+    /// The version string of the available update (empty if none).
+    pub version: String,
+    /// The currently running version.
+    pub current_version: String,
+    /// Release notes / changelog for the update (may be empty).
+    pub notes: String,
+}
+
+/// Check the configured update endpoint for a newer release.
+/// Returns metadata only — does NOT download or install.
+#[tauri::command]
+pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let current_version = app.package_info().version.to_string();
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater unavailable: {}", e))?;
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateInfo {
+            available: true,
+            version: update.version.clone(),
+            current_version,
+            notes: update.body.clone().unwrap_or_default(),
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            version: String::new(),
+            current_version,
+            notes: String::new(),
+        }),
+        Err(e) => Err(format!("Update check failed: {}", e)),
+    }
+}
+
+/// Download and install the available update, then relaunch the app.
+/// Emits "update:progress" events (0-100) to the frontend during download.
+/// On success the app restarts into the new version and this call does not return.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater unavailable: {}", e))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Update check failed: {}", e))?
+        .ok_or_else(|| "No update available".to_string())?;
+
+    let mut downloaded: u64 = 0;
+    let app_for_progress = app.clone();
+
+    update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded += chunk as u64;
+                if let Some(total) = total {
+                    let pct = ((downloaded as f64 / total as f64) * 100.0).round() as u32;
+                    let _ = app_for_progress.emit("update:progress", pct);
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Update install failed: {}", e))?;
+
+    // Relaunch into the newly installed version.
+    app.restart();
+}
+
 // ── Helper functions ──────────────────────────────────────────────────────────
 
 /// Validate that a path is within the clips output folder (for delete/rename operations).

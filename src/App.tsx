@@ -13,6 +13,7 @@ import StatusBar from "./components/StatusBar";
 import SaveNotification from "./components/SaveNotification";
 import ExportToast from "./components/ExportToast";
 import CaptureRecoveryToast from "./components/CaptureRecoveryToast";
+import UpdateToast from "./components/UpdateToast";
 import bridge from "./tauri-bridge";
 
 export default function App() {
@@ -137,6 +138,7 @@ export default function App() {
 			<SaveNotification path={recorder.state.savedPath} />
 			<ExportToast path={exportedFile} />
 			<CaptureRecoveryToast />
+			<UpdateToast />
 		</div>
 	);
 }

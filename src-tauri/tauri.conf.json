@@ -36,6 +36,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "externalBin": ["binaries/clipsta-capture"],
     "icon": [
       "icons/32x32.png",
@@ -54,5 +55,15 @@
       }
     }
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/tyrantsgit/clipsta-win-V1/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDQTgxMUJDRDQ3NUYzQTgKUldTbzgzWFV2QkdvUE9vODgrWjIwUHVHMjUxTTMycnVQYjl4dDNMQ2lFM1dpM1F0UXIyYW8wZlUK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }
